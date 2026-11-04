@@ -1,0 +1,8 @@
+$ /private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9 voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time --exact --ignored --nocapture --test-threads=1
+Revision: 7699190642dc4ff737f7218a22ce1a319902c7fc
+Before: 21:22  up  8:46, 2 users, load averages: 2.68 3.76 4.52
+
+running 1 test
+test voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time ... 
+After: 21:23  up  8:46, 2 users, load averages: 2.50 3.69 4.49
+External-condition valid: False

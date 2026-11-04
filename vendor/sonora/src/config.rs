@@ -183,9 +183,23 @@ pub struct EchoCanceller {
     /// is generally more responsive than the counter-based Legacy mode.
     pub transparent_mode: TransparentModeType,
     /// Gwar: whether to wait for lasting stereo before using more than one render
-    /// channel (default: true, as upstream). When false, the canceller uses every
-    /// render channel from its first frame and never resets on a change of content.
+    /// channel (default: true, as upstream). False disables content-based resets.
+    /// Known port defect: ordinary construction still uses only the left reference.
+    /// Correct initialization is dev-feature-only pending the two-reference follow-up.
     pub detect_stereo_content: bool,
+    /// Use zero reverb decay during dominant nearend; false preserves the native default.
+    pub zero_nearend_reverb_decay: bool,
+    /// Gwar measurement control: use the mono suppressor's release/attack tuning
+    /// with the multichannel adaptive filter. False preserves upstream tuning.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub multichannel_suppressor_like_mono: bool,
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub measurement_two_channel_start: bool,
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub measurement_native_profile: u8,
+    /// Reconstruct the historical left-only reference for comparisons.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub measurement_left_reference: bool,
 }
 
 impl Default for EchoCanceller {
@@ -194,6 +208,15 @@ impl Default for EchoCanceller {
             enforce_high_pass_filtering: true,
             transparent_mode: TransparentModeType::default(),
             detect_stereo_content: true,
+            zero_nearend_reverb_decay: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            multichannel_suppressor_like_mono: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_two_channel_start: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_native_profile: 0,
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_left_reference: false,
         }
     }
 }

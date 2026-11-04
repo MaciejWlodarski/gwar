@@ -1,0 +1,20 @@
+
+running 1 test
+test voice::codec_tests::four_shares_for_native_aec_option ... pair 0 order [0, 4]: none p50 0.006 p99 0.648 max 3.046 missing 480 | four p50 0.097 p99 0.273 max 0.372 missing 0 | p99 delta -0.375 ms
+pair 1 order [4, 0]: none p50 0.037 p99 0.277 max 3.295 missing 1920 | four p50 0.113 p99 0.299 max 5.368 missing 480 | p99 delta +0.022 ms
+pair 2 order [0, 4]: none p50 0.006 p99 0.326 max 6.281 missing 2880 | four p50 0.006 p99 0.643 max 5.064 missing 480 | p99 delta +0.316 ms
+pair 3 order [4, 0]: none p50 0.080 p99 0.197 max 1.732 missing 480 | four p50 0.002 p99 0.582 max 4.102 missing 480 | p99 delta +0.385 ms
+pair 4 order [0, 4]: none p50 0.002 p99 0.453 max 5.930 missing 480 | four p50 0.102 p99 0.355 max 5.495 missing 0 | p99 delta -0.097 ms
+pair 5 order [4, 0]: none p50 0.005 p99 0.523 max 6.419 missing 480 | four p50 0.006 p99 2.366 max 6.291 missing 0 | p99 delta +1.843 ms
+
+thread 'voice::codec_tests::four_shares_for_native_aec_option' (46198715) panicked at crates/gwar-client/src/voice/mod.rs:1343:9:
+share playback delayed voice: 1.843 ms
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    voice::codec_tests::four_shares_for_native_aec_option
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 403 filtered out; finished in 239.95s

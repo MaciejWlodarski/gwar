@@ -1457,16 +1457,19 @@ export class MlsRuntime {
   }
   /** Signing runs inside the queue, with the exact current group/epoch. The
    * builder may await WebCrypto; close waits for it and its write to finish. */
-  async sealMessage(conversation: string, build: (context: SealContext) => Promise<Plaintext>): Promise<{ group: string; epoch: number; ciphertext: string }> {
+  async sealMessage(conversation: string, build: (context: SealContext) => Promise<Plaintext>, checkAttempt = () => {}): Promise<{ group: string; epoch: number; ciphertext: string }> {
     return this.engine.run(async () => {
+      checkAttempt();
       const generation = this.generation; this.activeGeneration = generation; this.assertCurrent(generation);
       if (!this.enabled(conversation)) throw new Error("Server chat is not encrypted");
       const local = this.livePin(conversation);
       if (!local || this.held.has(conversation)) throw new Error("open the conversation first");
       const group = encoded(local.group);
       await this.syncGroup(group);
+      checkAttempt();
       const [epoch] = this.engine.query<[string, number[]]>({ sending_key: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } });
       const plaintext = await build({ server_key: this.server, conversation, group_id: group, epoch });
+      checkAttempt();
       this.assertCurrent(generation); this.assertGroupSynced(group);
       const ciphertext = await this.engine.op<number[]>({ seal_message: { context: { server_key: this.server, conversation, group_id: bytes(group), epoch, message_id: [...decodeFixed(plaintext.signature.message_id, 16)], revision: plaintext.signature.revision }, plaintext: [...new TextEncoder().encode(JSON.stringify(plaintext))], now: this.now(), revocations: this.options.revocations() } });
       this.assertCurrent(generation); this.assertGroupSynced(group);

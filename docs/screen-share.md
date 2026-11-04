@@ -316,14 +316,94 @@ decode stays for browser compatibility.
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
   The share and other viewers continue. There is no transcoding or native
   compatibility layer in A2. The decode watchdog isolates one failing viewer
-  after a two-second corroboration window. Only failure reports from every active
+  after a seven-second corroboration window (see below). A report counts only when the
+  viewer's slot has carried a whole stream for the four-second watchdog window:
+  a keyframe released from its first packet to its last with nothing of the slot
+  dropped since. Every wait for a keyframe ends that (an eviction, a deadline or
+  pacing drop, an ingress overrun, a codec switch, a recovery, a pause or
+  resume), and the window starts again only with the next keyframe released
+  whole that started after the wait. A keyframe already queued before the wait
+  does not count when it drains afterwards: the wait records the slot's highest
+  output sequence number, and only a keyframe above it can make the slot whole.
+  A decoder starved by the SFU's own drops is not a decoder that cannot
+  decode, and taking it for one once isolated a viewer for the rest of a watch.
+  Only failure reports from every active
   H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
-  a lower H.264 target, then VP9 when all peers offered it. Reports are limited
-  per viewer/share to one every ten seconds; the share has a ten-second hold-down.
-  The browser permits two reports per generation, with four-second detection and
-  a retry deadline ten seconds from the same observed stall. Anchoring both to
-  that stall avoids accumulating polling delays across the first report and retry,
-  which could otherwise exceed the corroboration window during replacement.
+  a lower H.264 target, then VP9 when all peers offered it; the share has a
+  ten-second hold-down between replacements.
+
+  The browser has no report budget. A decoder that receives packets and decodes
+  nothing for the stall time (`DECODE_STALL_MS`, 4 s, the server's watchdog
+  window) is reported then and every report period after (`DECODE_REPORT_EVERY_MS`,
+  5 s), until it decodes, its packets stop, or the slot's generation changes
+  because the server isolated it or fell back. Each report goes out on the first
+  stats poll at or after its deadline, and a gap between polls over
+  `DECODE_POLL_GAP_MS` (1.5 s) restarts the stall. Deadlines run from the stall,
+  not from each rounded poll, so reports do not drift: a stalled viewer reports at
+  least once in any 5 s + 1.5 s = 6.5 s, two reports are never closer than
+  5 s - 1.5 s = 3.5 s, and a new stall never brings a report closer than 5 s to
+  the last one. The stall starts at the viewer's own first stats sample, because
+  frames decoded before it are unknown. The viewer cannot see the SFU's drops (a
+  gap's lost packets can be balanced by duplicates), so it does not try: the
+  server ignores a report from a slot not yet whole for its window in constant
+  time, and takes the first one after. The SFU derives its two timings from
+  these constants (`CLIENT_REPORT_EVERY_MS`, `CLIENT_POLL_GAP_MS`) and a 0.5 s
+  allowance for transit differences (`REPORT_TRANSIT_MS`):
+  - **Corroboration window** (`CORROBORATE_FOR`) = 5 s + 1.5 s + 0.5 s = 7 s:
+    how long a reporter waits for its fellow viewers before it is isolated alone.
+    Viewers' first samples can be seconds apart, so their reports can be too. Once
+    a report is taken, every other viewer stalled on the same stream has one inside
+    the window, whatever the phase of its polls, if its first sample came within
+    5 s (one report period) of the keyframe notification: the report taken came at
+    least 4 s after the notification, and that viewer's first report comes at most
+    4 s + 1.5 s after its first sample. A two-second window isolated one of two
+    failing viewers whose retries came 2.84 s apart, and the fallback kept only
+    the other.
+
+    The notification goes out when the keyframe is queued, but each viewer's
+    slot only becomes whole when the keyframe is released to it in full, and the
+    server ignores a viewer's reports until 4 s after that. A viewer whose slot
+    went whole later than the reporter's can have its first counted report
+    arrive after the reporter's window: with polls every 1000 ms, the reporter
+    taken at 4 s, and a fellow whose reports come at 5 s and 11.47 s and whose
+    slot went whole after 1 s, the 5 s report is ignored and the reporter was
+    isolated at 11 s. So the window counts from the report taken, or from 4 s
+    after the latest first whole keyframe of a fellow viewer still reporting,
+    whichever is later. Every report a fellow sends from 4 s after it went whole
+    is taken, it sends one at least every 6.5 s, and its first comes at most
+    5.5 s after its first sample, so whatever the release skew, it corroborates
+    inside the window if its first sample came within 5 s of the notification
+    and its slot went whole before the window ends. The window uses each slot's
+    first whole keyframe of the generation, not its latest, so a fellow that
+    keeps losing keyframes cannot hold isolation off; a fellow that never went
+    whole is not waited for.
+  - **Report throttle** (`REPORT_THROTTLE`) = 5 s - 1.5 s - 0.5 s = 3 s: at most
+    one taken report per viewer and share this often. It bounds what a client
+    that reports too often can cost, a recovery check and a keyframe request. It
+    is shorter than the closest two reports of the real watchdog can arrive, so it
+    never holds back a report that corroborates another. Nor does it hold back the
+    first report after a codec switch: that comes 4 s after the new generation's
+    keyframe notification, which follows the switch's last taken report. With the
+    previous ten-second throttle and 5 s reports, a viewer whose report had been
+    taken just before a switch had its next two held back, and its fellow viewer
+    was isolated after 7 s.
+
+  Bounds, from the moment the slot becomes whole again, plus transit:
+  - a report is taken within 4 s + 5 s + one poll gap (1.5 s) = 10.5 s;
+  - when every viewer fails, the share falls back with the last report taken,
+    within 10.5 s, or when the hold-down from a previous replacement ends;
+  - a lone failing viewer beside healthy ones is isolated 7 s after its report
+    is taken, or 7 s after 4 s past the latest first whole keyframe of a healthy
+    viewer, whichever is later, at the next 100 ms housekeeping tick: within
+    about 17.6 s, unless a healthy viewer's slot went whole more than 6.5 s after
+    the failing viewer's, in which case 11.1 s after that.
+
+  Compared with main, a decoder that goes more than 4 s without a frame while
+  packets arrive is reported on each such stall, at most once per 5 s; main
+  stopped after two reports per generation. A decoder that decodes at least once
+  every 4 s, and a hidden tab whose polls come more than 1.5 s apart, are never
+  reported, as on main.
+
   Watch slots survive replacement, old-publisher packets drop, and the replacement
   keyframe opens the retained slots. Restore H.264 after reporters leave or two
   minutes, then hold for a minute before another downgrade. A3/B11a own native
@@ -2068,6 +2148,30 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   share that sent nothing yet has no rate, and its viewer starts at 2.5 Mbps as before: its cap is an admission
   ceiling, not the encoder's rate. A share added next to one already flowing
   joins at the measured estimate and grows by probing.
+
+  A **young share** (sending for less than 2 s) is averaged over its own life,
+  at least 1 s, instead of the whole 2 s window: a viewer joining one second in
+  would otherwise start from half of what it sends. A browser's encoder also
+  ramps for seconds (1–2 Mb/s in its first second and several times that five
+  seconds later are common), so a share counts as **ramping** for its first
+  10 s, and a viewer that joined it while nothing else flows on its transport
+  **follows it up**: each time the share grows by 1.2×, the viewer starts over
+  from the share's start estimate, as if it had joined a moment later. While
+  the share is young, growth is its start estimate's; after that, its largest
+  recent frame other than a keyframe, since keyframes (which the viewer's own
+  requests add) say nothing about a ramp. It does so only while its link
+  carries the last start (its estimate is at least 75% of it), so a slow link is
+  overrun once, as by any optimistic start, and not again; a pause or a second
+  flowing slot ends it. Before November 2026 such a viewer kept its early start
+  and grew only by probing, so its frames were evicted below the share's rate
+  and every keyframe the SFU asked for failed in turn, for seconds. Simulated on
+  a 20 ms ±5 ms link, a 4 Mb/s share's first viewer lost 7–22 keyframes over
+  3–11 s; now 1–2 in its first 2 s and none after. A share ramping from 1.3 to
+  4 Mb/s from its second second cost 433 evicted packets on a clean link and
+  1049–1975 (up to 18 failed keyframes) on the jittery one; now 59 (one
+  keyframe, once) and 8–1034 (up to 9). What jitter still costs is the
+  estimator's own back-off below the share's rate, which a steady 4 Mb/s share
+  meets too (111 and 548 packets evicted on two of five seeds).
 
   The start moves only ceilings: the SFU still forwards no more than the share
   sends, probes stay within the extras reserve, and nothing a client sends

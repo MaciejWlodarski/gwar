@@ -1,0 +1,103 @@
+scenario,arm,window_index,mean
+"in charge, then headphones",mono,0,0.586563494
+"in charge, then headphones",mono,1,0.589269805
+"in charge, then headphones",mono,2,0.734995332
+"in charge, then headphones",mono,3,0.806289823
+"in charge, then headphones",cold,0,0.527384422
+"in charge, then headphones",cold,1,0.528949832
+"in charge, then headphones",cold,2,0.646493821
+"in charge, then headphones",cold,3,0.712259194
+"in charge, then headphones",main-unreported,0,0.531441892
+"in charge, then headphones",main-unreported,1,0.536275198
+"in charge, then headphones",main-unreported,2,0.648352634
+"in charge, then headphones",main-unreported,3,0.723534242
+"in charge, then headphones",main-reported,0,0.531441892
+"in charge, then headphones",main-reported,1,0.560314111
+"in charge, then headphones",main-reported,2,0.76088945
+"in charge, then headphones",main-reported,3,0.716418995
+"in charge, then headphones",P7-unreported,0,0.528590072
+"in charge, then headphones",P7-unreported,1,0.547392172
+"in charge, then headphones",P7-unreported,2,0.648808457
+"in charge, then headphones",P7-unreported,3,0.72434732
+"in charge, then headphones",P7-reported,0,0.528590072
+"in charge, then headphones",P7-reported,1,0.561703002
+"in charge, then headphones",P7-reported,2,0.752603616
+"in charge, then headphones",P7-reported,3,0.722125962
+"warming, headphones 8 s before the share",mono,0,0.784079733
+"warming, headphones 8 s before the share",mono,1,0.795763007
+"warming, headphones 8 s before the share",mono,2,0.813835003
+"warming, headphones 8 s before the share",mono,3,0.813871304
+"warming, headphones 8 s before the share",cold,0,0.784079733
+"warming, headphones 8 s before the share",cold,1,0.621829581
+"warming, headphones 8 s before the share",cold,2,0.769577152
+"warming, headphones 8 s before the share",cold,3,0.706956373
+"warming, headphones 8 s before the share",main-unreported,0,0.731388715
+"warming, headphones 8 s before the share",main-unreported,1,0.713572433
+"warming, headphones 8 s before the share",main-unreported,2,0.742287146
+"warming, headphones 8 s before the share",main-unreported,3,0.734018992
+"warming, headphones 8 s before the share",main-reported,0,0.784079733
+"warming, headphones 8 s before the share",main-reported,1,0.621829581
+"warming, headphones 8 s before the share",main-reported,2,0.769577152
+"warming, headphones 8 s before the share",main-reported,3,0.706956373
+"warming, headphones 8 s before the share",P7-unreported,0,0.727644843
+"warming, headphones 8 s before the share",P7-unreported,1,0.719585088
+"warming, headphones 8 s before the share",P7-unreported,2,0.742738716
+"warming, headphones 8 s before the share",P7-unreported,3,0.734834278
+"warming, headphones 8 s before the share",P7-reported,0,0.784079733
+"warming, headphones 8 s before the share",P7-reported,1,0.621829581
+"warming, headphones 8 s before the share",P7-reported,2,0.761977189
+"warming, headphones 8 s before the share",P7-reported,3,0.712197466
+"warming, headphones 3 s before the share",mono,0,0.615148141
+"warming, headphones 3 s before the share",mono,1,0.748740035
+"warming, headphones 3 s before the share",mono,2,0.786556361
+"warming, headphones 3 s before the share",mono,3,0.802912229
+"warming, headphones 3 s before the share",cold,0,0.615148141
+"warming, headphones 3 s before the share",cold,1,0.606921002
+"warming, headphones 3 s before the share",cold,2,0.769577152
+"warming, headphones 3 s before the share",cold,3,0.706956373
+"warming, headphones 3 s before the share",main-unreported,0,0.55942592
+"warming, headphones 3 s before the share",main-unreported,1,0.646999528
+"warming, headphones 3 s before the share",main-unreported,2,0.732706258
+"warming, headphones 3 s before the share",main-unreported,3,0.733437387
+"warming, headphones 3 s before the share",main-reported,0,0.615148141
+"warming, headphones 3 s before the share",main-reported,1,0.606921002
+"warming, headphones 3 s before the share",main-reported,2,0.769577152
+"warming, headphones 3 s before the share",main-reported,3,0.706956373
+"warming, headphones 3 s before the share",P7-unreported,0,0.553801752
+"warming, headphones 3 s before the share",P7-unreported,1,0.657659397
+"warming, headphones 3 s before the share",P7-unreported,2,0.732934882
+"warming, headphones 3 s before the share",P7-unreported,3,0.732850998
+"warming, headphones 3 s before the share",P7-reported,0,0.615148141
+"warming, headphones 3 s before the share",P7-reported,1,0.606921002
+"warming, headphones 3 s before the share",P7-reported,2,0.761977189
+"warming, headphones 3 s before the share",P7-reported,3,0.712197466
+"in charge, then another room",mono,0,-45.247246778
+"in charge, then another room",mono,2,-44.217353114
+"in charge, then another room",mono,4,-48.051191683
+"in charge, then another room",mono,6,-58.182787436
+"in charge, then another room",mono,8,-49.202080338
+"in charge, then another room",cold,0,-42.855768133
+"in charge, then another room",cold,2,-43.477054737
+"in charge, then another room",cold,4,-50.668807277
+"in charge, then another room",cold,6,-55.403356905
+"in charge, then another room",cold,8,-49.337027232
+"in charge, then another room",main-unreported,0,-43.418749068
+"in charge, then another room",main-unreported,2,-42.993683003
+"in charge, then another room",main-unreported,4,-51.158882565
+"in charge, then another room",main-unreported,6,-58.773125401
+"in charge, then another room",main-unreported,8,-50.761661106
+"in charge, then another room",main-reported,0,-43.418749068
+"in charge, then another room",main-reported,2,-42.993683003
+"in charge, then another room",main-reported,4,-47.062752618
+"in charge, then another room",main-reported,6,-53.08700505
+"in charge, then another room",main-reported,8,-49.527126595
+"in charge, then another room",P7-unreported,0,-39.451354839
+"in charge, then another room",P7-unreported,2,-40.045555256
+"in charge, then another room",P7-unreported,4,-49.794990398
+"in charge, then another room",P7-unreported,6,-58.597197073
+"in charge, then another room",P7-unreported,8,-50.641664858
+"in charge, then another room",P7-reported,0,-39.451354839
+"in charge, then another room",P7-reported,2,-40.045555256
+"in charge, then another room",P7-reported,4,-45.92379351
+"in charge, then another room",P7-reported,6,-52.622954898
+"in charge, then another room",P7-reported,8,-49.430282451

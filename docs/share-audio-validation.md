@@ -742,6 +742,13 @@ mouth-to-ear.
 
 ### Warm stereo canceller
 
+**Near-voice fixture correction (PR #223).** The historical near-voice tables below
+use `voice()` / `long_voice()` for both talkers. Those fixtures share their vibrato
+and syllable rates, and overlapping harmonics can look like delayed far speech.
+The independent `talker()` audit below supersedes claims about how much near voice
+is preserved. Echo-only measurements have no near talker and are listed separately.
+
+
 The learning above is gone on speakers: a stereo canceller trains off the voice thread for the whole
 session and takes over within 5 frames of sound after the pin. "Cold" below is that earlier
 behaviour, which is what is left when no echo was found, and the rows are in release:
@@ -1011,6 +1018,1279 @@ only, and `E2E_SCREEN_AUDIO` is not part of CI.
 Not exercised here: the real macOS permission grant, the native capture on Windows, and
 Chrome's visible second picker, which the test selects automatically. Those need a person
 and the app.
+
+### Owner-approved Left warm P7 (PR #223, current implementation)
+
+**State: final validation complete; ready for review.**
+The owner selected **Left warm P7 only**, accepting 6/549 echo windows >+1 dB,
+2 >+3 dB, 0 >+6 dB, max +4.614568710 dB and total energy +0.200643008 dB.
+Production still keeps warm takeover, the first-sound pin and the left reference.
+
+The controlled four-share comparison **passes**: head `76991906` (main merged)
+against main `6c1c45c9`, separate release builds, head/main/head/main/head/main,
+three valid runs each, start load <3.5, void >4.5, no overlapping cargo/test or
+#213 timing, no sleep. Head max p99 delta is **+0.966 ms** (limit 1.0), main
++0.655 ms. Mean four-share p99 is equal (0.834 versus 0.842 ms); the higher head
+median delta (+0.502 versus +0.170 ms) comes from lower no-share baselines in the
+same runs and is not significant (permutation p=0.40). All 18 attempts, including
+12 voided for another worker's cargo or load, and all 36 pairs are in
+[the quiet timing archive](measurements/aec-quiet-223/README.md). The earlier
+uncontrolled +1.241 ms and +0.344 ms runs below are superseded.
+
+`the_share_canceller_ships_p7_and_voice_keeps_the_default` and
+`the_shipped_share_canceller_keeps_more_double_talk` run in CI and fail if the
+production P7 field is reverted; the measurement override in `canceller` keeps
+the production value for the shipped arm.
+
+Final-head local validation (2026-11-04, main merged): both fingerprints
+`c2d868db7d8d0eeb`; four heap guards; 53 active release APM tests; the 12-case
+speech matrix (11 strict passes and the accepted one-frame headphone deficit);
+all 549 echo windows (6/2/0, worst +4.614568710 dB, energy +0.200643008 dB);
+all 2,754 route cells / 102 means; 1 Mb/s p99 9.048–9.288 ms. The regenerated
+speech, echo/energy and route CSVs are byte-identical to the committed approved
+P7 CSVs. Featureless `cargo check --release -p gwar-client --lib` passes and
+the normal/build graph contains neither measurement feature. fmt, clippy
+(`-D warnings`) and the full workspace suite (1,498 passed, 0 failed, 51
+ignored) pass, as do the 13 standalone Sonora `echo_canceller3` tests including
+the measurement-only constructor regression.
+[Final validation](measurements/aec-final-validation.txt).
+
+The Sonora two-reference fix remains dev-feature opt-in only, for the separate
+follow-up.
+
+Earlier checkpoints in this document are historical, including their stop states.
+
+The production change against main `1099a681` is only
+`ep_strength.nearend_len = 0` for the share canceller, in both native configs.
+The warm takeover, first-share-sound stereo pin, left-only reference wiring,
+adaptive filter, other suppressor settings, gain control, model and existing
+route-change handling stay as on main. Mono voice construction keeps its default.
+The owner rejected mono-like tuning. The per-content selector failed dominance
+in 168/432 case/windows and is measurement-only.
+
+The owner accepts **6/549 echo windows above +1 dB, 2 above +3 dB, 0 above +6 dB,
+worst +4.614568710 dB, total energy +0.200643008 dB** against current warm/main.
+The four onset windows and two repeated mono controls at 7–8 s remain visible;
+this is not a claim that all extra echo is immediately after the pin. The 549
+observations include repeated controls, as explained in the historical options
+section. No strict +1 dB echo-gate pass is claimed.
+[Raw shipped echo](measurements/aec-shipped-echo.txt),
+[all 549 windows and f64 energies](measurements/aec-shipped-echo.csv),
+[energy summary](measurements/aec-shipped-echo-summary.csv).
+
+#### Shipped speech matrix
+
+The actual production configuration is selected by its ordinary config field,
+not by forcing measurement profile 7. The matrix includes leading render audio,
+render and voice Opus, AGC, gates and the full embedded denoiser. Held means active
+decoded 10 ms frames in the longest hold, not total wall-clock silence. Kept is
+RMS-based and can include leaked echo. All cases have 1,155 active input frames.
+
+| Lead, s | Route | Denoising % | Cold held / kept frames | P7 held / kept frames | Strict floor |
+| --- | --- | --- | --- | --- | --- |
+| 6 | headphones | 0 | 25 / 851 | 25 / 850 | one frame below; owner accepted |
+| 6 | headphones | 50 | 37 / 823 | 37 / 824 | PASS |
+| 6 | headphones | 100 | 37 / 824 | 37 / 825 | PASS |
+| 6 | speakers | 0 | 49 / 965 | 0 / 1155 | PASS |
+| 6 | speakers | 50 | 70 / 320 | 0 / 707 | PASS |
+| 6 | speakers | 100 | 136 / 121 | 49 / 487 | PASS |
+| 10 | headphones | 0 | 84 / 795 | 79 / 800 | PASS |
+| 10 | headphones | 50 | 84 / 765 | 79 / 771 | PASS |
+| 10 | headphones | 100 | 84 / 763 | 79 / 772 | PASS |
+| 10 | speakers | 0 | 93 / 980 | 0 / 1155 | PASS |
+| 10 | speakers | 50 | 105 / 355 | 0 / 705 | PASS |
+| 10 | speakers | 100 | 106 / 148 | 49 / 492 | PASS |
+
+P7 meets the strict held/kept floor in 11/12 cases. The explicit accepted
+exception is headphones, 6 s lead, denoising 0: 850 kept frames versus cold 851,
+held 25 in both (0.73593074 versus 0.73679656). The acceptance test retains its
+name `recorded_speech_is_not_held_after_stereo`, uses integer frame counts and
+permits exactly this one frame in this one case. It does not round all cases or
+weaken the held-frame requirement. Default speaker cases improve from cold
+136/0.104761906 and 106/0.12813853 to **49/0.42164502 and 49/0.425974**.
+There are still speech holds; this is an improvement, not no-AEC equivalence.
+[Raw matrix](measurements/aec-shipped-speech.txt),
+[all counts](measurements/aec-shipped-speech.csv).
+
+#### Route gaps: main versus shipped P7
+
+No production acoustic absence detector, Linux default-device polling or macOS
+data-source listener remains from the rejected experiments. The `pulseaudio`
+crate and its now-orphaned null-sink CI test are removed. Existing main macOS
+default-device/device-list notifications remain. The workflow, `io.rs` and
+`watch.rs` match main exactly. OS notices did not meet the joint route floors;
+a notice can help one headphone window and worsen another room's echo.
+
+The measurement-only route table retains all 27 rooms, three independent near
+voices, and all windows against both main and pre-#220 cold. Values below are
+means; the complete per-room CSV is authoritative for individual regressions.
+Headphone windows are seconds 0–3 / 3–5 / 5–8 / 8–16 after the later of route
+change and pin. Higher kept is better.
+
+**in charge, then headphones.**
+
+| Arm | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| mono | 0.587 | 0.589 | 0.735 | 0.806 |
+| cold | 0.527 | 0.529 | 0.646 | 0.712 |
+| main-unreported | 0.531 | 0.536 | 0.648 | 0.724 |
+| P7-unreported | 0.529 | 0.547 | 0.649 | 0.724 |
+| main-reported | 0.531 | 0.560 | 0.761 | 0.716 |
+| P7-reported | 0.529 | 0.562 | 0.753 | 0.722 |
+
+**warming, headphones 8 s before the share.**
+
+| Arm | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| mono | 0.784 | 0.796 | 0.814 | 0.814 |
+| cold | 0.784 | 0.622 | 0.770 | 0.707 |
+| main-unreported | 0.731 | 0.714 | 0.742 | 0.734 |
+| P7-unreported | 0.728 | 0.720 | 0.743 | 0.735 |
+| main-reported | 0.784 | 0.622 | 0.770 | 0.707 |
+| P7-reported | 0.784 | 0.622 | 0.762 | 0.712 |
+
+**warming, headphones 3 s before the share.**
+
+| Arm | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| mono | 0.615 | 0.749 | 0.787 | 0.803 |
+| cold | 0.615 | 0.607 | 0.770 | 0.707 |
+| main-unreported | 0.559 | 0.647 | 0.733 | 0.733 |
+| P7-unreported | 0.554 | 0.658 | 0.733 | 0.733 |
+| main-reported | 0.615 | 0.607 | 0.770 | 0.707 |
+| P7-reported | 0.615 | 0.607 | 0.762 | 0.712 |
+
+**in charge, then another room.** Quiet near-end seconds 0–1 / 2–3 / 4–5 / 6–7 / 8–9, echo dBFS; lower is better.
+
+| Arm | 0–1 | 2–3 | 4–5 | 6–7 | 8–9 |
+| --- | --- | --- | --- | --- | --- |
+| mono | -45.247 | -44.217 | -48.051 | -58.183 | -49.202 |
+| cold | -42.856 | -43.477 | -50.669 | -55.403 | -49.337 |
+| main-unreported | -43.419 | -42.994 | -51.159 | -58.773 | -50.762 |
+| P7-unreported | -39.451 | -40.046 | -49.795 | -58.597 | -50.642 |
+| main-reported | -43.419 | -42.994 | -47.063 | -53.087 | -49.527 |
+| P7-reported | -39.451 | -40.046 | -45.924 | -52.623 | -49.430 |
+
+P7 does **not** fix #220's unreported warming regression. At 8 s before pin,
+the first-window mean changes 0.731389 → 0.727645 (cold 0.784080); at 3 s it changes
+0.559426 → 0.553802 (cold 0.615148). Later windows have mixed, small changes. In
+charge, the first headphone mean falls 0.531442 → 0.528590; the next three rise.
+After a different-room change, mean echo is louder by +3.967 / +2.948 / +1.364 /
++0.176 / +0.120 dB. This remains separate route-gap work; no route-floor pass is
+claimed. Per-room P7/unreported deficits against main occur in 25/108 in-charge
+headphone cells, 11/108 (8 s), 22/108 (3 s), and 108/135 echo cells. Against cold,
+they occur in 45/108, 58/108, 73/108 and 78/135 respectively.
+The worst individual different-room quiet-echo cell is -69.559 → -39.434 dBFS (+30.126 dB), far 100 Hz, delay 150 ms, near 213 Hz, seconds 0–1. This is outside the fixed-room 549-window catalogue.
+[Raw route table](measurements/aec-shipped-routes.txt),
+[all 2,754 cells](measurements/aec-shipped-routes.csv),
+[102 means](measurements/aec-shipped-route-means.csv).
+
+#### Known defect: one render reference; follow-up
+
+The current Sonora constructor hardcodes one render reference while detection
+is disabled. Its "stereo" path is therefore left-only, including main and this
+release. `d9972dfe` fixes a real upstream-port defect by calling `initialize`
+in the constructor. That change now exists only in
+`new_initialized_for_measurement`, behind `gwar-aec-measurements`, and requires
+explicit `measurement_two_channel_start = true`. The default is false even
+when the dev feature is present. No constructor fix is enabled in production.
+The corrected constructor regression and an active Gwar regression for the
+retained one-reference production path make the two choices explicit.
+
+Corrected two-reference variants remove 48–52 dB more right-only echo, but fail
+the joint speech/echo gates. They need a separate follow-up. The complete options
+and right-path tables below remain measurement evidence, not selected behavior.
+`gwar-aec-measurements` and `model-measurements` are enabled only by dev
+dependencies; native-state snapshots, linear-output export, nonlinear resets,
+mono-like tuning, channel correction and model experiments require those features.
+A read-only `cargo tree -e normal,build` check confirms neither feature in the
+production graph, and a fresh featureless release compilation passes.
+
+#### Assertions and historical uncontrolled validation
+
+The timing numbers in this subsection are uncontrolled and superseded by the
+quiet comparison above; they are kept as history.
+
+The two Rust-CI failures at the two-reference checkpoint were
+`the_switch_keeps_the_voice_in_time` (586 versus 585 samples) and
+`wide_sound_from_the_first_moment_after_voice_does_not_leak` (-28.5 dBFS versus
+<-55 dBFS). Their assertions are unchanged and both pass with shipped left P7.
+A separate cold-fallback RMS comparison against mono was stale: P7 intentionally
+preserves more near voice and differed by 3.3 dB. It now requires bit-for-bit
+agreement with ordinary cold P7 across the entire output, while retaining the
+original click bound and the before-takeover mono equality. This tests the
+actual fallback contract, without loosening a numerical threshold.
+
+The shipped configuration's completed validation is below. The exact unchanged
+six-pair four-share guard completed all pairs and sent-frame guards, then failed
+with **+1.241 ms** in pair 4: no-share p99 0.063 ms, four-share p99 1.304 ms.
+The earlier selected-option +0.344 ms pass is historical evidence, not a
+replacement for this failed repetition. No valid failed timing run was retried.
+
+| Requirement | Current checkpoint |
+| --- | --- |
+| Speech matrix | 12 completed; 11 strict passes, one owner-accepted single-frame headphone deficit |
+| Echo table | All 549 meet the exact approved P7 envelope; >+1/+3/+6 dB: 6/2/0, worst +4.614568710 dB, total +0.200643008 dB |
+| Route table | 2,754 cells / 102 means completed; warming regression is slightly worse, not fixed |
+| Both voice-alone fingerprints | PASS: `c2d868db7d8d0eeb` |
+| Active release APM / heap guards | PASS: 53 tests; all four voice-thread heap guards, including replacement/refusal |
+| Four-share six pairs | **FAIL:** max +1.241 ms, limit <1.0 ms; all sent-frame guards pass |
+| 1 Mb/s p99 | Not rerun at this checkpoint after the hard stop; prior 9.048–9.288 ms evidence is historical |
+| Production dependency feature graph | PASS: neither diagnostic feature in normal/build edges |
+| Final full workspace / clippy / standalone constructor tests / featureless compilation | Not rerun after the hard stop |
+| Formatting / diff whitespace | PASS: workspace fmt, upstream-style vendor fmt, `git diff --check` |
+| Final Linux / overall CI | See PR #223 checks on the pushed checkpoint; not claimed green here |
+
+| Pair/order | No-share p99, ms | Four-share p99, ms | Delta, ms |
+| --- | --- | --- | --- |
+| 0: [0, 4] | 0.701 | 1.292 | +0.591 |
+| 1: [4, 0] | 0.040 | 0.707 | +0.666 |
+| 2: [0, 4] | 0.903 | 1.033 | +0.130 |
+| 3: [4, 0] | 0.476 | 1.135 | +0.659 |
+| 4: [0, 4] | 0.063 | 1.304 | +1.241 |
+| 5: [4, 0] | 0.413 | 0.617 | +0.204 |
+
+An earlier attempt was stopped before completing six pairs because inherited
+nice 10 plus another `nice -n 10` produced actual nice 20. Its complete partial
+output is retained and excluded. The valid replacement was verified at actual
+nice 10 before its first pair completed. No other heavy build/test ran alongside
+it. [Invalid input](measurements/aec-shipped-four-invalid-priority.txt),
+[valid hard-limit failure](measurements/aec-shipped-four.txt),
+[all six pairs](measurements/aec-shipped-four.csv),
+[validation and fingerprints/heap output](measurements/aec-shipped-validation.txt).
+The test uses virtual headphones, AGC on, denoising 0, no leading audio and the
+release dev-feature binary; it does not measure denoise-100 worker scheduling
+or hardware latency. No local browser, WebKit, physical audio output or
+production service is used. No additional performance workaround is selected:
+production remains only P7, as ordered.
+
+Reproduce the committed acoustic CSVs without building or playing audio:
+
+```sh
+python3 docs/measurements/summarize-aec-shipped.py
+```
+
+#### Reproduction commands
+
+Do not overlap another heavy build or #213's timing. The helper sets absolute
+nice 10, uses four Cargo jobs and separate targets, and records both revisions.
+
+```sh
+S=$(mktemp -d /tmp/gwar-aec-XXXX)
+MAIN=$(git merge-base HEAD origin/main)
+git worktree add --detach "$S/main" "$MAIN"
+python3 docs/measurements/build-aec-pair.py --head-dir . --main-dir "$S/main" --main-sha "$MAIN" --target-root "$S/targets" --out "$S/binaries.json"
+python3 docs/measurements/run-aec-quiet-timing.py --binaries "$S/binaries.json" --out "$S/quiet" --start-load 3.5 --max-load 4.5
+python3 docs/measurements/summarize-aec-quiet.py "$S/quiet"
+```
+
+Remaining gates, using the head test binary from `$S/binaries.json`:
+
+```sh
+export CARGO_TARGET_DIR="$S/targets/head" CARGO_BUILD_JOBS=4
+AEC_PROBE=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head"]["binary"])' "$S/binaries.json")
+nice -n 10 "$AEC_PROBE" fingerprint --ignored --nocapture --test-threads=1
+nice -n 10 "$AEC_PROBE" heap_on_the_voice_thread --nocapture --test-threads=1
+nice -n 10 "$AEC_PROBE" voice::apm --test-threads=1
+nice -n 10 "$AEC_PROBE" voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo --exact --ignored --nocapture --test-threads=1
+nice -n 10 "$AEC_PROBE" voice::apm::tests::shipped::shipped_p7_echo_tables --exact --ignored --nocapture --test-threads=1
+nice -n 10 "$AEC_PROBE" voice::apm::tests::shipped::what_an_unreported_device_costs --exact --ignored --nocapture --test-threads=1
+nice -n 10 cargo test --locked --release -p gwar-server --lib low_bandwidth_bursts_preserve_voice_with_and_without_video -- --nocapture --test-threads=1
+nice -n 10 cargo check --locked --release -p gwar-client --lib
+cargo tree --locked -p gwar-client -e normal,build --format '{p} {f}'
+nice -n 10 cargo clippy --locked --workspace --exclude gwar-desktop --all-targets -- -D warnings
+cargo fmt --all --check
+nice -n 10 cargo test --locked --workspace --exclude gwar-desktop -- --test-threads=1
+```
+
+`shipped_p7_echo_tables` compares every main-arm level bit for bit against
+`aec-paired-echo-cases.csv`, recorded on aarch64 macOS. Sonora's SIMD paths
+differ on x86_64, so that check is valid on aarch64 macOS only; it is not
+loosened, because the byte identity is the point. The measurement tests share
+process-wide controls behind one lock and must run single-threaded
+(`--test-threads=1`), as above.
+
+To compare acoustic outputs, copy `summarize-aec-shipped.py` into a scratch
+directory with the speech, echo and route outputs saved as
+`aec-shipped-speech.txt`, `aec-shipped-echo.txt` and `aec-shipped-routes.txt`,
+run it there and `cmp` the five CSVs against the committed ones. The featureless
+graph must omit `gwar-aec-measurements` and `model-measurements`. For the
+isolated Sonora follow-up regression only (not a production selection):
+
+```sh
+nice -n 10 cargo test --offline --manifest-path vendor/sonora/Cargo.toml --config "patch.crates-io.sonora-aec3.path=\"$PWD/vendor/sonora-aec3\"" --features gwar-aec-measurements --release --lib echo_canceller3::tests -- --test-threads=1
+rm vendor/sonora/Cargo.lock  # generated by the standalone command
+```
+
+### Correct render references and native options (historical PR #223 options checkpoint)
+
+**Historical checkpoint, superseded by the owner-approved P7 section above.** No measured option passes both strict acoustic gates.
+The separate constructor fix is commit `d9972dfe8cf8744e1097f4c7ef8b7b814b438b80`.
+It calls `initialize` as [upstream WebRTC does](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/echo_canceller3.cc) and makes the draft branch actually
+use both reference channels when detection is disabled. No experimental profile,
+mono-like tuning, model change, or per-content selector is selected for production.
+The default suppressor profile and warm-takeover policy remain in place. This is
+an options checkpoint, not readiness for review or permission to merge.
+
+The historical cold floor remains the pre-fix left-reference control, not a new
+cold baseline after the wiring change. Every held/kept cold value was reproduced
+exactly. For echo, the historical warm left-reference/profile-0 control remains
+the reference. All 549 dBFS values of that warm control, the cold control and
+left-reference warm/profile 7 match the previous raw tables exactly. The
+measurement-only reconstruction of left-reference startup defaults off.
+
+The formerly ignored native channel regression fails before the constructor fix
+(one reference instead of two) and passes afterward. All 13 wrapper AEC3 tests
+pass. [Constructor test evidence](measurements/aec-constructor-validation.txt).
+
+#### Options: strict speech and echo gates
+
+Default speaker cases use denoise 100 and AGC on. Each speech cell gives held
+active decoded 10 ms frames / kept, for 6 s and 10 s leads. These are not necessarily
+consecutive wall-clock seconds. Kept is RMS-based and can include leaked echo.
+Speech acceptance checks held <= historical cold and kept >= historical cold in
+each of 12 lead/route/denoise cases, without rounding tolerances.
+
+| Arm | Default speech: held/kept, lead 6; lead 10 | Speech pass /12 | Echo windows >+1 / +3 / +6 dB | Worst echo delta, dB | Total echo energy delta, dB | Four-share max delta / guard |
+| --- | --- | --- | --- | --- | --- | --- |
+| left-warm-p7 | 49/0.422; 49/0.426 | 11 | 6 / 2 / 0 | +4.615 | +0.201 | +0.344 ms / PASS |
+| two-warm-p7 | 192/0.081; 151/0.113 | 0 | 185 / 92 / 65 | +48.033 | +2.465 | +1.843 ms / FAIL |
+| two-cold-p7 | 80/0.602; 106/0.606 | 6 | 422 / 312 / 221 | +64.952 | +12.770 | +0.806 ms / PASS |
+| two-warm-p1 | 192/0.084; 342/0.119 | 0 | 198 / 98 / 70 | +48.541 | +2.397 | +0.292 ms / PASS |
+| two-cold-p1 | 80/0.602; 106/0.606 | 6 | 424 / 314 / 221 | +64.952 | +12.774 | +0.224 ms / PASS |
+
+Historical default cold: 136/0.105 and 106/0.128; historical warm: 510/0.142 and
+421/0.133. The 549 rows are 396 mono-table observations, including repeated
+pure-echo controls for both near-pitch labels, plus 153 wide-table observations.
+They are not 549 independent rooms. The echo tables are synthetic AEC-only PCM,
+without Opus, AGC, gating or denoising; the speech matrix includes both Opus
+passes, the gates, AGC and the embedded model. Total energy is the sum of squared samples
+in f64 divided by 48 kHz, across exactly those windows; it includes their actual
+durations and the documented repeated controls. Delta is 10 log10(candidate / warm
+control total). It is a catalogue metric, not a distribution of real users' rooms.
+
+At the worst two-reference warm windows (`wide new 150->120`, pin 60 s,
+0-0.25 s), absolute echo is -80.007 -> -31.974 dBFS (two-warm-p7); -80.007 -> -31.466 dBFS (two-warm-p1).
+The cold worst is -92.647 -> -27.695 dBFS at `wide same 190->190`,
+pin 310 s, 0.25-0.5 s. Large relative dB differences at a quiet floor and
+loud onset echo are therefore visible separately from the energy aggregate.
+
+Profile 7 with the historical left reference passes 11/12 speech cases. The one
+failure is headphones, lead 6 s, denoise 0: kept 0.73593074 versus cold 0.73679656,
+with 25 held frames in both. This single active frame is not rounded into a pass.
+Its echo has four >1 dB windows in the first second and two repeated mono controls
+at 7-8 s (+1.176 dB). Thus its six failures are not all immediately after takeover.
+
+The two-reference cold arms pass every speaker case and fail every headphone
+case. Warm fails all 12 cases with either profile. Profile 7 cold preserves more
+headphone speech than profile 1 cold at lead 10 s (43 held versus 84, kept about
+0.608-0.629 versus 0.593-0.617), but both remain below the historical kept floor.
+All 60 speech observations and per-window echo/energy observations are preserved:
+[aec-reference-speech.csv](measurements/aec-reference-speech.csv),
+[aec-reference-echo.csv](measurements/aec-reference-echo.csv),
+[aec-reference-echo-summary.csv](measurements/aec-reference-echo-summary.csv).
+
+#### Right-only and independent wide shares
+
+An additional 108 windows per arm cover four leads (6/20/60/310 s) and three
+shapes. `right-only` has zero left render after the pin and only the right speaker
+reaches the microphone. `wide-right` uses independent left/right fixtures and
+only the right acoustic path. `wide-both` adds the left path and 0.7 times the right
+path. The right fixture has unrelated vibrato and syllable timing. These 108
+windows are separate from the required 549 and are not pooled into their energy.
+
+| Arm | Right-only energy delta, dB | Independent wide/right delta, dB | Independent wide/both delta, dB |
+| --- | --- | --- | --- |
+| left-warm-p7 | -0.014 | +1.105 | +1.843 |
+| two-warm-p7 | -50.824 | -26.982 | -12.409 |
+| two-cold-p7 | -48.237 | -28.790 | +3.947 |
+| two-warm-p1 | -51.590 | -27.414 | -6.766 |
+| two-cold-p1 | -48.239 | -28.785 | +4.864 |
+
+The right-reference bug is directly visible: corrected variants reduce right-only
+energy by 48-52 dB. Correct reference wiring does not make the warm/cold trade-off
+disappear. [All right-path windows](measurements/aec-reference-right-echo.csv) and
+[aggregate metrics](measurements/aec-reference-right-summary.csv).
+
+#### Validation and remaining blockers
+
+Both voice-alone fingerprints remain `c2d868db7d8d0eeb`. Voice-thread heap guards,
+including replacement, pass. The active APM suite has 52 passing tests and two
+unchanged assertions failing after correct two-reference construction: the
+cross-correlation lag estimate is 586 versus 585 samples, and the first-quarter-
+second warm wide echo is -28.5 dBFS against a <-55 dBFS requirement. Those
+assertions are preserved. [Final validation output](measurements/aec-reference-validation.txt).
+Release workspace clippy with all targets (excluding
+the desktop package) passes with `-D warnings`. All five options completed the unchanged six-pair four-share test body. Four
+pass the p99 and sent-frame guards; two-reference warm/profile 7 fails the p99
+bound with +1.843 ms in its sixth pair. All sent-frame guards pass. No failing
+run is replaced with a favorable rerun. The unchanged exact guard on the corrected
+default profile (no experimental tuning) also passes six pairs, maximum reported
+delta +0.288 ms. [Default guard output](measurements/aec-reference-four-default.txt).
+
+The timing tests use virtual headphones, no leading audio, AGC on and native
+denoise 0. They use the same release test binary with dev-only AEC diagnostics
+and linear-output export enabled. They do not measure the denoise-100 model's
+worker scheduling or hardware latency. The table reports the largest printed
+three-decimal delta; the Rust guard checks the unrounded value. Raw logs for
+[option 1](measurements/aec-reference-four-1.txt),
+[option 2](measurements/aec-reference-four-2.txt),
+[option 3](measurements/aec-reference-four-3.txt),
+[option 4](measurements/aec-reference-four-4.txt),
+[option 5](measurements/aec-reference-four-5.txt), and
+[summary](measurements/aec-reference-four-summary.csv).
+
+Recommendation for the owner: select no tuning automatically. Among correctly
+wired options, cold/profile 7 is the preferred speech-first trade-off to discuss:
+it improves default speaker speech substantially, does better than cold/profile 1
+on the 10 s headphone cases, has slightly lower aggregate echo, and passes the
+four-share guard. Its catalogue echo energy is +12.770 dB against current warm,
+but only +0.011 dB against historical cold. The six headphone kept-floor failures
+and 422 echo windows above +1 dB remain explicit costs requiring an owner decision.
+Historical left-only/profile 7 remains a counterfactual option with the reference
+wiring defect; it is not enabled as a fix.
+
+Raw speech logs: [profile 7, historical left](measurements/aec-profile7-full-speech.txt),
+[all four two-reference arms](measurements/aec-two-reference-speech.txt).
+Raw echo logs: [full 549](measurements/aec-reference-full-echo.txt),
+[right paths](measurements/aec-reference-right-echo.txt).
+The raw files regenerate the CSVs without building or playing audio:
+
+```sh
+python3 docs/measurements/summarize-aec-reference-options.py --speech --echo --right
+```
+
+### Priority 1: default recorded-speech regression (historical pre-fix checkpoint)
+
+**Historical checkpoint:** default warm + speakers + full denoising is the production
+regression under investigation. `apps/web/src/state/settings.ts` defaults to
+`noiseStrength: 100`, noise suppression on, echo cancellation on and automatic
+gain control on. The model is unchanged. Route floors are lower priority until
+this regression is resolved. No measured native variant passes both full speech
+and echo acceptance. `recorded_speech_is_not_held_after_stereo` now checks
+warm against cold across both leads, both routes and all three denoising levels;
+no failing-first acceptance is removed. The acceptance rerun reproduces the same
+12 held/kept pairs exactly; the two speaker/full-denoise cases fail. Its process
+was paused for another worker, so its elapsed duration is not a timing result.
+[Full failing-first output](measurements/aec-speech-acceptance.txt).
+
+#### Native AEC wiring defect and measurement scope
+
+The audit found that Sonora's `EchoCanceller3::new` hardcodes
+`num_render_channels_to_aec = 1` even with stereo detection disabled. The disabled
+detector already reports persistent multichannel content but its update returns
+false, so the constructor never calls `initialize`. Render subframe preparation
+then copies only the left input when temporary detection is false. The new native
+snapshots confirm **one reference channel** for the historical "stereo" control.
+[Upstream WebRTC calls `Initialize()` in its constructor](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/echo_canceller3.cc),
+which selects the actual channel count from the detector's initial state.
+
+The historical tables below still describe the measured production program;
+"stereo" in those tables means the requested two-channel stream and multichannel
+configuration, not two actual adaptive reference channels. Conclusions about true
+two-reference stereo versus mono cannot be inferred from those old arms. A
+separate diagnostic calls native initialization correctly, keeping all existing
+multichannel tuning unchanged. It is not yet selected for production.
+
+Native AEC3 0.2.0 is vendored with its original license, registry checksum and
+feature-gated snapshots/state controls. The wrapper exports its native 16 kHz
+linear output. Projection of that low-band signal is a diagnostic, not a full-band
+speech score. The post-suppressor output is measured at 48 kHz before AGC. Baseline
+AEC and model outputs reproduce the earlier recorded-speech results.
+
+The candidate already receives the real pre-AEC microphone: `cancel_echo` copies
+the input into `Heard::Microphone` before processing it, and the worker sends that
+copy to AEC3. It is not trained on the far reference as a fake microphone. The
+probe's near talker begins one second before the share, after far-only leading
+audio, which is intentional.
+
+#### First isolated state experiments
+
+Six-second lead, both speaker paths, full denoising and **default AGC on**. Thus
+the cold control has 136 decoded held frames here; the earlier 80 decoded / 112
+manual-gate values used AGC off. All holds count active-input 10 ms frames, not
+necessarily consecutive wall-clock time. `kept` is RMS-based and may include echo;
+full acceptance also requires the quiet-echo tables.
+
+| Native arm | Held decoded frames | Kept | Linear projected gain, 3-8 s dB | Suppressor projected gain, 3-8 s dB | Model projected gain, 8-16 s dB |
+| --- | --- | --- | --- | --- | --- |
+| Cold current (AGC on) | 136 | 0.105 | -2.45 | -8.22 | -35.09 |
+| Warm current (AGC on) | 510 | 0.142 | -2.46 | -8.24 | -70.27 |
+| Reset suppression gain | 510 | 0.145 | -2.46 | -8.24 | -70.23 |
+| Reset ERLE only | 510 | 0.145 | -2.46 | -8.24 | -70.93 |
+| Reset AEC state, keep filters | 409 | 0.167 | -2.49 | -8.29 | -60.17 |
+| Reset gain and ERLE | 510 | 0.167 | -2.46 | -8.24 | -70.89 |
+| Warm, correct two-reference start | 190 | 0.078 | -3.63 | -28.74 | -41.07 |
+| Cold, correct two-reference start | 80 | 0.602 | -2.56 | -2.53 | -5.79 |
+| Warm, two references + gain reset | 129 | 0.084 | -3.63 | -28.74 | -41.10 |
+| Warm, two references + ERLE reset | 131 | 0.049 | -3.63 | -28.74 | -40.59 |
+
+Resetting suppression gain alone or ERLE alone leaves the 510-frame hold. A
+fresh AEC state with the old filters reduces it to 409, still above cold. Correct
+two-reference construction alone is not enough for warm. The cold two-reference
+arm improves recorded-speech output, but its native state enters transparent mode
+and its echo must be measured before considering it a fix.
+
+At 3-8 s, current warm's linear projection is -2.46 dB versus -8.24 dB after the
+suppressor. Current cold's corresponding projections are -2.45 / -8.22 dB: late
+AEC outputs are very similar despite the model's much larger warm loss later.
+The warm/cold difference develops after different takeover histories in the first
+three seconds. Snapshots also show different render-buffer delay estimates:
+56 ms in the warm path and 12 ms in the cold path in this room. Reverb decay stays
+at 0.83 in both, and warmed ERLE rapidly falls after the content changes. These
+observations guide further native residual/reverb/noise/config isolation; they
+do not establish a single cause yet. The model is not modified.
+
+[Complete linear/suppressor snapshots](measurements/aec-linear-suppression.txt)
+include ERL/ERLE, delay, filter delay, gains, nearend/transparent state and powers
+at half-second intervals. Native resets currently execute only in isolated tests;
+any selected production reset must be prepared on the worker to preserve the
+voice-thread heap bound.
+
+#### Recorded-speech matrix and full echo rejection
+
+Native profile 1 disables only the conservative tail-frequency-response envelope;
+it keeps the estimated reverb model and decay. Profile 2 sets the native default
+and nearend reverb decay to zero. Both keep the existing filter, suppression
+attack/release tuning and model. The historical control still has the one-left-
+reference wiring defect described above; correct two-reference arms are separate.
+
+Both profiles pass **all 12** lead (6/10 s), route (headphones/speakers) and
+denoise (0/50/100) cases against the unchanged cold control. With speakers and
+full denoising:
+
+| Lead | Cold hold / kept | Current warm hold / kept | Profile 1 hold / kept | Profile 2 hold / kept | No AEC hold / kept |
+| --- | --- | --- | --- | --- | --- |
+| 6 | 136 / 0.105 | 510 / 0.142 | 93 / 0.243 | 49 / 0.424 | 3 / 0.797 |
+| 10 | 106 / 0.128 | 421 / 0.133 | 81 / 0.193 | 49 / 0.424 | 3 / 0.797 |
+
+The preliminary quiet-echo gate uses 32 half-second windows for each lead on the
+same four-share signal, without AGC or denoising. Profile 1's largest increase
+is +0.062 dB; profile 2's is +0.263 dB. Both meet the +1 dB bound here. Correct
+native two-reference variants fail the speech matrix, including headphones, and
+are not selected. The cold two-reference arm also exceeds the preliminary echo
+bound by 5.02 dB in one first window.
+
+The full paired #220 echo tables reject both apparent winners. They cover the
+original mono and wide/same/new/antiphase/steady/speaker cases, delays, levels and
+pin times. Each run compares the candidate directly with the unchanged warm
+control before rounding; every room/window must be no more than 1 dB louder.
+There are 549 paired observations per profile (396 from the mono table, including
+repeated pure-echo controls for both near-talker pitches, and 153 from the wide
+table). These are not 549 independent rooms.
+
+| Native profile | Speech gate, 12 cases | Echo observations > +1 / +3 / +6 dB | Worst echo delta | Total energy delta, dB | Current warm / candidate dBFS at the worst window |
+| --- | --- | --- | --- | --- | --- |
+| 1: disable conservative tail envelope | Pass | 12 / 5 / 3 | +13.498 | +0.136 | -59.328 / -45.830 |
+| 2: zero default and nearend decay | Pass | 47 / 25 / 14 | +14.951 | +1.133 | -59.328 / -44.377 |
+| 7: zero nearend decay only | 11/12, completed in the latest checkpoint | 6 / 2 / 0 | +4.615 | +0.201 | -36.599 / -31.985 |
+| Plain cold, unchanged config | Speech baseline | 408 / 296 / 211 | +64.952 | +12.759 | -92.647 / -27.695 |
+
+The historical profile-1/2 energy aggregates are reconstructed from the unrounded
+per-window RMS dB values and durations; the latest options above additionally
+record direct f64 sums of squares.
+
+Profiles 1 and 2 are worst in `wide both speakers`, pin 310 s, 0.5-1 s after
+pinning. Profile 7 is worst in `wide steady`, pin 310 s, 0.25-0.5 s. Plain cold
+is worst in `wide same 190->190`, pin 310 s, 0.25-0.5 s. Plain cold therefore
+also fails the requested +1 dB echo bound; reverting warm takeover is an owner
+trade-off, not an accepted fix under that bound.
+
+A zero decay config does not clear an existing reverb-power accumulator:
+`ReverbModel::update_reverb` skips updating it when decay is zero, matching
+[upstream WebRTC](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/reverb_model.cc).
+Thus profile 7 freezes the stored tail during dominant nearend; it does not simply
+multiply the current residual by zero. Profile 2 starts with both decays zero and
+never builds that accumulator. Nearend-only mild decay 0.75/0.76 still holds
+421-510 active decoded speech frames at the two default speaker leads.
+Requiring stronger nearend evidence (ENR threshold 0.05 or 0.01 instead of 0.25)
+with nearend decay zero also fails both default speaker cases: 421-510 held frames,
+kept 0.048-0.098, below cold's 0.105/0.128. These stricter arms are rejected before
+spending a full echo-table run. [Strict-nearend screen](measurements/aec-strict-nearend.txt).
+Profile 9 (default decay 0.80, nearend decay zero) passes 11/12 speech cases but
+fails the strict kept floor on headphones, 6 s lead, full denoising: 0.7125541
+versus cold's 0.7134199, with 37 held frames in both. It is rejected without a full
+echo-table run, despite passing both default speaker screens and the preliminary
+quiet-echo check. [Full profile-9 matrix](measurements/aec-profile9-matrix.txt).
+Correct two-reference warm construction combined with fresh AEC state,
+fresh gain/ERLE, conservative initial adaptation, or nearend-only zero decay also
+fails the speech gate on held frames or kept signal. No tested variant is selected
+for production. The model remains unchanged.
+
+All observations are preserved in
+[aec-native-speech-matrix.csv](measurements/aec-native-speech-matrix.csv),
+[aec-native-speech-gate.txt](measurements/aec-native-speech-gate.txt),
+[aec-native-reverb.txt](measurements/aec-native-reverb.txt),
+[aec-paired-echo-cases.csv](measurements/aec-paired-echo-cases.csv),
+[aec-paired-echo-profile1.txt](measurements/aec-paired-echo-profile1.txt),
+[aec-paired-echo-profile2.txt](measurements/aec-paired-echo-profile2.txt),
+[aec-paired-echo-profile7.txt](measurements/aec-paired-echo-profile7.txt),
+[aec-bounded-native.txt](measurements/aec-bounded-native.txt) and
+[aec-decay-budget.txt](measurements/aec-decay-budget.txt).
+
+#### Cold path and why a stereo-only adjustment cannot recover its start
+
+The same tail changes were measured on the cold path with default AGC. They
+improve model output after the stereo pin but do not repair the leading mono
+AEC's earlier attenuation. The hold counters below are active-input frames at
+AEC / automatic gate / manual gate / decoded Opus output, respectively.
+
+| Lead, full denoising | Native arm | Holds AEC / auto / manual / decoded | Kept |
+| --- | --- | --- | --- |
+| 6 s | Current cold | 62 / 49 / 114 / 136 | 0.105 |
+| 6 s | Cold, profile 1 | 62 / 49 / 112 / 80 | 0.123 |
+| 6 s | Cold, profile 2 | 62 / 49 / 53 / 80 | 0.378 |
+| 10 s | Current cold | 108 / 93 / 94 / 106 | 0.128 |
+| 10 s | Cold, profile 1 | 108 / 93 / 94 / 106 | 0.144 |
+| 10 s | Cold, profile 2 | 108 / 93 / 94 / 106 | 0.388 |
+
+These experiments apply the native profile only to the stereo stage. The early
+62/108 AEC holds and 49/93 automatic-gate holds occur before that stage and remain
+identical. No-AEC keeps about 0.797 with three decoded held frames. Resetting the
+stereo state alone cannot recover already discarded speech. The native
+linear-versus-suppressor observations show an additional nonlinear loss, followed
+by a much larger history-dependent model loss; a single native state variable has
+not been proved to explain the whole warm regression. The cold model is not a
+clean reference for speech preservation. [Cold diagnostic output](measurements/aec-cold-native.txt).
+
+#### Reproducing the priority-1 gates
+
+Run one process at a time, without audio devices. The first command is the
+failing-first acceptance for the unchanged production configuration. Diagnostic
+screens print observations and can pass as Rust tests while their printed gate
+is false; `native_paired_echo_gate` actually asserts the per-window echo bound.
+
+```sh
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib recorded_speech_is_not_held_after_stereo -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib native_speech_and_quiet_echo_gate -- --ignored --nocapture --test-threads=1
+GWAR_NATIVE_AEC_PROFILE=1 CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib native_paired_echo_gate -- --ignored --nocapture --test-threads=1
+```
+
+Use `GWAR_NATIVE_AEC_PROFILE=2` or `7` for the other fully measured echo arms.
+`GWAR_NATIVE_ARMS` selects comma-separated speech-matrix tags; 40/41 map to native
+profiles 1/2, 90 to profile 7, 95/96 to mild nearend decay 0.75/0.76, and 97/98 to
+the stronger nearend-evidence profiles. Native overrides remain test-only.
+
+#### Local validation of the native diagnostic checkpoint
+
+The release APM suite passes 54 active tests (32 ignored diagnostics), including
+the voice-thread heap and replacement guards. Both voice-alone fingerprints are
+bit-identical at `c2d868db7d8d0eeb`. Release workspace clippy with all targets
+(excluding the desktop package, as in the earlier native validation), `-D warnings`,
+format and diff checks pass. [Validation output](measurements/aec-native-validation.txt).
+The complete workspace run after wake is retained in the earlier checkpoint;
+it was not repeated for these diagnostic-only additions after acoustic acceptance
+failed. The failing-first speech acceptance and paired echo failures remain
+explicit blockers. Timing and route acceptance are not declared complete by
+these local checks.
+
+#### Main four-share control
+
+The **unmodified** exact test from main `1099a6817bbbabb9074004000915a3c884262cdd`
+completed all six pairs. It passed the >1,500 sent-frame guards and the <=1 ms p99
+requirement. [Complete control output](measurements/aec-main-four-share.txt).
+
+| Pair/order | No-share p99, ms | Four-share p99, ms | Delta, ms |
+| --- | --- | --- | --- |
+| 0: [0, 4] | 0.349 | 0.444 | +0.096 |
+| 1: [4, 0] | 0.327 | 0.329 | +0.002 |
+| 2: [0, 4] | 0.313 | 0.407 | +0.094 |
+| 3: [4, 0] | 0.376 | 0.346 | -0.030 |
+| 4: [0, 4] | 0.346 | 0.499 | +0.153 |
+| 5: [4, 0] | 0.200 | 0.553 | +0.353 |
+
+Worst delta: +0.353 ms. This run does not reproduce the branch's guard failure;
+that failure remains a branch acceptance issue while the AEC investigation
+continues. The exact benchmark constructs native controls directly, rather than
+loading web settings; its defaults are not proof of the user-facing noiseStrength
+100 path.
+
+### Independent-talker audit and owner decision (PR #223)
+
+**Owner decision (2026-11-02): retain the current stereo canceller, with echo
+removal first. Mono-like suppressor tuning is rejected for production. Its optional
+measurement arm is available only through a dev-dependency feature. Stereo still
+pins on the first share sound. The per-content option must dominate every case and
+window before it can be considered for production.**
+
+**Historical post-wake stop, 2026-11-02: NOT READY FOR REVIEW at that checkpoint.**
+Current stereo remains selected. The current route detector misses five of 17
+mean baseline floors; retaining and deferring the candidate still misses three
+and is rejected. The per-content selector fails dominance and is rejected.
+Recorded speech is held for 510 active frames; the tested native-AEC and denoiser
+workarounds do not fix it without lost echo removal. The four-share test stops
+in its third pair with 1,399 sent frames, below its >1,500-frame guard.
+
+The owner's no-compromise instruction requires stopping here. Before review,
+fix and pass the route floors, recorded-speech hold and full six-pair four-share
+run, then obtain green CI for the final head. No compromise was enabled to make
+these results appear to pass. Completed data and exact failing probes are
+preserved below and in the measurement artifacts.
+
+The comparisons ran on arm64 macOS, release, Rust 1.99.1, one test at a time with
+`nice -n 10`. No audio device, browser, WebKit, application bundle or production
+connection was used. `EchoGone` is disabled to isolate #220. The stereo mono-like
+variant changes only `max_inc_factor` from 1.5 to 2.0 and `max_dec_factor_lf` from
+0.35 to 0.25; the stereo adaptive filter is retained. It is enabled only by the
+isolated ignored measurement test, never by the app.
+
+#### Reproduction and limits
+
+```sh
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib the_warmed_switch_against_cold_and_staying_mono -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib the_near_voice_cold_and_warm -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib independent_talker_channel_tradeoffs -- --ignored --nocapture --test-threads=1
+```
+
+The complete console output is in [aec-independent-talkers.txt](measurements/aec-independent-talkers.txt),
+and all 1,296 room/voice/window observations for the channel comparison are in
+[aec-channel-cases.csv](measurements/aec-channel-cases.csv). These are synthetic
+AEC measurements without gain, denoising, gating or Opus. They do not establish
+speech intelligibility or any real-time p99 limit.
+
+"Kept" retains the previous definition: the share of speaking frames whose output
+RMS is within 10 dB of clean near input, counting near frames above -40 dBFS.
+On speakers residual echo can inflate this fraction. The echo column measures
+output in silent near turns, starting 250 ms after the near voice stops (the
+longest simulated acoustic tail is 205 ms). Lower echo dBFS is better. Headphones
+have no acoustic echo; their quiet output is the processing floor. The mono
+antiphase rows' nearly 1.0 "kept" cannot establish voice preservation by itself:
+their echo is very loud.
+
+#### Corrected #220 near-voice table
+
+The far/share signals, eight offsets and windows are retained. The near fixture is
+now `talker(213 Hz, 3.1 Hz vibrato, 3.3 syllables/s, -24 dBFS)` with independent
+harmonic phases instead of correlated 200 Hz `long_voice`. The pitch and shape
+changed with the fixture, so differences are not attributed to correlation alone.
+Values are means across the eight offsets; windows follow share sound.
+
+| Route / lead / canceller | 0-3 | 3-8 | 8-16 | 16-32 |
+| --- | --- | --- | --- | --- |
+| headphones, 6 s, stay | 0.90 | 0.83 | 0.82 | 0.85 |
+| headphones, 6 s, cold | 0.90 | 0.76 | 0.77 | 0.81 |
+| headphones, 6 s, warm | 0.90 | 0.76 | 0.77 | 0.81 |
+| speakers, 6 s, stay | 0.75 | 0.64 | 0.47 | 0.50 |
+| speakers, 6 s, cold | 0.75 | 0.44 | 0.74 | 0.76 |
+| speakers, 6 s, warm | 0.80 | 0.47 | 0.48 | 0.57 |
+| headphones, 30 s, stay | 0.86 | 0.81 | 0.85 | 0.84 |
+| headphones, 30 s, cold | 0.86 | 0.77 | 0.79 | 0.79 |
+| headphones, 30 s, warm | 0.86 | 0.77 | 0.79 | 0.79 |
+| speakers, 30 s, stay | 0.81 | 0.62 | 0.46 | 0.57 |
+| speakers, 30 s, cold | 0.81 | 0.14 | 0.56 | 0.74 |
+| speakers, 30 s, warm | 0.70 | 0.47 | 0.39 | 0.56 |
+
+The claim that headphones recover to about 0.99 after the first three seconds is
+not reproduced. The claim that warm loses no more near voice than staying mono is
+also not reproduced. Warm can remove the cold takeover hole, but that does not
+imply better near-voice preservation in every later window. At a 30 s lead warm
+also keeps less than cold in the first window (0.70 vs 0.81).
+
+#### #220 echo, mixed level and projected near level
+
+Same 18 rooms (three far pitches, three delays, two near pitches) and two lead times.
+Near pitches stay 180/280 Hz but use `talker` with independent modulation/phases.
+Echo-only rows have no near voice and retain their old inputs. "Level" is mixed
+output dBFS. "Near beside wide" is near projection gain in dB from the existing
+best-lag `fidelity` calculation. Each mean cell is **stay / cold / warm**.
+
+| Lead | Metric | Window, s | Mean | Worst cold/warm vs stay, dB |
+| --- | --- | --- | --- | --- |
+| 6 | echo | 0-1 | -62.8 / -62.8 / -63.6 | 0.0 / 0.9 |
+| 6 | echo | 1-2 | -62.9 / -62.9 / -63.8 | 0.0 / 1.0 |
+| 6 | echo | 2-3 | -63.5 / -63.5 / -64.4 | 0.0 / 1.1 |
+| 6 | echo | 3-4 | -63.6 / -58.8 / -64.8 | 11.1 / 1.2 |
+| 6 | echo | 4-5 | -63.3 / -58.7 / -65.6 | 10.1 / 1.1 |
+| 6 | echo | 5-6 | -64.3 / -60.2 / -66.0 | 6.8 / 0.9 |
+| 6 | echo | 6-7 | -64.0 / -61.4 / -65.1 | 5.1 / 0.9 |
+| 6 | echo | 7-8 | -64.0 / -62.5 / -65.1 | 2.6 / 0.9 |
+| 6 | echo | 8-12 | -65.0 / -63.7 / -65.9 | 4.0 / 0.6 |
+| 6 | echo | 12-16 | -66.7 / -65.7 / -67.9 | 8.6 / 0.3 |
+| 6 | echo | 16-24 | -66.4 / -66.7 / -68.8 | 2.5 / 0.1 |
+| 6 | level | 0-1 | -25.8 / -25.8 / -25.8 | 0.0 / 0.7 |
+| 6 | level | 1-2 | -25.2 / -25.2 / -25.4 | 0.0 / 0.5 |
+| 6 | level | 2-3 | -26.3 / -26.3 / -26.5 | 0.0 / 1.5 |
+| 6 | level | 3-4 | -26.2 / -27.3 / -26.7 | 4.5 / 3.8 |
+| 6 | level | 4-5 | -25.2 / -26.2 / -25.8 | 5.8 / 4.0 |
+| 6 | level | 5-6 | -26.2 / -27.0 / -26.5 | 6.0 / 4.7 |
+| 6 | level | 6-7 | -26.3 / -28.4 / -26.7 | 17.3 / 2.5 |
+| 6 | level | 7-8 | -25.5 / -27.7 / -26.3 | 10.2 / 4.8 |
+| 6 | level | 8-12 | -25.8 / -26.4 / -26.1 | 2.4 / 2.4 |
+| 6 | level | 12-16 | -25.9 / -26.9 / -26.3 | 5.5 / 3.1 |
+| 6 | level | 16-24 | -25.9 / -26.2 / -26.1 | 3.6 / 2.3 |
+| 6 | kept beside wide share | 0-1 | -8.1 / -7.9 / -8.5 | 0.6 / 1.6 |
+| 6 | kept beside wide share | 1-2 | -8.1 / -7.9 / -8.9 | 1.9 / 3.3 |
+| 6 | kept beside wide share | 2-3 | -8.4 / -8.2 / -9.8 | 3.3 / 9.3 |
+| 6 | kept beside wide share | 3-4 | -8.2 / -12.6 / -11.3 | 10.2 / 9.1 |
+| 6 | kept beside wide share | 4-5 | -7.6 / -13.0 / -11.7 | 21.8 / 18.8 |
+| 6 | kept beside wide share | 5-6 | -8.7 / -14.0 / -11.8 | 23.5 / 9.2 |
+| 6 | kept beside wide share | 6-7 | -8.4 / -16.0 / -12.4 | 24.6 / 18.9 |
+| 6 | kept beside wide share | 7-8 | -8.1 / -12.4 / -11.1 | 16.7 / 10.5 |
+| 6 | kept beside wide share | 8-12 | -8.1 / -14.0 / -11.3 | 24.6 / 20.4 |
+| 6 | kept beside wide share | 12-16 | -8.1 / -13.3 / -11.3 | 23.6 / 23.6 |
+| 6 | kept beside wide share | 16-24 | -8.1 / -12.5 / -9.9 | 21.9 / 9.9 |
+| 20 | echo | 0-1 | -66.5 / -66.5 / -67.9 | 0.0 / 0.3 |
+| 20 | echo | 1-2 | -68.2 / -68.2 / -69.6 | 0.0 / 0.3 |
+| 20 | echo | 2-3 | -68.0 / -68.0 / -69.0 | 0.0 / 0.3 |
+| 20 | echo | 3-4 | -68.1 / -58.1 / -68.8 | 15.4 / 0.3 |
+| 20 | echo | 4-5 | -67.9 / -60.1 / -68.4 | 11.3 / 0.1 |
+| 20 | echo | 5-6 | -66.2 / -62.7 / -67.9 | 7.7 / 0.1 |
+| 20 | echo | 6-7 | -67.8 / -66.0 / -69.8 | 5.0 / 0.1 |
+| 20 | echo | 7-8 | -69.5 / -67.7 / -70.5 | 10.1 / 1.1 |
+| 20 | echo | 8-12 | -67.5 / -65.5 / -69.8 | 15.4 / 0.1 |
+| 20 | echo | 12-16 | -68.6 / -68.4 / -69.5 | 13.4 / 2.2 |
+| 20 | echo | 16-24 | -68.2 / -66.8 / -68.3 | 11.8 / 4.7 |
+| 20 | level | 0-1 | -25.2 / -25.2 / -25.4 | 0.0 / 1.0 |
+| 20 | level | 1-2 | -26.1 / -26.1 / -26.3 | 0.0 / 1.4 |
+| 20 | level | 2-3 | -26.1 / -26.1 / -26.4 | 0.0 / 1.8 |
+| 20 | level | 3-4 | -25.5 / -27.4 / -26.1 | 5.2 / 5.2 |
+| 20 | level | 4-5 | -25.5 / -29.1 / -26.4 | 12.9 / 9.1 |
+| 20 | level | 5-6 | -26.2 / -29.1 / -27.8 | 16.2 / 16.2 |
+| 20 | level | 6-7 | -26.1 / -28.2 / -26.6 | 7.4 / 4.2 |
+| 20 | level | 7-8 | -25.6 / -26.7 / -25.5 | 10.4 / 1.9 |
+| 20 | level | 8-12 | -26.0 / -26.4 / -26.1 | 5.7 / 1.9 |
+| 20 | level | 12-16 | -26.0 / -26.3 / -26.1 | 5.6 / 2.6 |
+| 20 | level | 16-24 | -26.1 / -26.1 / -26.2 | 3.0 / 2.8 |
+| 20 | kept beside wide share | 0-1 | -7.5 / -7.2 / -8.8 | 0.3 / 6.1 |
+| 20 | kept beside wide share | 1-2 | -8.4 / -8.2 / -9.8 | 1.2 / 7.0 |
+| 20 | kept beside wide share | 2-3 | -7.9 / -7.7 / -9.4 | 0.5 / 6.5 |
+| 20 | kept beside wide share | 3-4 | -8.0 / -11.9 / -10.2 | 9.8 / 9.8 |
+| 20 | kept beside wide share | 4-5 | -7.4 / -15.2 / -10.8 | 28.7 / 25.6 |
+| 20 | kept beside wide share | 5-6 | -7.7 / -17.1 / -10.9 | 31.9 / 24.1 |
+| 20 | kept beside wide share | 6-7 | -8.5 / -15.4 / -11.7 | 24.5 / 23.6 |
+| 20 | kept beside wide share | 7-8 | -8.5 / -14.6 / -10.4 | 23.2 / 7.2 |
+| 20 | kept beside wide share | 8-12 | -8.2 / -11.4 / -9.6 | 20.5 / 5.4 |
+| 20 | kept beside wide share | 12-16 | -8.2 / -11.7 / -9.4 | 23.2 / 4.2 |
+| 20 | kept beside wide share | 16-24 | -8.5 / -9.6 / -9.0 | 10.1 / 3.3 |
+
+Echo-only means and worst-room values reproduce #220 at the shown precision.
+The near-dependent claims change: with the independent fixture, the 6 s-lead
+mixed-level worst difference is 17.3 dB cold / 4.8 dB warm, instead of 13.0 dB
+for both; at 20 s it is 16.2 / 16.2 dB. Near projection beside wide sound is
+1.8-4.1 dB below staying mono in the windows from 3 s onward at the 6 s lead,
+which is a larger loss than the earlier correlated fixture suggested.
+
+#### Channels through the production Processing path
+
+Includes warming qualification, the cold fallback, handover and capture delay.
+Mono never pins. Six seconds of leading far voice precede 32 s of share content.
+Nine cases per row: delays 20/60/150 ms times three independent near talkers
+(213/176/251 Hz), speaking on alternating seconds. The two speakers have different
+impulse responses; "left speaker" means only the left reaches the microphone.
+Shapes: mono `[a,a]`, panned `[a,0]`, independent stereo `[a,b]`, antiphase `[a,-a]`.
+Share level is -14 dBFS per active channel; near is -24 dBFS. Vectors use windows
+**0-3 / 3-8 / 8-16 / 16-32 seconds** after share sound.
+
+| Share | Acoustic route | Canceller | Kept fraction | Echo / quiet output, dBFS |
+| --- | --- | --- | --- | --- |
+| mono content | headphones | stereo | 0.830 / 0.724 / 0.748 / 0.743 | -95.6 / -96.0 / -95.7 / -95.2 |
+| mono content | headphones | mono downmix | 0.830 / 0.765 / 0.814 / 0.774 | -95.6 / -95.9 / -95.8 / -95.4 |
+| mono content | headphones | stereo mono-like suppressor | 0.830 / 0.767 / 0.793 / 0.782 | -95.6 / -96.0 / -95.7 / -95.2 |
+| mono content | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| mono content | left speaker | mono downmix | 0.613 / 0.598 / 0.605 / 0.608 | -59.8 / -63.3 / -63.1 / -62.4 |
+| mono content | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| mono content | both speakers | stereo | 0.488 / 0.439 / 0.429 / 0.398 | -52.3 / -55.8 / -55.6 / -55.1 |
+| mono content | both speakers | mono downmix | 0.548 / 0.495 / 0.498 / 0.469 | -52.6 / -55.2 / -54.7 / -53.7 |
+| mono content | both speakers | stereo mono-like suppressor | 0.541 / 0.492 / 0.495 / 0.469 | -52.1 / -55.8 / -55.6 / -55.1 |
+| panned | headphones | stereo | 0.880 / 0.754 / 0.748 / 0.743 | -95.8 / -96.0 / -95.7 / -95.2 |
+| panned | headphones | mono downmix | 0.880 / 0.830 / 0.883 / 0.837 | -95.8 / -96.2 / -95.3 / -95.7 |
+| panned | headphones | stereo mono-like suppressor | 0.880 / 0.796 / 0.793 / 0.782 | -95.8 / -96.0 / -95.7 / -95.2 |
+| panned | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| panned | left speaker | mono downmix | 0.729 / 0.611 / 0.624 / 0.622 | -46.3 / -62.7 / -62.3 / -62.7 |
+| panned | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| panned | both speakers | stereo | 0.528 / 0.569 / 0.575 / 0.556 | -54.8 / -55.7 / -59.2 / -62.3 |
+| panned | both speakers | mono downmix | 0.690 / 0.642 / 0.639 / 0.632 | -50.4 / -56.7 / -59.4 / -60.9 |
+| panned | both speakers | stereo mono-like suppressor | 0.569 / 0.612 / 0.617 / 0.599 | -54.7 / -55.7 / -59.1 / -62.3 |
+| wide independent | headphones | stereo | 0.863 / 0.717 / 0.748 / 0.743 | -95.7 / -96.0 / -95.7 / -95.2 |
+| wide independent | headphones | mono downmix | 0.863 / 0.758 / 0.665 / 0.760 | -95.7 / -95.5 / -95.3 / -94.5 |
+| wide independent | headphones | stereo mono-like suppressor | 0.863 / 0.762 / 0.793 / 0.782 | -95.7 / -96.0 / -95.7 / -95.2 |
+| wide independent | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide independent | left speaker | mono downmix | 0.718 / 0.679 / 0.715 / 0.716 | -44.4 / -47.1 / -44.0 / -42.3 |
+| wide independent | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide independent | both speakers | stereo | 0.653 / 0.583 / 0.669 / 0.713 | -34.4 / -37.7 / -36.2 / -34.1 |
+| wide independent | both speakers | mono downmix | 0.578 / 0.591 / 0.614 / 0.622 | -51.7 / -51.2 / -49.9 / -48.4 |
+| wide independent | both speakers | stereo mono-like suppressor | 0.661 / 0.645 / 0.718 / 0.755 | -34.1 / -34.9 / -34.5 / -32.8 |
+| wide antiphase | headphones | stereo | 0.992 / 0.733 / 0.748 / 0.743 | -149.8 / -96.0 / -95.7 / -95.2 |
+| wide antiphase | headphones | mono downmix | 0.992 / 0.990 / 0.990 / 0.990 | -149.8 / -147.5 / -147.5 / -146.1 |
+| wide antiphase | headphones | stereo mono-like suppressor | 0.992 / 0.776 / 0.793 / 0.782 | -149.8 / -96.0 / -95.7 / -95.2 |
+| wide antiphase | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide antiphase | left speaker | mono downmix | 0.999 / 0.997 / 0.998 / 0.998 | -24.0 / -23.8 / -24.0 / -23.9 |
+| wide antiphase | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide antiphase | both speakers | stereo | 0.445 / 0.491 / 0.541 / 0.533 | -46.0 / -54.5 / -53.9 / -54.0 |
+| wide antiphase | both speakers | mono downmix | 1.000 / 0.999 / 1.000 / 0.999 | -24.4 / -24.4 / -24.4 / -24.4 |
+| wide antiphase | both speakers | stereo mono-like suppressor | 0.515 / 0.561 / 0.595 / 0.592 | -45.6 / -54.3 / -53.8 / -54.0 |
+
+A concrete conflicting case is independent stereo, both speakers, 150 ms left
+path, 176 Hz near talker, 3-8 s after share sound:
+
+| Canceller | Kept | Echo in near silence, dBFS |
+| --- | --- | --- |
+| Stereo (current) | 0.477 | -41.55 |
+| Stereo, mono suppressor | 0.544 | -36.13 |
+
+Mono-like suppression increases the frame fraction by 0.066 while making echo
+5.42 dB louder here. This alone prevents accepting it as a non-regressing option.
+
+#### Initial channel decision
+
+Neither alternative dominates current stereo on both outputs across every case
+and window. Mono loses the reference for antiphase and cannot independently fit
+two unrelated speaker paths. Mono-like stereo suppression preserves more near
+frames in some rows while allowing more echo in others. The owner chose current stereo and prioritized echo removal, so mono-like
+suppression is rejected for production.
+
+The following verification describes the initial `eacede99` checkpoint only.
+The route/content/tone continuation and current acceptance state follow below.
+
+#### Initial checkpoint verification (`eacede99`)
+
+- Release APM tests: **51 passed, 15 ignored**, including the warmed handover,
+  refused-candidate and replacement-path heap checks.
+- Explicit voice-alone fingerprints: **2 passed**, both `c2d868db7d8d0eeb`.
+- Three ignored comparisons above: **3 passed**; their success means they completed,
+  not that the branch meets the owner's acoustic acceptance requirement.
+- `cargo fmt --all --check` and `git diff --check`: passed.
+- Not run at this checkpoint: clippy, full workspace tests, 1 Mb/s and four-share
+  timing limits, realistic tone/Opus/gate/denoiser probes, Linux build/null sinks.
+  The inherited Linux CI is red; its import fix still requires a new CI run.
+
+#### Route-gap continuation after wake
+
+The route harness uses the same 27 rooms (three far pitches, three delays and
+three unrelated near talkers), with all arms receiving identical inputs. These
+are synthetic AEC-only runs, without gain, gate, denoising or Opus. Headphone
+windows are 0-3 / 3-5 / 5-8 / 8-16 s after the later of the pin and the move.
+Another-room cells are echo dBFS in seconds 0, 2, 4, 6 and 8 after the move, while
+the near talker is silent; lower is better. Means do not establish every room's
+acceptance. All 4,590 individual observations, including diagnostic arms, are in
+[aec-route-cases.csv](measurements/aec-route-cases.csv).
+
+`worker-only` removes the inherited in-charge acoustic replacement. `worker-faster`
+also changes the warming detector from four to two 250 ms echo-absence looks.
+It is the current draft production candidate. `worker-keep-eligibility` restarts
+but retains the found-echo qualification. `native-gain-change` instead asks AEC3
+to adapt to an echo-path gain change without reconstructing it. The latter two
+are measurement-only and are rejected.
+
+| Scenario | Arm | Mean by window |
+| --- | --- | --- |
+| in charge, then headphones | before-220 | 0.527 / 0.529 / 0.646 / 0.712 |
+| in charge, then headphones | main-unreported | 0.531 / 0.536 / 0.648 / 0.724 |
+| in charge, then headphones | main-reported | 0.531 / 0.560 / 0.761 / 0.716 |
+| in charge, then headphones | inherited | 0.531 / 0.536 / 0.623 / 0.689 |
+| in charge, then headphones | worker-only | 0.531 / 0.536 / 0.648 / 0.724 |
+| in charge, then headphones | worker-faster | 0.531 / 0.536 / 0.648 / 0.724 |
+| in charge, then headphones | worker-keep-eligibility | 0.531 / 0.536 / 0.648 / 0.724 |
+| in charge, then headphones | native-gain-change | 0.447 / 0.466 / 0.609 / 0.696 |
+| warming, headphones 8 s before the share | before-220 | 0.784 / 0.622 / 0.770 / 0.707 |
+| warming, headphones 8 s before the share | main-unreported | 0.731 / 0.714 / 0.742 / 0.734 |
+| warming, headphones 8 s before the share | main-reported | 0.784 / 0.622 / 0.770 / 0.707 |
+| warming, headphones 8 s before the share | inherited | 0.784 / 0.622 / 0.770 / 0.707 |
+| warming, headphones 8 s before the share | worker-only | 0.784 / 0.622 / 0.770 / 0.707 |
+| warming, headphones 8 s before the share | worker-faster | 0.784 / 0.622 / 0.770 / 0.707 |
+| warming, headphones 8 s before the share | worker-keep-eligibility | 0.715 / 0.644 / 0.744 / 0.715 |
+| warming, headphones 8 s before the share | native-gain-change | 0.704 / 0.689 / 0.727 / 0.715 |
+| warming, headphones 3 s before the share | before-220 | 0.615 / 0.607 / 0.770 / 0.707 |
+| warming, headphones 3 s before the share | main-unreported | 0.559 / 0.647 / 0.733 / 0.733 |
+| warming, headphones 3 s before the share | main-reported | 0.615 / 0.607 / 0.770 / 0.707 |
+| warming, headphones 3 s before the share | inherited | 0.581 / 0.652 / 0.593 / 0.590 |
+| warming, headphones 3 s before the share | worker-only | 0.581 / 0.652 / 0.750 / 0.689 |
+| warming, headphones 3 s before the share | worker-faster | 0.615 / 0.607 / 0.770 / 0.707 |
+| warming, headphones 3 s before the share | worker-keep-eligibility | 0.591 / 0.639 / 0.627 / 0.645 |
+| warming, headphones 3 s before the share | native-gain-change | 0.493 / 0.586 / 0.695 / 0.701 |
+| in charge, then another room | before-220 | -42.856 / -43.477 / -50.669 / -55.403 / -49.337 |
+| in charge, then another room | main-unreported | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+| in charge, then another room | main-reported | -43.419 / -42.994 / -47.063 / -53.087 / -49.527 |
+| in charge, then another room | inherited | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+| in charge, then another room | worker-only | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+| in charge, then another room | worker-faster | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+| in charge, then another room | worker-keep-eligibility | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+| in charge, then another room | native-gain-change | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+
+The two-window worker candidate fixes both inherited drops: in charge it matches
+main at 0.648 / 0.724 in the final two windows, versus 0.623 / 0.689 inherited;
+three seconds before the pin it matches before-#220 at
+0.615 / 0.607 / 0.770 / 0.707. It **still fails the required floor of both
+baselines**: for example, main keeps 0.714 rather than 0.622 in the 3-5 s window
+of the eight-second move, and 0.647 rather than 0.607 in that window of the
+three-second move. In the other room, its second-2 echo is -42.994 dBFS versus
+-43.477 before #220. `route_gaps_reach_both_baselines` makes this acceptance
+failure explicit; an ignored comparison completing successfully is not a pass
+of that requirement.
+
+The final post-wake experiment keeps the old filter after the absence detector
+fires, but waits the full three-second learning interval after the pin before
+using it. It is measurement-only:
+
+| Scenario | Retained candidate, delayed takeover |
+| --- | --- |
+| in charge, then headphones | 0.531 / 0.536 / 0.648 / 0.724 |
+| warming, headphones 8 s before the share | 0.784 / 0.735 / 0.742 / 0.734 |
+| warming, headphones 3 s before the share | 0.615 / 0.676 / 0.733 / 0.733 |
+| in charge, then another room | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+
+This changes the trade-off rather than satisfying the floor. With headphones
+three seconds before the pin, it improves 3-5 s to 0.676 but loses 5-8 s against
+before-#220 (0.733 versus 0.770). With an eight-second move it loses that same
+window (0.742 versus 0.770). Its other-room echo still loses second 2. The option
+is rejected. The 2,295 repeated baseline/current/native observations reproduce
+the completed pre-sleep values exactly; 459 retained/deferred observations are
+added to the route CSV. The current two-window candidate still misses five of
+17 mean cells; the deferred variant misses three. Neither is accepted as a
+complete route-gap fix. Per-room comparisons are stricter still.
+
+The per-second observations are preserved in
+[aec-route-tone-probes.txt](measurements/aec-route-tone-probes.txt). They isolate
+the inherited in-charge replacement after takeover: removing only that observer
+restores main's output. Four absence looks do not reliably restart the warming
+candidate before the three-second pin; two do. Retaining qualification on a fresh
+filter and the native gain-change hint both fail to improve all windows.
+
+**OS sources:** retain Linux default sink/source/port polling and the macOS output
+data-source listener because a notice has measurable benefit. In-charge
+headphones improve from 0.648 to 0.761 in 5-8 s; warming first-window means improve
+from 0.731 to 0.784 (eight-second move) and 0.559 to 0.615 (three-second move).
+This does not make resetting on every notice universally beneficial: in the other
+room the notice leaves echo 4.10 dB louder at second 4 and 5.69 dB louder at
+second 6. The reset policy therefore remains part of the failed acoustic
+acceptance, rather than proof that OS detection solves route changes.
+
+#### Per-content channel selection: rejected
+
+A measurement-only worker classifies four 10 ms render frames from channel
+energies and their dot product. Positive correlation >=0.95 or a silent side
+keeps the mono downmix; independent or antiphase content requests stereo.
+The harness waits for each worker answer to remove scheduler variability;
+this synchronization is not proposed for the voice thread. Mono/panned failures
+are independent of when a wide-content pin is delivered, since these arms never
+request one.
+
+The 108 shape/route/room cases and four windows match the earlier channel table.
+All four arms and 1,728 observations are in
+[aec-content-cases.csv](measurements/aec-content-cases.csv). The original three
+arms reproduce the committed channel measurements. The paired current/selector
+means are:
+
+| Share shape | Route | Arm | Kept, 0-3 / 3-8 / 8-16 / 16-32 s | Echo dBFS, same windows |
+| --- | --- | --- | --- | --- |
+| mono content | headphones | stereo | 0.830 / 0.724 / 0.748 / 0.743 | -95.6 / -96.0 / -95.7 / -95.2 |
+| mono content | headphones | content-correlation | 0.830 / 0.765 / 0.814 / 0.774 | -95.6 / -95.9 / -95.8 / -95.4 |
+| mono content | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| mono content | left speaker | content-correlation | 0.613 / 0.598 / 0.605 / 0.608 | -59.8 / -63.3 / -63.1 / -62.4 |
+| mono content | both speakers | stereo | 0.488 / 0.439 / 0.429 / 0.398 | -52.3 / -55.8 / -55.6 / -55.1 |
+| mono content | both speakers | content-correlation | 0.548 / 0.495 / 0.498 / 0.469 | -52.6 / -55.2 / -54.7 / -53.7 |
+| panned | headphones | stereo | 0.880 / 0.754 / 0.748 / 0.743 | -95.8 / -96.0 / -95.7 / -95.2 |
+| panned | headphones | content-correlation | 0.880 / 0.830 / 0.883 / 0.837 | -95.8 / -96.2 / -95.3 / -95.7 |
+| panned | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| panned | left speaker | content-correlation | 0.729 / 0.611 / 0.624 / 0.622 | -46.3 / -62.7 / -62.3 / -62.7 |
+| panned | both speakers | stereo | 0.528 / 0.569 / 0.575 / 0.556 | -54.8 / -55.7 / -59.2 / -62.3 |
+| panned | both speakers | content-correlation | 0.690 / 0.642 / 0.639 / 0.632 | -50.4 / -56.7 / -59.4 / -60.9 |
+| wide independent | headphones | stereo | 0.863 / 0.717 / 0.748 / 0.743 | -95.7 / -96.0 / -95.7 / -95.2 |
+| wide independent | headphones | content-correlation | 0.863 / 0.743 / 0.773 / 0.724 | -95.7 / -96.0 / -95.8 / -95.0 |
+| wide independent | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide independent | left speaker | content-correlation | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide independent | both speakers | stereo | 0.653 / 0.583 / 0.669 / 0.713 | -34.4 / -37.7 / -36.2 / -34.1 |
+| wide independent | both speakers | content-correlation | 0.653 / 0.583 / 0.669 / 0.713 | -34.4 / -37.7 / -36.2 / -34.1 |
+| wide antiphase | headphones | stereo | 0.992 / 0.733 / 0.748 / 0.743 | -149.8 / -96.0 / -95.7 / -95.2 |
+| wide antiphase | headphones | content-correlation | 0.992 / 0.744 / 0.773 / 0.724 | -149.8 / -96.0 / -95.8 / -95.0 |
+| wide antiphase | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide antiphase | left speaker | content-correlation | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide antiphase | both speakers | stereo | 0.445 / 0.491 / 0.541 / 0.533 | -46.0 / -54.5 / -53.9 / -54.0 |
+| wide antiphase | both speakers | content-correlation | 0.445 / 0.491 / 0.541 / 0.533 | -46.0 / -54.5 / -53.9 / -54.0 |
+
+Strict dominance fails in 168 of 432 case/window pairs: 18 have less near voice
+and 165 have more echo (the counts overlap and include numerical floor changes).
+Material failures are much larger than the floor: panned content, left speaker,
+20 ms delay, 176 Hz near talker, 0-3 s has **19.55 dB more echo**. Independent
+content on headphones, 251 Hz near talker, 16-32 s loses 0.0748 kept.
+The mean panned/left first window worsens from -61.7 to -46.3 dBFS echo.
+The option is dropped from production. Current stereo still pins on first share
+sound, with its unchanged default suppressor tuning, as the owner decided.
+
+#### Leading signal, Opus, gate and denoiser holds
+
+`explore_tone` is replaced by reproducible ignored DSP probes in
+`voice/apm/tests/tones.rs`. They use 6/10 s of leading far voice, near input
+beginning one second before four stereo shares, real Opus render and voice coding,
+AEC, production automatic/manual input gates and the embedded DeepFilterNet3
+model at 0/50/100 percent denoising. The room has independent 60/75 ms speaker
+paths and reflections. Headphones have no acoustic echo. The warmed worker is
+caught up before each next frame. The model runs synchronously: these tests
+exercise the DSP, not model-worker deadlines or real-time device scheduling.
+No audio is played on a device.
+
+Near inputs include a steady note, a sung 220 Hz note with 5.2 Hz vibrato, a
+harmonic plucked instrument, 60 Hz hum plus an unrelated talker, that talker alone,
+and [recorded LibriSpeech speech](https://www.openslr.org/12). The 16 kHz float
+fixture is from the [official TorchAudio example](https://docs.pytorch.org/audio/2.8/tutorials/asr_inference_with_ctc_decoder_tutorial.html),
+interpolated to 48 kHz and normalized to -24 dBFS. Source, CC BY 4.0 attribution,
+transformation and hashes are in its fixture README.
+
+Each maximum below is in **active-input 10 ms frames**, ordered
+AEC below -50 dBFS / automatic gate closed / manual gate closed / decoded output
+below -60 dBFS. Quiet input frames are skipped, so a maximum is accumulated active
+speech time, not necessarily a contiguous wall-clock interval. `sent` in the raw
+log counts audible decoded frames per second, not merely Opus packets. "Kept"
+is still RMS-based and can include residual echo; the near projection diagnostic
+below separates that limitation.
+
+| Lead | Route | Denoising % | Signal | Cold maxima | Warm maxima | No-AEC maxima |
+| --- | --- | --- | --- | --- | --- | --- |
+| 6 | headphones | 0 | steady tone | 39 / 10 / 10 / 38 | 39 / 10 / 10 / 38 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 50 | steady tone | 39 / 10 / 43 / 40 | 39 / 10 / 43 / 40 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 100 | steady tone | 39 / 10 / 1600 / 1600 | 39 / 10 / 1600 / 1600 | 0 / 0 / 1600 / 1600 |
+| 6 | headphones | 0 | sung vibrato | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 50 | sung vibrato | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 100 | sung vibrato | 0 / 0 / 1520 / 1545 | 0 / 0 / 1520 / 1545 | 0 / 0 / 1509 / 1533 |
+| 6 | headphones | 0 | instrument | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 50 | instrument | 0 / 0 / 15 / 5 | 0 / 0 / 15 / 5 | 0 / 0 / 14 / 4 |
+| 6 | headphones | 100 | instrument | 0 / 0 / 1600 / 1600 | 0 / 0 / 1600 / 1600 | 0 / 0 / 1600 / 181 |
+| 6 | headphones | 0 | hum plus talker | 8 / 0 / 0 / 6 | 8 / 0 / 0 / 6 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 50 | hum plus talker | 8 / 0 / 0 / 8 | 8 / 0 / 0 / 8 | 0 / 0 / 0 / 2 |
+| 6 | headphones | 100 | hum plus talker | 8 / 0 / 0 / 18 | 8 / 0 / 0 / 18 | 0 / 0 / 0 / 27 |
+| 6 | headphones | 0 | talker | 4 / 0 / 0 / 4 | 4 / 0 / 0 / 4 | 0 / 0 / 0 / 0 |
+| 6 | headphones | 50 | talker | 4 / 0 / 0 / 6 | 4 / 0 / 0 / 6 | 0 / 0 / 0 / 3 |
+| 6 | headphones | 100 | talker | 4 / 0 / 0 / 6 | 4 / 0 / 0 / 6 | 0 / 0 / 114 / 108 |
+| 6 | headphones | 0 | human speech | 42 / 22 / 22 / 26 | 42 / 22 / 22 / 26 | 0 / 0 / 0 / 1 |
+| 6 | headphones | 50 | human speech | 42 / 22 / 23 / 37 | 42 / 22 / 23 / 37 | 0 / 0 / 0 / 2 |
+| 6 | headphones | 100 | human speech | 42 / 22 / 23 / 37 | 42 / 22 / 23 / 37 | 0 / 0 / 0 / 2 |
+| 6 | speakers | 0 | steady tone | 289 / 260 / 260 / 264 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 50 | steady tone | 289 / 260 / 261 / 289 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 100 | steady tone | 289 / 260 / 1268 / 1296 | 0 / 0 / 1600 / 1600 | 0 / 0 / 1509 / 1534 |
+| 6 | speakers | 0 | sung vibrato | 289 / 260 / 260 / 264 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 50 | sung vibrato | 289 / 260 / 261 / 289 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 100 | sung vibrato | 289 / 260 / 1267 / 1294 | 0 / 0 / 1553 / 1579 | 0 / 0 / 1440 / 1465 |
+| 6 | speakers | 0 | instrument | 166 / 137 / 137 / 141 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 50 | instrument | 166 / 137 / 274 / 174 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 100 | instrument | 166 / 137 / 1600 / 1600 | 0 / 0 / 1600 / 1600 | 0 / 0 / 1532 / 1559 |
+| 6 | speakers | 0 | hum plus talker | 20 / 0 / 0 / 6 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 50 | hum plus talker | 20 / 0 / 115 / 24 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 100 | hum plus talker | 20 / 0 / 115 / 85 | 0 / 0 / 0 / 14 | 0 / 0 / 0 / 6 |
+| 6 | speakers | 0 | talker | 10 / 0 / 0 / 4 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 50 | talker | 10 / 0 / 0 / 18 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 100 | talker | 10 / 0 / 23 / 20 | 0 / 0 / 0 / 8 | 0 / 0 / 0 / 6 |
+| 6 | speakers | 0 | human speech | 62 / 49 / 49 / 56 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 50 | human speech | 62 / 49 / 53 / 70 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 6 | speakers | 100 | human speech | 62 / 49 / 112 / 80 | 0 / 0 / 729 / 510 | 0 / 0 / 0 / 3 |
+| 10 | headphones | 0 | steady tone | 47 / 18 / 18 / 47 | 47 / 18 / 18 / 47 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 50 | steady tone | 47 / 18 / 54 / 49 | 47 / 18 / 54 / 49 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 100 | steady tone | 47 / 18 / 1498 / 1523 | 47 / 18 / 1498 / 1523 | 0 / 0 / 1600 / 1600 |
+| 10 | headphones | 0 | sung vibrato | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 50 | sung vibrato | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 100 | sung vibrato | 0 / 0 / 1463 / 1487 | 0 / 0 / 1463 / 1487 | 0 / 0 / 1425 / 1448 |
+| 10 | headphones | 0 | instrument | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 50 | instrument | 0 / 0 / 15 / 5 | 0 / 0 / 15 / 5 | 0 / 0 / 14 / 4 |
+| 10 | headphones | 100 | instrument | 0 / 0 / 1600 / 1600 | 0 / 0 / 1600 / 1600 | 0 / 0 / 1600 / 181 |
+| 10 | headphones | 0 | hum plus talker | 9 / 0 / 0 / 7 | 9 / 0 / 0 / 7 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 50 | hum plus talker | 9 / 0 / 0 / 8 | 9 / 0 / 0 / 8 | 0 / 0 / 0 / 1 |
+| 10 | headphones | 100 | hum plus talker | 9 / 0 / 0 / 8 | 9 / 0 / 0 / 8 | 0 / 0 / 0 / 27 |
+| 10 | headphones | 0 | talker | 4 / 0 / 0 / 4 | 4 / 0 / 0 / 4 | 0 / 0 / 0 / 0 |
+| 10 | headphones | 50 | talker | 4 / 0 / 0 / 5 | 4 / 0 / 0 / 5 | 0 / 0 / 0 / 1 |
+| 10 | headphones | 100 | talker | 4 / 0 / 0 / 5 | 4 / 0 / 0 / 5 | 0 / 0 / 0 / 11 |
+| 10 | headphones | 0 | human speech | 85 / 60 / 60 / 84 | 85 / 60 / 60 / 84 | 0 / 0 / 0 / 1 |
+| 10 | headphones | 50 | human speech | 85 / 60 / 60 / 84 | 85 / 60 / 60 / 84 | 0 / 0 / 0 / 2 |
+| 10 | headphones | 100 | human speech | 85 / 60 / 60 / 84 | 85 / 60 / 60 / 84 | 0 / 0 / 0 / 2 |
+| 10 | speakers | 0 | steady tone | 289 / 260 / 260 / 263 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 50 | steady tone | 289 / 260 / 260 / 288 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 100 | steady tone | 289 / 260 / 1265 / 1293 | 0 / 0 / 1550 / 1577 | 0 / 0 / 1508 / 1531 |
+| 10 | speakers | 0 | sung vibrato | 288 / 259 / 259 / 265 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 50 | sung vibrato | 288 / 259 / 260 / 288 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 100 | sung vibrato | 288 / 259 / 1560 / 1587 | 0 / 0 / 1553 / 1580 | 0 / 0 / 1470 / 1490 |
+| 10 | speakers | 0 | instrument | 231 / 202 / 202 / 205 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 50 | instrument | 231 / 202 / 276 / 242 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 100 | instrument | 231 / 202 / 1600 / 1600 | 0 / 0 / 1600 / 1600 | 0 / 0 / 1519 / 1545 |
+| 10 | speakers | 0 | hum plus talker | 143 / 114 / 114 / 142 | 1 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 50 | hum plus talker | 143 / 114 / 260 / 146 | 1 / 0 / 0 / 1 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 100 | hum plus talker | 143 / 114 / 260 / 288 | 1 / 0 / 1552 / 1580 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 0 | talker | 111 / 88 / 88 / 110 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 50 | talker | 111 / 88 / 176 / 114 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 100 | talker | 111 / 88 / 176 / 177 | 0 / 0 / 747 / 769 | 0 / 0 / 0 / 2 |
+| 10 | speakers | 0 | human speech | 108 / 93 / 93 / 106 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 50 | human speech | 108 / 93 / 94 / 106 | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| 10 | speakers | 100 | human speech | 108 / 93 / 94 / 106 | 0 / 0 / 652 / 428 | 0 / 0 / 0 / 3 |
+
+**Real speech is held.** With six seconds of lead, speakers and full denoising,
+the warm no-gain arm accumulates 510 held decoded speech frames versus 80 cold
+and 3 without AEC. At ten seconds of lead the warm arm reaches 428. The production
+gain-control setting does not fix it: 510 decoded frames, 778 manual-gate frames,
+kept 0.142; the no-AEC/gain control reaches only 3 held decoded frames, kept 0.797.
+`recorded_speech_is_not_held_after_stereo` checks this requirement explicitly and
+is currently a known failing acceptance probe. The generic synthetic talker
+alone misses this long hold.
+
+The warm/gain/full-model output levels in 0-3 / 3-8 / 8-16 s are
+-22.21 / -39.82 / -74.25 dBFS. A best-delay projection onto the clean recorded
+speech, allowing up to 50 ms delay, gives the following diagnostic gains and
+normalized correlations. It is a signal-component measurement, not a listening
+score:
+
+| Stage | Projected near gain dB, 0-3 / 3-8 / 8-16 s | Correlation, same windows |
+| --- | --- | --- |
+| After AEC and gain, before model | -2.21 / -8.24 / -11.04 | 0.183 / 0.136 / 0.111 |
+| After full model | -7.09 / -25.49 / -70.27 | 0.489 / 0.293 / 0.103 |
+| After gain-mask-only model, after stereo | -2.94 / -9.66 / -12.67 | 0.184 / 0.141 / 0.116 |
+
+Resetting model context at takeover, lowering its minimum-SNR shortcut to -100 dB,
+normalizing its input, lowering the complex-filter SNR threshold, and disabling
+the post-filter do not eliminate the recorded-speech hold. Skipping its complex
+filter preserves more of the near projection, but is rejected: the pure-echo
+3-8 s level changes from -65.31 to -7.21 dBFS, **58.11 dB louder**. Its apparent
+1.0 "kept" therefore cannot be read as complete voice preservation.
+A corrected post-wake native-gain-change probe at the first share sound, with
+all model stages retained, also reaches 510 held decoded speech frames (kept
+0.142). It is rejected as a speech fix. This measurement uses separate typed
+controls for warm/gain/model options; the earlier exploratory native-speech log
+with overlapping numeric conditions is excluded from committed evidence.
+
+These denoiser and native-AEC controls are feature-gated diagnostics supplied
+only by dev dependencies. The normal/build dependency graph contains neither
+`gwar-aec-measurements` nor `model-measurements`. No such workaround is enabled
+in production.
+
+#### Post-wake validation and reproduction
+
+The pre-sleep full workspace run is incomplete and is not counted. It was stopped
+before sleep; completed acoustic measurements finished before sleep. After the
+owner's 17:56 wake, the full suite and exact acceptance probes were rerun.
+[Full post-wake evidence](measurements/aec-post-wake-validation.txt) preserves
+commands, all output and the failures, including the completed pre-sleep FIFO
+simulation. Results are:
+
+| Requirement | Result |
+| --- | --- |
+| Full release workspace, excluding desktop | **PASS:** 1,496 passed, 39 ignored, 56 binaries/doc suites at resumed `a298543b` |
+| Final APM after diagnostic-only source changes | **PASS:** 54 passed, 24 ignored at `2b489471`; all four voice-thread heap guards passed, including replacement/refusal |
+| Voice-alone and warmed fingerprints | **PASS:** both `c2d868db7d8d0eeb`, rerun after wake |
+| Release workspace clippy, all targets, warnings denied | **PASS** at `2b489471`; fixes CI's needless-range-loop warning |
+| Production dependency feature isolation | **PASS:** neither diagnostic feature present in the normal/build graph |
+| 1 Mb/s FIFO simulation | **PASS:** completed before sleep, 9.048-9.288 ms p99; also active in the repeated full suite |
+| Four-share full six-pair p99 delta <=1 ms | **FAIL / not established:** third pair stops on sent-frame guard, 1,998 without shares / 1,399 with four shares, required >1,500 each |
+| Route floors against both baselines | **FAIL:** current candidate misses five of 17 mean cells; deferred arm misses three; per-case acceptance is not established |
+| Recorded speech without long holds | **FAIL:** executed acceptance probe exits 101; 510 held decoded active frames versus 3 without AEC |
+| Per-content option dominates current stereo | **FAIL / rejected:** 168 of 432 case/windows fail strict dominance; no production selection |
+| Linux build and PulseAudio null sinks | **PASS** in [a298543b CI](https://github.com/MaciejWlodarski/gwar/actions/runs/41476145382), `rust-voice` including `a_default_the_server_moves_is_seen`; `native-build` and Linux desktop also pass |
+| Overall CI | a298543b failed only measurement-loop clippy, now fixed locally; [2b489471 CI](https://github.com/MaciejWlodarski/gwar/actions/runs/41487816694) was queued at the last check. Green CI on the final head is not established |
+
+The two completed timing pairs were:
+
+| Pair/order | No-share p99, ms | Four-share p99, ms | Delta, ms |
+| --- | --- | --- | --- |
+| 0: 0, then 4 | 0.203 | 0.259 | +0.056 |
+| 1: 4, then 0 | 0.236 | 0.293 | +0.058 |
+
+The third pair fails before its percentiles are reported. These two rows do not
+prove the six-pair hard limit. The failure is preserved rather than rerunning
+until a favorable sample appears. No further measurements are run after this
+hard-limit failure. Formatting and diff checks are completed before the final
+checkpoint commit. The final documentation-only head's CI status is reported in
+the PR body.
+
+```sh
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test --locked --release --workspace --exclude gwar-desktop -- --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib route_gaps_reach_both_baselines -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib recorded_speech_is_not_held_after_stereo -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib four_shares_leave_the_voice_pipeline_on_time -- --ignored --nocapture --test-threads=1
+```
 
 ## Lip-sync
 

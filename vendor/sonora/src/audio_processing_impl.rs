@@ -74,6 +74,8 @@ struct CaptureState {
     capture_output_used: bool,
     capture_output_used_last_frame: bool,
     echo_path_gain_change: bool,
+    #[cfg(feature = "gwar-aec-measurements")]
+    reported_echo_gain_change: bool,
     prev_pre_adjustment_gain: f32,
     playout_volume: i32,
     prev_playout_volume: i32,
@@ -93,6 +95,8 @@ impl Default for CaptureState {
             capture_output_used: true,
             capture_output_used_last_frame: true,
             echo_path_gain_change: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            reported_echo_gain_change: false,
             prev_pre_adjustment_gain: -1.0,
             playout_volume: -1,
             prev_playout_volume: -1,
@@ -148,6 +152,8 @@ impl Default for FormatState {
 /// adjustment across the capture and render audio paths.
 #[derive(Debug)]
 pub(crate) struct AudioProcessingImpl {
+    #[cfg(feature = "gwar-aec-measurements")]
+    measurement_linear: AudioBuffer,
     config: Config,
     submodule_states: SubmoduleStates,
     submodules: Submodules,
@@ -171,6 +177,8 @@ impl AudioProcessingImpl {
     /// Creates a new audio processing instance with the given configuration.
     pub(crate) fn with_config(config: Config) -> Self {
         let mut apm = Self {
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_linear: AudioBuffer::new(16000, 1, 16000, 1, 16000),
             config,
             submodule_states: SubmoduleStates::new(),
             submodules: Submodules {
@@ -289,9 +297,32 @@ impl AudioProcessingImpl {
         self.capture_runtime_settings.push_back(setting);
     }
 
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement(&self) -> sonora_aec3::measurement::Measurement {
+        self.submodules
+            .echo_controller
+            .as_ref()
+            .map_or_else(Default::default, |ec| ec.measurement())
+    }
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_linear(&self) -> [f32; 160] {
+        std::array::from_fn(|i| self.measurement_linear.channel(0)[i] / 32768.0)
+    }
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_restart_nonlinear(&mut self, mode: u8) {
+        if let Some(ec) = &mut self.submodules.echo_controller {
+            ec.measurement_restart_nonlinear(mode);
+        }
+    }
+
     /// Returns current processing statistics.
     pub(crate) fn get_statistics(&self) -> &AudioProcessingStats {
         &self.capture.stats
+    }
+
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn notify_echo_gain_change(&mut self) {
+        self.capture.reported_echo_gain_change = true;
     }
 
     /// Sets the applied input volume (e.g. from the OS mixer).
@@ -504,8 +535,14 @@ impl AudioProcessingImpl {
         }
 
         // Phase 2: Echo path gain change detection.
+        #[cfg(feature = "gwar-aec-measurements")]
+        let reported = std::mem::take(&mut self.capture.reported_echo_gain_change);
         if self.submodules.echo_controller.is_some() {
             self.capture.echo_path_gain_change = self.capture.applied_input_volume_changed;
+            #[cfg(feature = "gwar-aec-measurements")]
+            {
+                self.capture.echo_path_gain_change |= reported;
+            }
 
             if let Some(adjuster) = &self.submodules.capture_levels_adjuster {
                 let pre_adjustment_gain = adjuster.get_pre_adjustment_gain();
@@ -595,6 +632,13 @@ impl AudioProcessingImpl {
             }
             let echo_path_gain_change = self.capture.echo_path_gain_change;
             let capture_buffer = self.capture.capture_audio.as_mut().unwrap();
+            #[cfg(feature = "gwar-aec-measurements")]
+            ec.process_capture(
+                capture_buffer,
+                Some(&mut self.measurement_linear),
+                echo_path_gain_change,
+            );
+            #[cfg(not(feature = "gwar-aec-measurements"))]
             ec.process_capture(capture_buffer, None, echo_path_gain_change);
         }
 
@@ -1276,6 +1320,16 @@ impl AudioProcessingImpl {
         let sample_rate_hz = self.proc_sample_rate_hz();
         let num_render_channels = self.num_reverse_channels();
         let num_capture_channels = self.num_proc_channels();
+        #[cfg(feature = "gwar-aec-measurements")]
+        {
+            self.measurement_linear = AudioBuffer::new(
+                16000,
+                num_capture_channels,
+                16000,
+                num_capture_channels,
+                16000,
+            );
+        }
 
         let mut config = EchoCanceller3Config::default();
         config.echo_removal_control.transparent_mode = ec.transparent_mode;
@@ -1285,15 +1339,97 @@ impl AudioProcessingImpl {
         let mut multichannel = EchoCanceller3Config::create_default_multichannel_config();
         multichannel.echo_removal_control.transparent_mode = ec.transparent_mode;
         multichannel.multi_channel.detect_stereo_content = ec.detect_stereo_content;
+        if ec.zero_nearend_reverb_decay {
+            config.ep_strength.nearend_len = 0.0;
+            multichannel.ep_strength.nearend_len = 0.0;
+        }
+        #[cfg(feature = "gwar-aec-measurements")]
+        if ec.multichannel_suppressor_like_mono {
+            multichannel.suppressor.normal_tuning.max_inc_factor =
+                config.suppressor.normal_tuning.max_inc_factor;
+            multichannel.suppressor.normal_tuning.max_dec_factor_lf =
+                config.suppressor.normal_tuning.max_dec_factor_lf;
+        }
+        #[cfg(feature = "gwar-aec-measurements")]
+        {
+            config.filter.export_linear_aec_output = true;
+            multichannel.filter.export_linear_aec_output = true;
+        }
+        #[cfg(feature = "gwar-aec-measurements")]
+        for c in [&mut config, &mut multichannel] {
+            match ec.measurement_native_profile {
+                1 => c.ep_strength.use_conservative_tail_frequency_response = false,
+                2 => {
+                    c.ep_strength.default_len = 0.0;
+                    c.ep_strength.nearend_len = 0.0;
+                }
+                3 => c.filter.use_linear_filter = false,
+                4 => {
+                    c.echo_removal_control.transparent_mode =
+                        crate::config::TransparentModeType::Legacy
+                }
+                5 => c.filter.conservative_initial_phase = true,
+                6 => c.ep_strength.erle_onset_compensation_in_dominant_nearend = true,
+                7 => c.ep_strength.nearend_len = 0.0,
+                8 => {
+                    c.ep_strength.default_len = 0.80;
+                    c.ep_strength.nearend_len = 0.80;
+                }
+                9 => {
+                    c.ep_strength.default_len = 0.80;
+                    c.ep_strength.nearend_len = 0.0;
+                }
+                10 => c.ep_strength.nearend_len = 0.75,
+                11 => c.ep_strength.nearend_len = 0.76,
+                12 | 13 => {
+                    c.ep_strength.nearend_len = 0.0;
+                    c.suppressor.dominant_nearend_detection.enr_threshold =
+                        if ec.measurement_native_profile == 12 {
+                            0.05
+                        } else {
+                            0.01
+                        };
+                }
+                _ => {}
+            }
+        }
         let multichannel_config = Some(multichannel);
 
-        self.submodules.echo_controller = Some(EchoCanceller3::new(
+        #[cfg(feature = "gwar-aec-measurements")]
+        let controller = if ec.measurement_two_channel_start {
+            EchoCanceller3::new_initialized_for_measurement(
+                config,
+                multichannel_config,
+                sample_rate_hz,
+                num_render_channels,
+                num_capture_channels,
+            )
+        } else {
+            EchoCanceller3::new(
+                config,
+                multichannel_config,
+                sample_rate_hz,
+                num_render_channels,
+                num_capture_channels,
+            )
+        };
+        #[cfg(not(feature = "gwar-aec-measurements"))]
+        let controller = EchoCanceller3::new(
             config,
             multichannel_config,
             sample_rate_hz,
             num_render_channels,
             num_capture_channels,
-        ));
+        );
+        self.submodules.echo_controller = Some(controller);
+        #[cfg(feature = "gwar-aec-measurements")]
+        if ec.measurement_left_reference {
+            self.submodules
+                .echo_controller
+                .as_mut()
+                .unwrap()
+                .measurement_restore_left_reference();
+        }
     }
 
     fn initialize_noise_suppressor(&mut self) {

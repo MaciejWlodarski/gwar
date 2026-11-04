@@ -13,7 +13,7 @@ import type { SealedMessage } from "../proto/SealedMessage";
 import type { ChatMessage } from "../proto/ChatMessage";
 import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
 import { latestMessageId, storedKey, type SealedThreadKey } from "./reducer";
-import { useSession } from "./stores";
+import { useSession, useOutbox } from "./stores";
 import type { ChatItem } from "./types";
 
 export type SealedRuntime = Pick<MlsRuntime, "status" | "subscribe" | "openConversation" | "sync" | "sealMessage" | "openMessage">;
@@ -332,6 +332,7 @@ export class SealedConversations {
           // An edit cannot swap the files its message was sent with: such a revision is ignored, like a fork.
           if (old?.kind === "msg" && old.authentic && msg.text !== DELETION_TEXT && !sameAttachments(old.msg.attachments ?? [], msg.attachments ?? [])) return;
           item = { ...item, authentic: true, verified: fullyVerified(verification) };
+          useOutbox.getState().reconcile(serverKey, thread, msg.author_uid, msg.signature!.message_id);
           if (this.pending.has(key) && !this.notified.has(key) && notificationAllowed(verification)) this.notify(msg);
           this.notified.add(key); this.pending.delete(key);
         }
@@ -345,44 +346,94 @@ export class SealedConversations {
     this.queue = done.catch(() => {});
     return done;
   }
+  delivered(thread: SealedKey, messageId: string, expected?: { serverKey: string | null; authorUid?: string; revision?: number }): boolean {
+    const serverKey = this.link.serverKey;
+    if (!serverKey || this.stopped || !this.current() || (expected && (expected.serverKey !== serverKey || expected.authorUid !== this.uid))) return false;
+    const conversation = this.conversation(thread);
+    return !!useSession.getState().threads[thread]?.items.some(i => i.kind === "msg" && i.authentic && !i.cannotOpen && !i.removed
+      && i.sealed?.conversation === conversation && i.sealed.author_uid === this.uid && i.sealed.message_id === messageId
+      && !this.removed.get(conversation)?.has(i.sealed.id) && i.msg.author_uid === this.uid
+      && !!i.msg.signature && i.msg.signature.server_key === serverKey && i.msg.signature.conversation === conversation
+      && i.msg.signature.author_uid === this.uid && i.msg.signature.message_id === messageId && i.msg.signature.revision >= (expected?.revision ?? 0));
+  }
+  /** Rejections are only delivery evidence after opening and authenticating our own row.
+   * Hold conversation removals across the fetch and every row/page, just like ordinary history. */
+  private async recoverDelivery(thread: SealedKey, messageId: string, check: () => void): Promise<boolean> {
+    const conversation = this.conversation(thread);
+    this.enter(conversation);
+    try {
+      if (this.delivered(thread, messageId)) return true;
+      let before: number | null = null;
+      for (let rows = 0; rows < SCAN_ROWS;) {
+        check();
+        const page: { sealed: SealedMessage[] } = await this.link.request("chat.sealed.history", { conversation, before, limit: 100 });
+        check();
+        if (!page.sealed.length) return false;
+        await this.page(conversation, page.sealed, before, useSession.getState().epoch);
+        check();
+        if (this.delivered(thread, messageId)) return true;
+        rows += page.sealed.length;
+        before = Math.min(...page.sealed.map(row => row.id));
+      }
+      return false;
+    } finally { this.leave(conversation); }
+  }
+  async recover(thread: SealedKey, messageId: string, currentAttempt = () => true): Promise<boolean> {
+    const epoch = useSession.getState().epoch;
+    const check = () => { this.check(); if (!currentAttempt() || epoch !== useSession.getState().epoch) throw new ConnectionLostError(); };
+    check();
+    return this.recoverDelivery(thread, messageId, check);
+  }
   /** Sends a message, or a revision of `original`. Its encrypted attachments are
    * tied to it when it is sent and stay its own through every edit; a deletion lists none. */
-  async send(thread: SealedKey, text: string, mentions: string[], original?: MessageSignature, attachments: Attachment[] = []): Promise<void> {
-    this.check();
-    const epoch = useSession.getState().epoch;
-    const checkSession = () => { this.check(); if (epoch !== useSession.getState().epoch) throw new ConnectionLostError(); };
-    const check = () => {
-      checkSession();
-      if (original) {
-        const item = useSession.getState().threads[thread]?.items.find(i => i.kind === "msg" && i.msg.signature?.message_id === original.message_id);
-        if (item?.kind === "msg" && (item.cannotOpen || item.msg.signature?.revision !== original.revision)) throw new Error(tNow("chat.editChanged"));
-      }
-    };
+  async send(thread: SealedKey, text: string, mentions: string[], original?: MessageSignature, attachments: Attachment[] = [],
+    retry = { message_id: original?.message_id ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))), created_at: original?.created_at ?? Date.now() }, currentAttempt = () => true): Promise<void> {
     const conversation = this.conversation(thread);
-    const retry = { message_id: original?.message_id ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))), created_at: original?.created_at ?? Date.now() };
-    if (text === DELETION_TEXT) attachments = [];
-    if (attachments.some(a => !a.sealed)) throw new Error("Unencrypted attachment in an encrypted conversation");
-    if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"));
-    for (let attempt = 0; attempt < 3; attempt++) {
-      let signature!: MessageSignature;
-      const sealed = await this.runtime.sealMessage(conversation, async ctx => {
-        check();
-        signature = await signMessage(this.identity, { serverKey: ctx.server_key, target: conversation,
-          sealed: { group: ctx.group_id, epoch: Number(ctx.epoch) } }, this.uid, text, mentions, attachments, original, retry);
-        check(); return { text, mentions, attachments, signature };
-      });
-      check();
-      try {
-        const row = original
-          ? await this.link.request(text === DELETION_TEXT ? "chat.delete_own" : "chat.sealed.edit", { conversation, ...sealed, message_id: retry.message_id, revision: signature.revision })
-          : await this.link.request("chat.sealed.send", { conversation, ...sealed, message_id: retry.message_id, files: attachments.map(a => a.id) });
-        checkSession(); await this.receive(row, false); return;
-      } catch (error) {
+    this.enter(conversation);
+    try {
+      this.check();
+      if (!original && this.delivered(thread, retry.message_id)) return;
+      const epoch = useSession.getState().epoch;
+      const checkSession = () => { this.check(); if (!currentAttempt() || epoch !== useSession.getState().epoch) throw new ConnectionLostError(); };
+      const check = () => {
         checkSession();
-        if (!(error instanceof RequestError) || !["stale", "pending"].includes(error.code) || attempt === 2) throw error;
-        await this.runtime.sync(); check();
-        if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"), { cause: error });
+        if (original) {
+          const item = useSession.getState().threads[thread]?.items.find(i => i.kind === "msg" && i.msg.signature?.message_id === original.message_id);
+          if (item?.kind === "msg" && (item.cannotOpen || item.msg.signature?.revision !== original.revision)) throw new Error(tNow("chat.editChanged"));
+        }
+      };
+      if (text === DELETION_TEXT) attachments = [];
+      if (attachments.some(a => !a.sealed)) throw new Error("Unencrypted attachment in an encrypted conversation");
+      if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"));
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let signature!: MessageSignature;
+        const sealed = await this.runtime.sealMessage(conversation, async ctx => {
+          check();
+          signature = await signMessage(this.identity, { serverKey: ctx.server_key, target: conversation,
+            sealed: { group: ctx.group_id, epoch: Number(ctx.epoch) } }, this.uid, text, mentions, attachments, original, retry);
+          check(); return { text, mentions, attachments, signature };
+        }, check);
+        check();
+        try {
+          const row = original
+            ? await this.link.request(text === DELETION_TEXT ? "chat.delete_own" : "chat.sealed.edit", { conversation, ...sealed, message_id: retry.message_id, revision: signature.revision })
+            : await this.link.request("chat.sealed.send", { conversation, ...sealed, message_id: retry.message_id, files: attachments.map(a => a.id) });
+          checkSession();
+          await this.receive(row, false);
+          checkSession();
+          if (!this.delivered(thread, retry.message_id, { serverKey: this.link.serverKey ?? null, authorUid: this.uid, revision: signature.revision })) throw new Error(tNow("chat.notSent"));
+          return;
+        } catch (error) {
+          checkSession();
+          // Upload ownership is checked before duplicate message IDs: an attached upload can
+          // turn a lost acknowledgement into bad_request rather than conflict.
+          if (!original && error instanceof RequestError && (error.code === "conflict" || (error.code === "bad_request" && attachments.length > 0))
+            && await this.recoverDelivery(thread, retry.message_id, checkSession)) return;
+          if (!(error instanceof RequestError) || !["stale", "pending"].includes(error.code) || attempt === 2) throw error;
+          await this.runtime.sync(); check();
+          if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"), { cause: error });
+        }
       }
-    }
+    } finally { this.leave(conversation); }
   }
 }

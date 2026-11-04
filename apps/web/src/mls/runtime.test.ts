@@ -466,6 +466,16 @@ describe("MLS synchronization", () => {
     })).rejects.toThrow("group changed");
     expect(f.operations.some(o => o.op === "seal_message")).toBe(false);
   });
+  it.each(["queued", "signing"] as const)("cancels message sealing during %s before consuming an encryption key", async pause => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    let cancelled = pause === "queued";
+    const build = vi.fn(async () => { cancelled = true; return {} as Plaintext; });
+    await expect(f.runtime.sealMessage(conversation, build, () => {
+      if (cancelled) throw new Error("attempt cancelled");
+    })).rejects.toThrow("attempt cancelled");
+    if (pause === "queued") expect(build).not.toHaveBeenCalled();
+    expect(f.operations.some(o => o.op === "seal_message")).toBe(false);
+  });
   it("shares admitted history with persisted chunks, retries identical bytes, imports before ack", async () => {
     const f = await fixture({ ...clean(), groups: [summary()] });
     f.world.head = 1; f.world.entries = [{ epoch: 0, commit: "CQ", proposals: [] }];

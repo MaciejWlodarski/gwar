@@ -1,0 +1,19 @@
+attempt,arm,valid,exit_code,peak_load_1m,invalid_reasons
+00-head,head,False,-15,3.27734375,overlap with another cargo/test or #213 timing; overlap at end
+01-head,head,False,-15,2.78466796875,overlap with another cargo/test or #213 timing; overlap at end
+02-head,head,False,-15,2.6845703125,overlap with another cargo/test or #213 timing; overlap at end
+03-head,head,False,-15,2.2333984375,overlap with another cargo/test or #213 timing; overlap at end
+04-head,head,False,-15,4.92626953125,one-minute load exceeded 4.5; one-minute load exceeded 4.5 at end
+05-head,head,True,0,3.14453125,
+06-main,main,False,-15,2.2158203125,overlap with another cargo/test or #213 timing
+07-main,main,True,0,2.1455078125,
+08-head,head,False,-15,2.30859375,overlap with another cargo/test or #213 timing; overlap at end
+09-head,head,False,-15,3.02978515625,overlap with another cargo/test or #213 timing; overlap at end
+10-head,head,True,0,3.74462890625,
+11-main,main,True,0,3.37255859375,
+12-head,head,True,0,2.95849609375,
+13-main,main,False,-15,2.537109375,overlap with another cargo/test or #213 timing; overlap at end
+14-main,main,False,-15,3.28173828125,overlap with another cargo/test or #213 timing; overlap at end
+15-main,main,False,-15,3.349609375,overlap with another cargo/test or #213 timing; overlap at end
+16-main,main,False,-15,2.12060546875,overlap with another cargo/test or #213 timing; overlap at end
+17-main,main,True,0,2.5439453125,

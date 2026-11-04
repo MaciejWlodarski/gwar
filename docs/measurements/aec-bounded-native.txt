@@ -1,0 +1,27 @@
+   Compiling sonora v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora)
+   Compiling gwar-client v0.1.2 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-client)
+    Finished `release` profile [optimized] target(s) in 2m 00s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/gwar_client-63cb5b99089087a9)
+
+running 1 test
+test voice::apm::tests::tones::bounded_native_reverb_screen ... bounded-native,lead=6,mode=34,hold=111,kept=0.05974026,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=35,hold=183,kept=0.048484847,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=86,hold=111,kept=0.05974026,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=87,hold=183,kept=0.048484847,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=88,hold=299,kept=0.051948052,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=89,hold=111,kept=0.058874458,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=90,hold=49,kept=0.42164502,cold-hold=136,cold-kept=0.104761906,speech-pass=true
+bounded-native,lead=6,mode=91,hold=370,kept=0.14112554,cold-hold=136,cold-kept=0.104761906,speech-pass=false
+bounded-native,lead=6,mode=92,hold=49,kept=0.42337662,cold-hold=136,cold-kept=0.104761906,speech-pass=true
+bounded-native,lead=10,mode=34,hold=70,kept=0.081385285,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=35,hold=300,kept=0.03203463,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=86,hold=70,kept=0.081385285,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=87,hold=300,kept=0.03203463,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=88,hold=70,kept=0.07012987,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=89,hold=70,kept=0.07878788,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=90,hold=49,kept=0.425974,cold-hold=106,cold-kept=0.12813853,speech-pass=true
+bounded-native,lead=10,mode=91,hold=418,kept=0.13852814,cold-hold=106,cold-kept=0.12813853,speech-pass=false
+bounded-native,lead=10,mode=92,hold=49,kept=0.42337662,cold-hold=106,cold-kept=0.12813853,speech-pass=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 399 filtered out; finished in 70.81s

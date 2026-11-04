@@ -745,7 +745,7 @@ async function main() {
     await alert.waitFor({ timeout: 8000 });
     await alert.getByText("retry me").waitFor();
     await b.evaluate(() => window.__restoreSend());
-    await alert.getByRole("button", { name: "Retry" }).click();
+    await alert.getByRole("button", { name: "Send again" }).click();
     await a.getByText("retry me").waitFor({ timeout: 8000 });
     await alert.waitFor({ state: "detached" });
   });
@@ -837,6 +837,62 @@ async function main() {
       const row = page.locator("[data-message]").filter({ hasText: `alias DM reply ${rid}` });
       await row.waitFor();
       await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified reply across endpoint aliases");
+    }
+  });
+
+  await check("an encrypted failure stays in its timeline and Retry preserves its identity", async () => {
+    await a.evaluate(() => {
+      const ws = window.__sockets.find(x => x.readyState === WebSocket.OPEN && x.url.endsWith("/ws"));
+      const original = ws.send.bind(ws);
+      window.__sealedRetryFrames = [];
+      window.__rejectSealed = true;
+      window.__restoreSealedSend = () => { ws.send = original; };
+      ws.send = data => {
+        const frame = JSON.parse(data);
+        if (frame.op === "chat.sealed.send") {
+          window.__sealedRetryFrames.push({ op: frame.op, id: frame.d.message_id });
+          if (window.__rejectSealed) frame.d.group = "invalid";
+        } else if (frame.op === "chat.send") window.__sealedRetryFrames.push({ op: frame.op });
+        original(JSON.stringify(frame));
+      };
+    });
+    const failedText = `encrypted retry ${rid}`, laterText = `later than the failed send ${rid}`;
+    try {
+      await composer(a).fill(failedText);
+      await a.getByRole("button", { name: "Send message", exact: true }).click();
+      const failed = a.getByRole("alert").filter({ hasText: failedText });
+      await failed.waitFor({ timeout: 8000 });
+      if (await composer(a).inputValue()) throw new Error("the failed message returned to the composer");
+      await a.evaluate(async () => { (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "pl" }); });
+      await failed.getByText(/Nie wysłano/).waitFor();
+      await failed.getByRole("button", { name: "Wyślij ponownie", exact: true }).waitFor();
+      await failed.getByRole("button", { name: "Odrzuć", exact: true }).waitFor();
+      await a.evaluate(async () => {
+        (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "en" });
+        window.__rejectSealed = false;
+      });
+      await composer(a).fill(laterText);
+      await a.getByRole("button", { name: "Send message", exact: true }).click();
+      await b.getByText(laterText, { exact: true }).waitFor({ timeout: 8000 });
+      if (!await failed.evaluate((el, text) => {
+        const later = [...el.parentElement.querySelectorAll('[data-message]')].find(row => row.textContent.includes(text));
+        return !!later && !!(el.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING);
+      }, laterText)) throw new Error("the failed message moved after its follow-up");
+      await failed.getByRole("button", { name: "Send again", exact: true }).click();
+      for (const page of [a, b]) {
+        const row = page.locator('[data-message]').filter({ hasText: failedText });
+        await row.waitFor({ timeout: 8000 });
+        await waitFor(() => row.getAttribute("data-message-verification").then(v => v === "verified"), "verified encrypted retry");
+        if (await row.count() !== 1) throw new Error("Retry duplicated the encrypted message");
+      }
+      await failed.waitFor({ state: "detached" });
+      const frames = await a.evaluate(() => window.__sealedRetryFrames);
+      if (frames.some(f => f.op === "chat.send") || frames[0].id !== frames.at(-1).id) throw new Error(`encrypted Retry changed its route or identity: ${JSON.stringify(frames)}`);
+    } finally {
+      await a.evaluate(async () => {
+        window.__restoreSealedSend();
+        (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "en" });
+      });
     }
   });
 
