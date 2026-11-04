@@ -84,20 +84,33 @@ const INITIAL_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 const KEYFRAME_BOOTSTRAP: Duration = Duration::from_secs(5);
 const DECODE_WINDOW: Duration = Duration::from_secs(4);
 /// The browser's decode watchdog (`DecodeWatchdog`, apps/web/src/voice/screen.ts) reports a
-/// decoder that keeps failing every 10 s, each report on the first stats poll at or after its
-/// deadline, and a poll gap over 1.5 s restarts its stall.
-const CLIENT_REPORT_EVERY_MS: u64 = 10_000;
+/// decoder that decodes nothing for `DECODE_WINDOW`, then every `CLIENT_REPORT_EVERY_MS`
+/// (`DECODE_REPORT_EVERY_MS` there), each report on the first stats poll at or after its
+/// deadline; a poll gap over `CLIENT_POLL_GAP_MS` (`DECODE_POLL_GAP_MS`) restarts its stall.
+/// So a stalled viewer reports at least once in any `CLIENT_REPORT_EVERY_MS +
+/// CLIENT_POLL_GAP_MS`, and its reports are never closer than `CLIENT_REPORT_EVERY_MS -
+/// CLIENT_POLL_GAP_MS`.
+const CLIENT_REPORT_EVERY_MS: u64 = 5_000;
 const CLIENT_POLL_GAP_MS: u64 = 1_500;
-/// Differences between viewers in when the keyframe notification and their reports travel.
+/// Differences between viewers, or between one viewer's reports, in transit.
 const REPORT_TRANSIT_MS: u64 = 500;
-/// Allow independent watchdog reports to meet before isolating a failed watch. A stalled viewer
-/// reports at least once in any span of one report period and one poll gap, whatever the phase
-/// of its polls and however late its first sample after the keyframe notification (up to 10.5 s,
-/// against a report taken 4 s after it at the earliest). Viewers' stalls start at their own
-/// first samples, which can be seconds apart, so no shorter window holds: 2 s isolated one of
-/// two failing viewers whose retries came 2.84 s apart.
+/// Allow independent watchdog reports to meet before isolating a failed watch: one report
+/// period, one poll gap and the transit allowance (7 s). Once a report is taken, every other
+/// viewer stalled on the same stream has one inside it, whatever the phase of its polls, as long
+/// as its first stats sample came within `CLIENT_REPORT_EVERY_MS` of the keyframe notification:
+/// a report taken at the earliest `DECODE_WINDOW` after the notification leaves room for a first
+/// report `DECODE_WINDOW + CLIENT_POLL_GAP_MS` after such a sample. Viewers' stalls start at
+/// their own first samples, which can be seconds apart: 2 s isolated one of two failing viewers
+/// whose retries came 2.84 s apart.
 const CORROBORATE_FOR: Duration =
     Duration::from_millis(CLIENT_REPORT_EVERY_MS + CLIENT_POLL_GAP_MS + REPORT_TRANSIT_MS);
+/// At most one taken report per viewer and share this often. It bounds what a client that
+/// reports too often can cost (a recovery check and a keyframe request), and is shorter than
+/// the closest two reports of the real watchdog can arrive (3 s), so it never holds back a report
+/// that corroborates another or follows a codec switch: a new generation's first report comes
+/// `DECODE_WINDOW` after its keyframe notification, which comes after the switch's last report.
+const REPORT_THROTTLE: Duration =
+    Duration::from_millis(CLIENT_REPORT_EVERY_MS - CLIENT_POLL_GAP_MS - REPORT_TRANSIT_MS);
 /// A publish transport that has not connected by then fails.
 pub const PUBLISH_CONNECT: Duration = Duration::from_secs(30);
 /// Members and guests must connect their watch transport before this deadline.
@@ -2303,7 +2316,7 @@ impl Sfu {
         if self
             .decode_reports
             .get(&(session, share.to_owned()))
-            .is_some_and(|at| now.saturating_duration_since(*at) < recovery::HOLD_DOWN)
+            .is_some_and(|at| now.saturating_duration_since(*at) < REPORT_THROTTLE)
         {
             return;
         }
@@ -2382,7 +2395,7 @@ impl Sfu {
     }
 
     fn recoveries(&mut self, now: Instant) {
-        self.decode_reports.retain(|_, at| now.saturating_duration_since(*at) < recovery::HOLD_DOWN);
+        self.decode_reports.retain(|_, at| now.saturating_duration_since(*at) < REPORT_THROTTLE);
         let shares: Vec<_> = self.publishers.keys().cloned().collect();
         for share in shares {
             let origin = self.publishers[&share].origin.clone();
@@ -5697,16 +5710,17 @@ pub(crate) mod tests {
 
     /// Replays viewers 7's and 8's report times (ms after `start`, when both slots were armed
     /// and whole) against the server's corroboration window. It ticks the window at every
-    /// report, before the report, and wherever a report's window ends. `throttled`: both
-    /// viewers' previous-generation reports were taken a second before `start`, so only retries
-    /// can corroborate. Ok once the fallback is planned with both viewers still watching.
+    /// report, before the report, and wherever a report's window ends. `switched`: the slots
+    /// follow a codec switch whose reports were taken just before: viewer 7's at `start`, viewer
+    /// 8's a whole corroboration window earlier, the widest the switch allows, so their
+    /// throttles end apart. Ok once the fallback is planned with both viewers still watching.
     fn replay_reports(
         sfu: &mut Sfu,
         origin: &ScreenOrigin,
         need: h264_stream::Requirements,
         start: Instant,
         viewers: [&[u64]; 2],
-        throttled: bool,
+        switched: bool,
     ) -> Result<(), String> {
         *origin.recovery.lock().unwrap() = Default::default();
         sfu.decode_reports.clear();
@@ -5719,8 +5733,9 @@ pub(crate) mod tests {
             slot.keyframe_at = Some(start);
             slot.intact_since = Some(start);
             slot.last_h264 = Some((start, need));
-            if throttled {
-                sfu.decode_reports.insert((*session, "h264".into()), start - Duration::from_secs(1));
+            if switched {
+                let taken = if *session == 7 { start } else { start - CORROBORATE_FOR };
+                sfu.decode_reports.insert((*session, "h264".into()), taken);
             }
         }
         let window = CORROBORATE_FOR.as_millis() as u64;
@@ -5749,24 +5764,26 @@ pub(crate) mod tests {
     }
 
     /// Review repro: after a replacement, viewer A samples its stats at 1600 + 1270n ms and viewer
-    /// B at 1000n ms; neither decoder decodes. A's stall starts at its own first sample, so its
-    /// retry came at 16,840 ms and B's at 14,000 ms. With their first reports throttled, a 2 s
-    /// window isolated B at 16,000 ms before A corroborated, and the fallback kept only A.
+    /// B at 1000n ms; neither decoder decodes. A's stall starts at its own first sample, so with
+    /// 10 s spacing its retry came at 16,840 ms and B's at 14,000 ms. With their first reports
+    /// throttled, a 2 s window isolated B at 16,000 ms before A corroborated, and the fallback
+    /// kept only A.
     #[tokio::test]
     async fn retries_from_late_and_early_polls_corroborate_and_the_fallback_keeps_both() {
         let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
         let reports = watchdog_reports();
         let of = |period, delay| reports.iter().find(|r| r.0 == period && r.1 == delay).unwrap().2.clone();
         let (a, b) = (of(1270, 1600), of(1000, 0));
-        assert_eq!((&a[..2], &b[..2]), (&[6680, 16_840][..], &[4000, 14_000][..]));
-        for throttled in [true, false] {
-            replay_reports(&mut sfu, &origin, need, now + Duration::from_secs(10), [&a, &b], throttled).unwrap();
+        assert_eq!((&a[..3], &b[..3]), (&[6680, 11_760, 16_840][..], &[4000, 9000, 14_000][..]));
+        for switched in [true, false] {
+            replay_reports(&mut sfu, &origin, need, now + Duration::from_secs(10), [&a, &b], switched).unwrap();
+            replay_reports(&mut sfu, &origin, need, now + Duration::from_secs(10), [&b, &a], switched).unwrap();
             assert!(sfu.watchers.values().all(|w| w.slots[0].decode_cap.is_some()), "both get the fallback");
         }
     }
 
     /// Every pair of poll periods (1, 1.27 and 1.5 s) and first-sample delays (0 to 3 s, every
-    /// 50 ms) of the real watchdog, with and without throttled first reports, and with one
+    /// 50 ms) of the real watchdog, on a fresh share and right after a codec switch, and with one
     /// viewer's reports 0.5 s later in transit: both viewers corroborate, and the fallback keeps
     /// both.
     #[tokio::test]
@@ -5779,10 +5796,10 @@ pub(crate) mod tests {
             for b in &reports {
                 for transit in [0, 500] {
                     let late: Vec<u64> = a.2.iter().map(|at| at + transit).collect();
-                    for throttled in [true, false] {
-                        if let Err(e) = replay_reports(&mut sfu, &origin, need, start, [&late, &b.2], throttled) {
+                    for switched in [true, false] {
+                        if let Err(e) = replay_reports(&mut sfu, &origin, need, start, [&late, &b.2], switched) {
                             panic!(
-                                "A every {} ms from {} ms (+{transit} ms) vs B every {} ms from {} ms, throttled {throttled}: {e}",
+                                "A every {} ms from {} ms (+{transit} ms) vs B every {} ms from {} ms, switched {switched}: {e}",
                                 a.0, a.1, b.0, b.1
                             );
                         }
@@ -5869,10 +5886,11 @@ pub(crate) mod tests {
         report(&mut sfu, 7, now + Duration::from_secs(5));
         assert!(origin.recovery.lock().unwrap().pending, "sole viewer may recover its share");
         origin.recovery.lock().unwrap().pending = false;
-        // The replacement's keyframe goes out whole to the retained slot.
-        sfu.watchers.get_mut(&7).unwrap().slots[0].intact_since = Some(now + Duration::from_secs(5));
-        sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((now + Duration::from_secs(10), need));
-        report(&mut sfu, 7, now + Duration::from_secs(10));
+        // The slot stays whole; a report sooner than the throttle after the taken one is ignored.
+        sfu.watchers.get_mut(&7).unwrap().slots[0].intact_since = Some(now);
+        let soon = now + Duration::from_secs(5) + REPORT_THROTTLE - Duration::from_millis(1);
+        sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((soon, need));
+        report(&mut sfu, 7, soon);
         assert!(sfu.watchers[&7].slots[0].failed_at.is_none(), "per-session throttle ignores repeated reports");
         sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((now + Duration::from_secs(15), need));
         report(&mut sfu, 7, now + Duration::from_secs(15));

@@ -555,8 +555,13 @@ export async function probeH264(): Promise<H264Capability[]> {
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
 }
 
-/** Spacing of a stalled decoder's reports; network gaps restart the four-second clock. */
-const REPORT_EVERY_MS = 10_000;
+/** A decoder that receives packets and decodes nothing this long is reported (the SFU's
+ * `DECODE_WINDOW`). */
+export const DECODE_STALL_MS = 4000;
+/** Spacing of a stalled decoder's later reports (the SFU's `CLIENT_REPORT_EVERY_MS`). */
+export const DECODE_REPORT_EVERY_MS = 5000;
+/** A longer gap between stats samples restarts the stall (the SFU's `CLIENT_POLL_GAP_MS`). */
+export const DECODE_POLL_GAP_MS = 1500;
 
 export class DecodeWatchdog {
   private frames: number | null = null;
@@ -565,34 +570,34 @@ export class DecodeWatchdog {
   private next: number | null = null;
   private reported: number | null = null;
   /**
-   * Reports a decoder that receives packets and decodes nothing for 4 s, then every 10 s for as
-   * long as that lasts: until it decodes, packets stop, or the slot's generation changes (the
-   * server isolated the viewer or fell back). There is no budget. The server takes a report only
-   * once the SFU has forwarded the slot whole for the watchdog's window, since its own drops
-   * starve a decoder like a codec it cannot decode, and the viewer cannot see those drops: lost
-   * packets can be balanced by duplicates. So the watchdog keeps reporting, and the first report
-   * past the server's window is taken. Deadlines run from the stall, 4 s and then every 10 s,
-   * each sent on the first poll at or after it, so a stalled decoder reports at least once in
-   * any 10 s plus one poll gap (at most 1.5 s, a longer one restarts the stall). The server's
-   * corroboration window (`CORROBORATE_FOR` in the SFU) is sized from these two numbers, so
-   * viewers that stalled together corroborate whatever their polls' phases: keep them in step.
-   * The stall starts at this watchdog's own first sample, since frames decoded before it are
-   * unknown. A new stall never brings the next report closer than 10 s to the last one. A report
-   * the server ignores costs it a constant-time check.
+   * Reports a decoder that receives packets and decodes nothing for `DECODE_STALL_MS`, then
+   * every `DECODE_REPORT_EVERY_MS` for as long as that lasts: until it decodes, packets stop, or
+   * the slot's generation changes (the server isolated the viewer or fell back). There is no
+   * budget. The server takes a report only once the SFU has forwarded the slot whole for the
+   * watchdog's window, since its own drops starve a decoder like a codec it cannot decode, and
+   * the viewer cannot see those drops: lost packets can be balanced by duplicates. So the
+   * watchdog keeps reporting, and the first report past the server's window is taken. Deadlines
+   * run from the stall, each report sent on the first poll at or after its deadline, so a
+   * stalled decoder reports at least once in any `DECODE_REPORT_EVERY_MS` plus
+   * `DECODE_POLL_GAP_MS` (a longer gap restarts the stall), and two reports are never closer
+   * than `DECODE_REPORT_EVERY_MS` less one poll gap. The SFU sizes its corroboration window and
+   * its report throttle from these constants: keep them in step. The stall starts at this
+   * watchdog's own first sample, since frames decoded before it are unknown. A new stall never
+   * brings the next report closer than `DECODE_REPORT_EVERY_MS` to the last one. A report the
+   * server ignores costs it a constant-time check.
    */
   observe(now: number, packets: number, frames: number): boolean {
     const decoded = this.frames === null || frames > this.frames;
     const paused = this.packets !== null && packets <= this.packets;
-    if (decoded || paused || (this.last !== null && now - this.last > 1500)) {
-      this.next = Math.max(now + 4000, (this.reported ?? -Infinity) + REPORT_EVERY_MS);
+    if (decoded || paused || (this.last !== null && now - this.last > DECODE_POLL_GAP_MS)) {
+      this.next = Math.max(now + DECODE_STALL_MS, (this.reported ?? -Infinity) + DECODE_REPORT_EVERY_MS);
     }
     this.frames = frames;
     const flowing = this.packets !== null && packets > this.packets;
     this.packets = packets; this.last = now;
     if (!flowing || this.next === null || now < this.next) return false;
-    // Anchored to the stall, not to this rounded callback: one report per 10 s step, with no
-    // drift. 10 s also outlasts the server's viewer/share throttle from the previous generation.
-    while (this.next <= now) this.next += REPORT_EVERY_MS;
+    // Anchored to the stall, not to this rounded callback: one report per step, with no drift.
+    while (this.next <= now) this.next += DECODE_REPORT_EVERY_MS;
     this.reported = now;
     return true;
   }
