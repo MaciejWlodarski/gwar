@@ -1,0 +1,18 @@
+$ /private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9 voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time --exact --ignored --nocapture --test-threads=1
+Revision: 7699190642dc4ff737f7218a22ce1a319902c7fc
+Before: 21:52  up  9:16, 2 users, load averages: 2.82 3.01 3.19
+
+running 1 test
+test voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time ... pair 0 order [0, 4]: none p50 0.363 p99 0.793 max 3.990 missing 480 | four p50 0.011 p99 1.307 max 7.437 missing 0 | p99 delta +0.514 ms
+pair 1 order [4, 0]: none p50 0.010 p99 0.192 max 1.367 missing 480 | four p50 0.011 p99 1.158 max 1.533 missing 0 | p99 delta +0.966 ms
+pair 2 order [0, 4]: none p50 0.113 p99 0.657 max 0.907 missing 480 | four p50 0.121 p99 0.271 max 0.522 missing 0 | p99 delta -0.386 ms
+pair 3 order [4, 0]: none p50 0.102 p99 0.187 max 0.367 missing 480 | four p50 0.116 p99 0.263 max 0.293 missing 0 | p99 delta +0.076 ms
+pair 4 order [0, 4]: none p50 0.008 p99 0.336 max 0.675 missing 480 | four p50 0.243 p99 1.250 max 6.144 missing 0 | p99 delta +0.914 ms
+pair 5 order [4, 0]: none p50 0.003 p99 0.752 max 1.285 missing 480 | four p50 0.269 p99 1.241 max 2.368 missing 0 | p99 delta +0.489 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 239.93s
+
+
+After: 21:56  up  9:20, 2 users, load averages: 2.46 2.90 3.10
+External-condition valid: True

@@ -1,0 +1,81 @@
+{
+  "arm": "head",
+  "sha": "7699190642dc4ff737f7218a22ce1a319902c7fc",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9",
+  "binary_sha256": "071fbe3ef779d92484de1b76ec52d945e83d6eea4ddd85588b128dc7b6e42cd8",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T20:15:16.972968+00:00",
+    "load": [
+      2.96484375,
+      5.06494140625,
+      5.09765625
+    ],
+    "uptime": "21:15  up  8:39, 2 users, load averages: 2.96 5.06 5.10",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": false,
+  "invalid_reasons": [
+    "overlap with another cargo/test or #213 timing",
+    "overlap at end"
+  ],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T20:15:17.051370+00:00",
+    "load": [
+      2.96484375,
+      5.06494140625,
+      5.09765625
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 2645,
+  "test_nice": 10,
+  "exit_code": -15,
+  "after": {
+    "at": "2026-11-04T20:16:23.161633+00:00",
+    "load": [
+      2.42138671875,
+      4.515625,
+      4.88818359375
+    ],
+    "uptime": "21:16  up  8:40, 2 users, load averages: 2.42 4.52 4.89",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": [
+        {
+          "pid": 3154,
+          "parent": 3152,
+          "nice": 19,
+          "command": "/opt/homebrew/bin/cargo"
+        }
+      ]
+    }
+  },
+  "peak_load_1m": 3.27734375,
+  "pair_count": 1
+}

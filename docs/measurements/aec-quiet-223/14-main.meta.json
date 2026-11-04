@@ -1,0 +1,81 @@
+{
+  "arm": "main",
+  "sha": "6c1c45c9d677b63f6b61ba25a91fcd997a014ca1",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+  "binary_sha256": "c09245733f7d8cf1bb3695bd56e5e05dd0f1ea8042874e38019df545eef784be",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T21:07:08.592893+00:00",
+    "load": [
+      3.28173828125,
+      2.568359375,
+      2.7158203125
+    ],
+    "uptime": "22:07  up  9:30, 2 users, load averages: 3.28 2.57 2.72",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": false,
+  "invalid_reasons": [
+    "overlap with another cargo/test or #213 timing",
+    "overlap at end"
+  ],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T21:07:08.671721+00:00",
+    "load": [
+      3.28173828125,
+      2.568359375,
+      2.7158203125
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 42767,
+  "test_nice": 10,
+  "exit_code": -15,
+  "after": {
+    "at": "2026-11-04T21:07:13.818672+00:00",
+    "load": [
+      3.0986328125,
+      2.5419921875,
+      2.70556640625
+    ],
+    "uptime": "22:07  up  9:30, 2 users, load averages: 3.10 2.54 2.71",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": [
+        {
+          "pid": 42822,
+          "parent": 42819,
+          "nice": 19,
+          "command": "cargo"
+        }
+      ]
+    }
+  },
+  "peak_load_1m": 3.28173828125,
+  "pair_count": 0
+}

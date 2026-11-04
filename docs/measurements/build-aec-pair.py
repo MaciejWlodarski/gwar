@@ -10,7 +10,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--head-dir', type=Path, required=True)
     parser.add_argument('--main-dir', type=Path, required=True)
-    parser.add_argument('--main-sha', default='208c886668b597a1c1334c926bb8ccd2948e8b83')
+    parser.add_argument('--main-sha', required=True)
     parser.add_argument('--target-root', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
