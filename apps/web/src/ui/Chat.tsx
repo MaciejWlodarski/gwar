@@ -19,9 +19,9 @@ import { SEALED_FILE_OVERHEAD } from "../net/sealed-file";
 import type { ChatMessage } from "../proto/ChatMessage";
 import { controller, UploadError } from "../state/controller";
 import { myChannelId, storedKey } from "../state/reducer";
-import { useOutbox, useSession, useUi } from "../state/stores";
+import { useOutbox, useSession, useUi, type FailedSend } from "../state/stores";
 import type { ChatItem, ThreadKey, StoredThreadKey } from "../state/types";
-import { AttachmentList } from "./Attachments";
+import { AttachmentChip, AttachmentList } from "./Attachments";
 import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
 import { useChannelPermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
@@ -375,6 +375,45 @@ function useClosedTsChannel(threadKey: ThreadKey): boolean {
   return useSession((s) => s.kind === "teamspeak" && threadKey === "channel" && s.viewChannel !== null && s.viewChannel !== myChannelId(s));
 }
 
+function FailedMessageRow({ message: f }: { message: FailedSend }) {
+  const t = useT();
+  useSession(s => s.epoch);
+  const fresh = !!f.sealed && f.session !== controller.sendSession;
+  const missing = !!f.sealed && (f.attachments ?? []).some(id => !f.attachmentMetadata?.some(a => a.id === id && a.sealed));
+  return (
+  <div key={f.id} role="alert" className="mx-4 mt-2 flex gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2">
+    <AlertCircle className="mt-0.5 size-4 shrink-0 text-danger" />
+    <div className="min-w-0 flex-1">
+      <div className="text-xs font-medium text-danger">
+        {t("chat.notSent")}
+      </div>
+      <div className="mt-0.5 text-sm break-words whitespace-pre-wrap text-fg/80">{f.text}</div>
+      {!!f.attachments?.length && <div className="mt-1 flex flex-col items-start gap-1.5">
+        {f.attachments.map(id => {
+          const att = f.attachmentMetadata?.find(a => a.id === id);
+          return <AttachmentChip key={id} att={att ?? { name: t("file.attachment"), mime: "application/octet-stream" }} missing={!!f.sealed && !att?.sealed} />;
+        })}
+      </div>}
+      <div className="mt-1.5 flex flex-wrap gap-2">
+        <button
+          disabled={missing}
+          onClick={() => void controller.retrySend(f.id, fresh)}
+          className="t flex cursor-pointer items-center gap-1 rounded-md bg-danger px-2 py-1 text-xs font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <RotateCw className="size-3" /> {t("chat.retry")}
+        </button>
+        <button
+          onClick={() => void controller.dismissSend(f.id)}
+          className="t cursor-pointer rounded-md px-2 py-1 text-xs font-medium text-muted hover:bg-hover hover:text-fg"
+        >
+          {t("chat.dismiss")}
+        </button>
+      </div>
+    </div>
+  </div>
+  );
+}
+
 export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; editLastRef?: EditLastRef }) {
   const t = useT();
   const lang = useLanguage();
@@ -391,7 +430,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   // Nobody shares keys of an earlier incarnation any more: those rows wait for nothing.
   const superseded = useCallback((i: ChatItem) => i.kind === "msg" && !!i.sealed && !!roster && i.sealed.group !== roster.group, [roster]);
   const allFailed = useOutbox((o) => o.failed);
-  const failed = useMemo(() => allFailed.filter((f) => f.thread === key), [allFailed, key]);
+  const failed = useMemo(() => allFailed.filter((f) => f.thread === key && !f.sending), [allFailed, key]);
   const serverKey = controller.messageServerKey;
   const [authTick, setAuthTick] = useState(0);
   useEffect(() => {
@@ -467,7 +506,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
     const entry = shown.verified.get(i.msg.id);
     const target = targetFor(i.msg);
     return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target, sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(withChannelLifecycle(entry.state, serverKey, target));
-  })), [thread?.items, shown, serverKey, key, signingUid, unshared]);
+  }), failed.map(f => ({ key: `failed:${f.id}`, at: f.at ?? f.sealed?.created_at ?? Number.MAX_SAFE_INTEGER }))), [thread?.items, shown, serverKey, key, signingUid, unshared, failed]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
@@ -599,6 +638,10 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
         {thread?.items.some(unshared) && <p className="px-4 py-2 text-center text-xs text-subtle">{t("chat.historyNotShared")}</p>}
         {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key" && !unshared(i) && !superseded(i)) && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
         {rows.map((row) => {
+          if (row.type === "failed") {
+            const f = failed.find(f => `failed:${f.id}` === row.key);
+            return f ? <FailedMessageRow key={row.key} message={f} /> : null;
+          }
           if (row.type === "day")
             return (
               <div key={row.key} className="my-3 flex items-center gap-3 px-4" role="separator">
@@ -630,31 +673,6 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
             />
           );
         })}
-        {failed.map((f) => (
-          <div key={f.id} role="alert" className="mx-4 mt-2 flex gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2">
-            <AlertCircle className="mt-0.5 size-4 shrink-0 text-danger" />
-            <div className="min-w-0 flex-1">
-              <div className="text-xs font-medium text-danger">
-                {t("chat.notSent")}: {f.error}
-              </div>
-              <div className="mt-0.5 text-sm break-words whitespace-pre-wrap text-fg/80">{f.text}</div>
-              <div className="mt-1.5 flex gap-2">
-                <button
-                  onClick={() => void controller.retrySend(f.id)}
-                  className="t flex cursor-pointer items-center gap-1 rounded-md bg-danger px-2 py-1 text-xs font-medium text-white hover:brightness-110"
-                >
-                  <RotateCw className="size-3" /> {t("chat.retry")}
-                </button>
-                <button
-                  onClick={() => useOutbox.getState().remove(f.id)}
-                  className="t cursor-pointer rounded-md px-2 py-1 text-xs font-medium text-muted hover:bg-hover hover:text-fg"
-                >
-                  {t("chat.dismiss")}
-                </button>
-              </div>
-            </div>
-          </div>
-        ))}
       </div>
       {showJump && (
         <button
@@ -771,12 +789,10 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
   const [pendingByThread, setPendingByThread] = useState<Record<string, PendingFile[]>>({});
   // Every live preview URL, so leaving the composer (or a disconnect) releases them all.
   const previews = useRef(new Set<string>());
-  const mounted = useRef(true);
   const release = (url?: string) => { if (url && previews.current.delete(url)) URL.revokeObjectURL(url); };
   useEffect(() => {
     const live = previews.current;
-    mounted.current = true;
-    return () => { mounted.current = false; for (const url of live) URL.revokeObjectURL(url); live.clear(); };
+    return () => { for (const url of live) URL.revokeObjectURL(url); live.clear(); };
   }, []);
   // Each channel keeps its own draft and files: "channel" follows the viewed one.
   const draftKey = useSession(s => storedKey(s, threadKey) ?? threadKey);
@@ -885,20 +901,16 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
     if ((!value && ready.length === 0) || over || disabled || uploading) return;
     const mentions = mention.mentionsFor(value);
     const attachments = ready.map((f) => f.fileId!).filter(Boolean);
-    // Clear right away so quick follow-ups are not lost. A failed send shows up
-    // in the conversation with a Retry button (see MessageList).
-    const key = draftKey;
-    setDrafts((d) => ({ ...d, [key]: "" }));
-    // Failed uploads stay for another try; the sent ones go (their previews are no longer needed).
-    setPendingByThread((all) => ({ ...all, [key]: (all[key] ?? []).filter((f) => f.status !== "done") }));
-    mention.reset();
-    ref.current?.focus();
-    const sent = await controller.sendChat(threadKey, value, { mentions, attachments });
-    // A failed plaintext send waits in the outbox; a failed encrypted one comes back to the composer, files too.
-    if (!sent && encrypted && mounted.current) {
-      setDrafts(d => ({ ...d, [key]: d[key] ? `${value}\n${d[key]}` : value }));
-      setPendingByThread((all) => ({ ...all, [key]: [...ready, ...(all[key] ?? [])] }));
-    } else for (const f of ready) release(f.preview);
+    const key = draftKey, raw = text;
+    const sentIds = new Set(ready.map(f => f.id)), sentPreviews = ready.map(f => f.preview);
+    await controller.sendChat(threadKey, value, { mentions, attachments, onRetained: () => {
+      // The failure now owns this text and the keys for its uploaded files.
+      setDrafts(d => d[key] === raw ? { ...d, [key]: "" } : d);
+      setPendingByThread(all => ({ ...all, [key]: (all[key] ?? []).filter(f => !sentIds.has(f.id)) }));
+      const state = useSession.getState();
+      if (storedKey(state, state.activeThread) === key) { mention.reset(); ref.current?.focus(); }
+      for (const preview of sentPreviews) release(preview);
+    } });
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
