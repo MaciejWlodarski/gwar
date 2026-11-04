@@ -25,6 +25,88 @@ pub(super) fn check_approved_echo(case: &str, current: f32, shipped: f32) {
     assert!(shipped <= approved, "P7 exceeds its approved per-window echo: {case}, {shipped} > {approved}");
 }
 
+/// P7 is the one production change of PR #223: the share canceller zeroes the reverb decay
+/// during dominant nearend (`ep_strength.nearend_len = 0`), mono voice keeps the native default.
+#[test]
+fn the_share_canceller_ships_p7_and_voice_keeps_the_default() {
+    let _scope = measurement_scope();
+    let zeroed = |stereo| canceller(stereo).echo_canceller.unwrap().zero_nearend_reverb_decay;
+    assert!(zeroed(true), "the share canceller must zero the nearend reverb decay (owner-approved P7)");
+    assert!(!zeroed(false), "mono voice keeps the native nearend reverb decay");
+}
+
+/// A stereo canceller built from `config`, fed `far` on both channels and `mic`, frame by frame.
+fn stage_output(config: Config, far: &[f32], mic: &[f32]) -> Vec<f32> {
+    let mut stage = Stage::stereo_config(config);
+    let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
+    let mut out = Vec::with_capacity(mic.len());
+    for (far, mic) in far.as_chunks::<FRAME>().0.iter().zip(mic.as_chunks::<FRAME>().0) {
+        let _ = stage.apm.process_render_f32(&[far, far], &mut [&mut left, &mut right]);
+        let _ = stage.apm.set_stream_delay_ms(20);
+        let _ = stage.apm.process_capture_f32(&[mic], &mut [&mut near]);
+        out.extend_from_slice(&near);
+    }
+    out
+}
+
+/// A reverberant room: a direct echo `delay_ms` away, 10 dB down, and a tail that loses 4.4 dB
+/// every 30 ms, about 0.4 s to fall 60 dB.
+fn reverberant_room(far: &[f32], delay_ms: usize) -> Vec<f32> {
+    let (direct, round) = (delay_ms * RATE / 1000, 30 * RATE / 1000);
+    let mut echo = vec![0f32; far.len()];
+    for i in 0..far.len() {
+        let heard = if i >= direct { 0.3 * far[i - direct] } else { 0.0 };
+        echo[i] = heard + if i >= round { 0.6 * echo[i - round] } else { 0.0 };
+    }
+    echo
+}
+
+/// What P7 is for: in double talk in a reverberant room the far voice trained, the shipped share
+/// canceller keeps more of the near talker than the same canceller with the native nearend reverb
+/// decay. On aarch64 macOS, debug: 178 against 152 of 197 active frames kept, -9.96 against
+/// -10.92 dB of the near level.
+#[test]
+fn the_shipped_share_canceller_keeps_more_double_talk() {
+    let _scope = measurement_scope();
+    let len = 6 * RATE;
+    let far = voice(len, 120.0, -20.0);
+    let joins = 3 * RATE;
+    let said: Vec<f32> = talker(len, 213.0, 3.1, 3.3, -24.0)
+        .into_iter()
+        .enumerate()
+        .map(|(i, s)| if i < joins { 0.0 } else { s })
+        .collect();
+    let mic: Vec<f32> = reverberant_room(&far, 60).iter().zip(&said).map(|(echo, near)| echo + near).collect();
+    let shipped = canceller(true);
+    let mut native = shipped.clone();
+    native.echo_canceller.as_mut().unwrap().zero_nearend_reverb_decay = false;
+    let window = joins + RATE / 2..len;
+    // Active near frames whose output stays within 10 dB of what was said, and the near level kept.
+    let kept = |config| {
+        let out = stage_output(config, &far, &mic);
+        assert_eq!(out.len(), mic.len());
+        let frames = window
+            .clone()
+            .step_by(FRAME)
+            .filter(|&at| db(&said[at..at + FRAME]) > -40.0)
+            .filter(|&at| db(&out[at..at + FRAME]) > db(&said[at..at + FRAME]) - 10.0)
+            .count();
+        (frames, fidelity(&out[window.clone()], &said[window.clone()]).1)
+    };
+    let ((shipped_frames, shipped_level), (native_frames, native_level)) = (kept(shipped), kept(native));
+    eprintln!(
+        "double talk kept: shipped {shipped_frames} frames, {shipped_level:.3} dB; native default {native_frames} frames, {native_level:.3} dB"
+    );
+    assert!(
+        shipped_frames >= native_frames + 10,
+        "P7 keeps no more near frames: {shipped_frames} against {native_frames}"
+    );
+    assert!(
+        shipped_level > native_level,
+        "P7 keeps a weaker near voice: {shipped_level:.3} against {native_level:.3} dB"
+    );
+}
+
 #[test]
 fn production_stereo_keeps_one_render_reference() {
     let stage = Stage::stereo();
@@ -32,18 +114,14 @@ fn production_stereo_keeps_one_render_reference() {
 }
 
 #[test]
-#[ignore = "all 549 windows against the owner-approved P7 envelope; release alone"]
+#[ignore = "all 549 windows against the owner-approved P7 envelope; bit-exact main levels recorded on aarch64 macOS, valid there only; release, alone, single-threaded"]
 fn shipped_p7_echo_tables() {
+    let _scope = measurement_scope();
     AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
     AEC_ECHO_COMPARE_PROFILE.store(SHIPPED_AEC_PROFILE, Ordering::Relaxed);
     AEC_APPROVED_ECHO.store(true, Ordering::Relaxed);
-    AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);
-    AEC_ECHO_WORST_BITS.store(0, Ordering::Relaxed);
     the_warmed_switch_against_cold_and_staying_mono();
     the_wide_leak_cold_and_warm();
-    AEC_APPROVED_ECHO.store(false, Ordering::Relaxed);
-    AEC_ECHO_COMPARE_PROFILE.store(0, Ordering::Relaxed);
-    AEC_NATIVE_PROFILE.store(SHIPPED_AEC_PROFILE, Ordering::Relaxed);
     eprintln!(
         "shipped echo: over +1 dB {}, worst {:.9} dB; every window meets the approved envelope",
         AEC_ECHO_REGRESSIONS.load(Ordering::Relaxed),
@@ -59,6 +137,7 @@ fn route_arm(
     before: &[f32],
     after: &[f32],
 ) -> Vec<f32> {
+    let _scope = measurement_scope();
     AEC_NATIVE_PROFILE.store(profile, Ordering::Relaxed);
     let mut p = if mode == 2 { warm_session() } else { session(LEARNING_FRAMES) };
     let mut out = Vec::with_capacity(far.len());
@@ -85,8 +164,9 @@ fn route_arm(
 }
 
 #[test]
-#[ignore = "main/P7 route gaps, 27 rooms; release alone"]
+#[ignore = "main/P7 route gaps, 27 rooms; release, alone, single-threaded"]
 fn what_an_unreported_device_costs() {
+    let _scope = measurement_scope();
     let total = 36 * RATE;
     let windows = [(0usize, 3usize), (3, 5), (5, 8), (8, 16)];
     let arms = [

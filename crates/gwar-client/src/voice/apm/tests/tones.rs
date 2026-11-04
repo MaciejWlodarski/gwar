@@ -357,6 +357,7 @@ fn historical_arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> H
 }
 
 fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, options: ArmOptions) -> Holds {
+    let _scope = measurement_scope();
     let total = (lead + 16) * RATE;
     let far = coded_render(lead, total);
     let l = room(&left_channel(&far), 60);
@@ -557,7 +558,7 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "leading signal, Opus, gate and model comparison; run in release alone"]
+#[ignore = "leading signal, Opus, gate and model comparison; release, alone, single-threaded"]
 fn realistic_signals_through_the_warmed_switch() {
     for lead in [6, 10] {
         for echo in [false, true] {
@@ -578,7 +579,7 @@ fn realistic_signals_through_the_warmed_switch() {
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "isolated model-context diagnostic, run in release"]
+#[ignore = "isolated model-context diagnostic; release, alone, single-threaded"]
 fn model_context_after_the_takeover() {
     for mode in 0..7 {
         let h = arm("human speech", 6, true, 100, mode);
@@ -588,7 +589,7 @@ fn model_context_after_the_takeover() {
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "model level diagnostic, run in release"]
+#[ignore = "model level diagnostic; release, alone, single-threaded"]
 fn level_before_the_model() {
     for mode in 7..13 {
         let h = arm("human speech", 6, true, 100, mode);
@@ -598,7 +599,7 @@ fn level_before_the_model() {
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "model stage diagnostic, run in release"]
+#[ignore = "model stage diagnostic; release, alone, single-threaded"]
 fn model_stages_after_echo() {
     for mode in 13..16 {
         let h = arm("human speech", 6, true, 100, mode);
@@ -608,7 +609,7 @@ fn model_stages_after_echo() {
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "post-AEC gain-mask speech/noise/echo comparison, run in release"]
+#[ignore = "post-AEC gain-mask speech/noise/echo comparison; release, alone, single-threaded"]
 fn gain_mask_after_stereo() {
     for name in ["human speech", "silence", "noise", "human with noise"] {
         for mode in [7, 17] {
@@ -623,7 +624,7 @@ fn gain_mask_after_stereo() {
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "native AEC gain-change held-speech diagnostic, run in release"]
+#[ignore = "native AEC gain-change held-speech diagnostic; release, alone, single-threaded"]
 fn native_change_at_first_share() {
     for name in ["human speech", "silence"] {
         let h = arm(name, 6, true, 100, 20);
@@ -636,7 +637,7 @@ fn native_change_at_first_share() {
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "owner-approved 12-case recorded-speech acceptance; run in release alone"]
+#[ignore = "owner-approved 12-case recorded-speech acceptance; release, alone, single-threaded"]
 fn recorded_speech_is_not_held_after_stereo() {
     for lead in [6, 10] {
         for echo in [false, true] {
@@ -667,8 +668,9 @@ fn recorded_speech_is_not_held_after_stereo() {
 }
 
 #[test]
-#[ignore = "native AEC state and linear/suppressor comparison; run in release alone"]
+#[ignore = "native AEC state and linear/suppressor comparison; release, alone, single-threaded"]
 fn aec_linear_and_suppression_at_takeover() {
+    let _scope = measurement_scope();
     AEC_TRACE.store(true, Ordering::Relaxed);
     for mode in [8, 7, 21, 22, 23, 24, 30, 31, 32, 33] {
         let h = arm("human speech", 6, true, 100, mode);
@@ -681,8 +683,9 @@ fn aec_linear_and_suppression_at_takeover() {
 }
 
 #[test]
-#[ignore = "native reverb/noise/state/config isolation; run in release alone"]
+#[ignore = "native reverb/noise/state/config isolation; release, alone, single-threaded"]
 fn native_reverb_and_capture_state() {
+    let _scope = measurement_scope();
     AEC_TRACE.store(true, Ordering::Relaxed);
     for mode in [36, 37, 38, 40, 41, 42, 43, 44, 45, 50, 51, 52, 53, 54, 55] {
         let h = arm("human speech", 6, true, 100, mode);
@@ -695,7 +698,7 @@ fn native_reverb_and_capture_state() {
 }
 
 #[test]
-#[ignore = "default speech matrix and 500 ms quiet-echo gate; run in release alone"]
+#[ignore = "default speech matrix and 500 ms quiet-echo gate; release, alone, single-threaded"]
 fn native_speech_and_quiet_echo_gate() {
     let modes: Vec<u8> = std::env::var("GWAR_NATIVE_ARMS")
         .unwrap_or_else(|_| "7,40,41,51,54,31".into())
@@ -754,7 +757,7 @@ fn native_speech_and_quiet_echo_gate() {
 }
 
 #[test]
-#[ignore = "cold-path native reverb comparison, recorded speech; run in release alone"]
+#[ignore = "cold-path native reverb comparison, recorded speech; release, alone, single-threaded"]
 fn cold_path_native_reverb() {
     for lead in [6, 10] {
         for noise in [0, 50, 100] {
@@ -770,7 +773,7 @@ fn cold_path_native_reverb() {
 }
 
 #[test]
-#[ignore = "bounded native nearend/reverb screening; run in release alone"]
+#[ignore = "bounded native nearend/reverb screening; release, alone, single-threaded"]
 fn bounded_native_reverb_screen() {
     for lead in [6, 10] {
         let cold = arm("human speech", lead, true, 100, 8);
@@ -789,7 +792,7 @@ fn bounded_native_reverb_screen() {
 }
 
 #[test]
-#[ignore = "native nearend-confidence budget screening; run in release alone"]
+#[ignore = "native nearend-confidence budget screening; release, alone, single-threaded"]
 fn nearend_decay_budget_screen() {
     for lead in [6, 10] {
         let cold = arm("human speech", lead, true, 100, 8);

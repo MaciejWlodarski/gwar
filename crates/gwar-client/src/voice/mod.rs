@@ -1301,7 +1301,7 @@ mod codec_tests {
 
     /// Same unmodified six-pair guard with a test-only native option selected before startup.
     #[test]
-    #[ignore = "native option timing; run in release alone"]
+    #[ignore = "native option timing; release, alone, single-threaded"]
     fn four_shares_for_native_aec_option() {
         let id = std::env::var("GWAR_NATIVE_PIPELINE_OPTION").unwrap().parse().unwrap();
         apm::with_native_pipeline_option(id, four_shares_leave_the_voice_pipeline_on_time);

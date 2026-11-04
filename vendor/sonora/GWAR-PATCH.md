@@ -48,13 +48,61 @@ Corrected two-reference variants greatly improve right-only echo, but fail the
 joint speech/echo gates. They require a separate follow-up and owner decision.
 The full options table and evidence are in `docs/share-audio-validation.md`.
 
-## PR #223 measurement control
+## PR #223 measurement hooks (`gwar-aec-measurements`)
 
-`EchoCanceller.multichannel_suppressor_like_mono` defaults to false. The isolated,
-ignored `independent_talker_channel_tradeoffs` test can set it for stereo stages
-only, through a test-only flag in Gwar. It copies two values from the default mono
-configuration into the multichannel suppressor: `max_inc_factor` (2.0 instead of
-1.5) and `max_dec_factor_lf` (0.25 instead of 0.35). The multichannel adaptive filter
-keeps its existing coarse-filter lengths and rates. The option and diagnostic echo-gain notification exist only with the
-`gwar-aec-measurements` dev-dependency feature. The owner rejected mono-like
-tuning for production on 2026-11-02: retain current stereo, echo removal first.
+The feature is enabled only by `gwar-client`'s dev-dependency. Normal and release
+builds, including the desktop app, never compile it: `cargo tree -p gwar-client
+-e normal,build --format '{p} {f}'` lists neither this feature nor
+`model-measurements`, so nothing below changes shipped behaviour. Every hook is
+behind `#[cfg(feature = "gwar-aec-measurements")]`:
+
+- `EchoCanceller.multichannel_suppressor_like_mono` (default false): copies the
+  mono suppressor's `max_inc_factor` (2.0 instead of 1.5) and `max_dec_factor_lf`
+  (0.25 instead of 0.35) into the multichannel config. Rejected for production by
+  the owner on 2026-11-02.
+- `EchoCanceller.measurement_two_channel_start` (default false): builds the
+  controller with `EchoCanceller3::new_initialized_for_measurement`, the
+  upstream-style constructor that calls `initialize` (the `d9972dfe` fix).
+- `EchoCanceller.measurement_native_profile` (default 0, none): native config
+  experiments applied to both configs. 1 no conservative tail response; 2
+  `default_len` and `nearend_len` 0; 3 no linear filter; 4 Legacy transparent
+  mode; 5 conservative initial phase; 6 ERLE onset compensation in dominant
+  nearend; 7 `nearend_len` 0 (what production now selects through
+  `zero_nearend_reverb_decay`); 8 both lengths 0.80; 9 `default_len` 0.80 and
+  `nearend_len` 0; 10 `nearend_len` 0.75; 11 `nearend_len` 0.76; 12 and 13
+  `nearend_len` 0 with dominant-nearend `enr_threshold` 0.05 and 0.01.
+- `EchoCanceller.measurement_left_reference` (default false): after
+  construction, `EchoCanceller3::measurement_restore_left_reference` rebuilds the
+  render blocker and block processor for one channel, reconstructing the
+  historical left-only wiring for comparisons.
+- `AudioProcessing::notify_echo_gain_change`: the next capture frame ORs
+  `true` into `echo_path_gain_change`, without touching volume or config.
+- `AudioProcessing::measurement`: a fixed-size snapshot of native linear and
+  suppressor state from the vendored `sonora-aec3` (`Measurement`).
+- `AudioProcessing::measurement_linear`: the last 10 ms of the native 16 kHz
+  linear AEC output. To fill it, the feature forces
+  `filter.export_linear_aec_output = true` in both configs and passes a linear
+  buffer to `process_capture`.
+- `AudioProcessing::measurement_restart_nonlinear(mode)`: rebuilds one native
+  state (1 suppression gain, 2 ERLE, 3 AEC state, 4 gain and ERLE, 5 residual
+  echo estimator, 6 reverb model, 7 comfort noise) while the adaptive filters and
+  render alignment survive.
+- Test `disabled_detection_must_keep_all_render_reference_channels` covers the
+  opt-in constructor only.
+
+`zero_nearend_reverb_decay` itself is not feature-gated: it is the shipped P7
+switch (default false, so upstream behaviour) and Gwar sets it for the share
+canceller only.
+
+## When to drop or rebase this patch
+
+Drop the `detect_stereo_content` and transparent-mode changes when upstream
+Sonora exposes both settings, and `zero_nearend_reverb_decay` when it exposes
+`ep_strength.nearend_len` (or the whole `EchoCanceller3Config`) through its
+public config. The measurement hooks exist only for the PR #223 studies and the
+two-reference follow-up; drop them, and the vendored `sonora-aec3`, once that
+follow-up is decided and no committed measurement needs to be regenerated. When
+rebasing on a new upstream release, re-apply only the `Gwar:` changes and the
+feature-gated hooks above, then rerun `voice_alone_is_mains_canceller_to_the_bit`,
+both voice-alone fingerprints and the shipped P7 gates in
+`docs/share-audio-validation.md`.

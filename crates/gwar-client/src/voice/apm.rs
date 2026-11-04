@@ -144,7 +144,8 @@ fn canceller(stereo: bool) -> Config {
             measurement_two_channel_start: stereo && AEC_NATIVE_CHANNELS.load(Ordering::Relaxed),
             measurement_native_profile: if stereo && profile != SHIPPED_AEC_PROFILE { profile } else { 0 },
             measurement_left_reference: stereo && AEC_LEGACY_REFERENCE.load(Ordering::Relaxed),
-            zero_nearend_reverb_decay: stereo && profile == SHIPPED_AEC_PROFILE,
+            // The shipped arm keeps the production field above, so tests see a revert of it.
+            zero_nearend_reverb_decay: canceller.zero_nearend_reverb_decay && profile == SHIPPED_AEC_PROFILE,
             ..canceller
         }
     };
@@ -826,9 +827,67 @@ static AEC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 #[cfg(test)]
 static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Serializes every test that changes the measurement controls above. They are process-wide, so
+/// ignored measurement tests must also run single-threaded: a test that only reads them through
+/// [`canceller`] would otherwise see another test's choice.
+#[cfg(test)]
+static MEASUREMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static MEASUREMENT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Holds [`MEASUREMENT_LOCK`] (re-entrant on one thread) and puts every control back to the shipped
+/// defaults when the outermost scope ends, also on panic.
+#[cfg(test)]
+pub(super) struct MeasurementScope {
+    lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+pub(super) fn measurement_scope() -> MeasurementScope {
+    let outermost = MEASUREMENT_DEPTH.with(|depth| {
+        depth.set(depth.get() + 1);
+        depth.get() == 1
+    });
+    let lock = outermost.then(|| MEASUREMENT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    if outermost {
+        reset_measurement_controls();
+    }
+    MeasurementScope { lock }
+}
+
+#[cfg(test)]
+impl Drop for MeasurementScope {
+    fn drop(&mut self) {
+        MEASUREMENT_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        if self.lock.is_some() {
+            reset_measurement_controls();
+        }
+    }
+}
+
+#[cfg(test)]
+fn reset_measurement_controls() {
+    AEC_NATIVE_PROFILE.store(SHIPPED_AEC_PROFILE, Ordering::Relaxed);
+    AEC_LEGACY_REFERENCE.store(false, Ordering::Relaxed);
+    AEC_PIPELINE_COLD.store(false, Ordering::Relaxed);
+    AEC_WARM_ONLY_TWO.store(false, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
+    AEC_NONLINEAR_AT_TAKEOVER.store(0, Ordering::Relaxed);
+    AEC_ECHO_COMPARE_PROFILE.store(0, Ordering::Relaxed);
+    AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);
+    AEC_ECHO_WORST_BITS.store(0, Ordering::Relaxed);
+    AEC_APPROVED_ECHO.store(false, Ordering::Relaxed);
+    AEC_TRACE.store(false, Ordering::Relaxed);
+    MEASURE_MONO_SUPPRESSOR.store(false, Ordering::Relaxed);
+}
+
 /// Isolated timing control. The production path never reads these test-only choices.
 #[cfg(test)]
 pub(super) fn with_native_pipeline_option(id: u8, run: impl FnOnce()) {
+    let _scope = measurement_scope();
     let (profile, legacy, cold) = match id {
         0 => (0, false, false),
         1 => (7, true, false),
@@ -1766,6 +1825,7 @@ mod tests {
         // is not required to match mono: cancelling the warm candidate must instead
         // produce the exact ordinary cold path, with the click bound above unchanged.
         let cold = through(&mut session(LEARNING_FRAMES), &far, &near, Some(pin));
+        assert_eq!(out.len(), cold.len());
         assert!(
             out.iter().zip(&cold).all(|(a, b)| a.to_bits() == b.to_bits()),
             "the cancelled handover differs from ordinary cold P7"
@@ -2559,15 +2619,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "native-profile comparison on the complete #220 echo tables; run in release alone"]
+    #[ignore = "native-profile comparison on the complete #220 echo tables; release, alone, single-threaded"]
     fn native_profile_echo_tables() {
+        let _scope = measurement_scope();
         let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "0".into()).parse().unwrap();
         assert!(profile <= 2);
         AEC_NATIVE_PROFILE.store(profile, Ordering::Relaxed);
         eprintln!("native echo tables, profile={profile}");
         the_warmed_switch_against_cold_and_staying_mono();
         the_wide_leak_cold_and_warm();
-        AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
     }
 
     fn echo_energy(samples: &[f32]) -> f64 {
@@ -2590,8 +2650,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "strict paired per-room +1 dB gate on full #220 echo tables; run in release alone"]
+    #[ignore = "strict paired per-room +1 dB gate on full #220 echo tables; release, alone, single-threaded"]
     fn native_paired_echo_gate() {
+        let _scope = measurement_scope();
         let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "1".into()).parse().unwrap();
         assert!([1, 2, 7, 8, 9, 10, 11].contains(&profile));
         AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
@@ -3082,8 +3143,9 @@ mod tests {
     /// The new route detector is disabled to isolate #220's channel/tuning choice.
     /// No gain, denoiser, gate, device or real-time scheduler is involved.
     #[test]
-    #[ignore = "a channel/tuning comparison, run in release and alone"]
+    #[ignore = "a channel/tuning comparison; release, alone, single-threaded"]
     fn independent_talker_channel_tradeoffs() {
+        let _scope = measurement_scope();
         let pin = 6 * RATE;
         let total = pin + 32 * RATE;
         let windows = [(0, 3), (3, 8), (8, 16), (16, 32)];

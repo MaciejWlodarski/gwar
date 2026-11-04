@@ -1037,6 +1037,11 @@ same runs and is not significant (permutation p=0.40). All 18 attempts, includin
 [the quiet timing archive](measurements/aec-quiet-223/README.md). The earlier
 uncontrolled +1.241 ms and +0.344 ms runs below are superseded.
 
+`the_share_canceller_ships_p7_and_voice_keeps_the_default` and
+`the_shipped_share_canceller_keeps_more_double_talk` run in CI and fail if the
+production P7 field is reverted; the measurement override in `canceller` keeps
+the production value for the shipped arm.
+
 Final-head local validation (2026-11-04, main merged): both fingerprints
 `c2d868db7d8d0eeb`; four heap guards; 53 active release APM tests; the 12-case
 speech matrix (11 strict passes and the accepted one-frame headphone deficit);
@@ -1297,6 +1302,13 @@ nice -n 10 cargo clippy --locked --workspace --exclude gwar-desktop --all-target
 cargo fmt --all --check
 nice -n 10 cargo test --locked --workspace --exclude gwar-desktop -- --test-threads=1
 ```
+
+`shipped_p7_echo_tables` compares every main-arm level bit for bit against
+`aec-paired-echo-cases.csv`, recorded on aarch64 macOS. Sonora's SIMD paths
+differ on x86_64, so that check is valid on aarch64 macOS only; it is not
+loosened, because the byte identity is the point. The measurement tests share
+process-wide controls behind one lock and must run single-threaded
+(`--test-threads=1`), as above.
 
 To compare acoustic outputs, copy `summarize-aec-shipped.py` into a scratch
 directory with the speech, echo and route outputs saved as

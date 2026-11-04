@@ -20,6 +20,7 @@ const OPTIONS: [NativeOption; 7] = [
 ];
 
 fn option_output(option: NativeOption, far: &[[f32; 2]], mic: &[f32], pin: usize) -> Vec<f32> {
+    let _scope = measurement_scope();
     AEC_NATIVE_PROFILE.store(option.profile, Ordering::Relaxed);
     AEC_NATIVE_CHANNELS.store(!option.legacy, Ordering::Relaxed);
     AEC_LEGACY_REFERENCE.store(option.legacy, Ordering::Relaxed);
@@ -43,8 +44,9 @@ fn emit_option_window(option: NativeOption, case: &str, from: usize, to: usize, 
 /// Same 396 mono + 153 wide window observations as the historical paired table.
 /// The near-pitch rows are repeated pure-echo controls, not independent rooms.
 #[test]
-#[ignore = "seven arms on all 549 paired echo windows; run in release alone"]
+#[ignore = "seven arms on all 549 paired echo windows; release, alone, single-threaded"]
 fn native_reference_options_full_echo() {
+    let _scope = measurement_scope();
     let mono_windows: Vec<_> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
     for before in [6, 20] {
         let pin = before * RATE;
@@ -112,8 +114,9 @@ fn native_reference_options_full_echo() {
 }
 
 #[test]
-#[ignore = "right-only and independent wide acoustic paths; run in release alone"]
+#[ignore = "right-only and independent wide acoustic paths; release, alone, single-threaded"]
 fn native_reference_options_right_echo() {
+    let _scope = measurement_scope();
     let windows = [(0, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12), (12, 16), (16, 24), (32, 48)];
     for before in [6, 20, 60, 310] {
         let pin = before * RATE;
