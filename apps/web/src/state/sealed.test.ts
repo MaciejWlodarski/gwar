@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SealedConversations, type SealedRuntime } from "./sealed";
-import { useSession } from "./stores";
+import { useSession, useOutbox } from "./stores";
 import { generateIdentity, uidForPublicKey } from "../net/identity";
 import type { Link } from "../net/connection";
 import { RequestError } from "../net/connection";
@@ -32,7 +32,15 @@ async function row(text = "hello", original?: Plaintext, attachments: Attachment
   return { id: 1, conversation, group, epoch, author_uid: b, author_name: "Bob", message_id: signature.message_id,
     revision: signature.revision, ciphertext: "sealed", sent_at: signature.created_at, deleted: text === DELETION_TEXT } satisfies SealedMessage;
 }
+function sentRow(id = 1): SealedMessage {
+  opened = drafts.at(-1)!;
+  const signature = opened.signature;
+  return { id, conversation: signature.conversation, group: signature.group_id, epoch: Number(signature.epoch), author_uid: signature.author_uid,
+    author_name: "Alice", message_id: signature.message_id, revision: signature.revision, ciphertext: "signed response",
+    sent_at: signature.created_at, deleted: opened.text === DELETION_TEXT };
+}
 beforeEach(() => {
+  useOutbox.getState().clear();
   active = true; opened = undefined; drafts = []; status = "ready"; epoch = 0;
   request.mockReset(); notify.mockReset();
   useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "gwar" });
@@ -47,11 +55,154 @@ beforeEach(() => {
   dm = new SealedConversations(runtime, { serverKey: server, request } as unknown as Link, alice, a, () => active, notify, () => {});
 });
 describe("encrypted DM controller", () => {
+  it("retains the logical message identity after a lost answer and an explicit Retry", async () => {
+    const retry = { message_id: b64(16, 12), created_at: Date.now() };
+    request.mockRejectedValueOnce(new Error("answer lost"));
+    await expect(dm.send(`dm:${b}`, "hello", [], undefined, [], retry)).rejects.toThrow("answer lost");
+    epoch++;
+    request.mockImplementationOnce(async () => sentRow());
+    await dm.send(`dm:${b}`, "hello", [], undefined, [], retry);
+    expect(drafts).toHaveLength(2);
+    expect(drafts.map(d => d.signature.message_id)).toEqual([retry.message_id, retry.message_id]);
+    expect(drafts.map(d => d.signature.created_at)).toEqual([retry.created_at, retry.created_at]);
+    expect(drafts.map(d => d.signature.epoch)).toEqual(["0", "1"]);
+  });
+  it.each([false, true])("reconciles only authenticated arrivals by author and logical ID (live=%s)", async live => {
+    const delivered = await row();
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "mine", sealed: { message_id: delivered.message_id, created_at: delivered.sent_at },
+      authorUid: a, serverKey: server, error: "answer lost" });
+    // Another author with the same logical ID is not our delivery.
+    await dm.receive(delivered, live);
+    expect(useOutbox.getState().failed).toHaveLength(1);
+    const signature = await signMessage(alice, { serverKey: server, target: conversation, sealed: { group, epoch } }, a, "mine", [], [], undefined,
+      { message_id: delivered.message_id, created_at: delivered.sent_at });
+    const plain = { text: "mine", mentions: [], attachments: [], signature };
+    opened = { ...plain, signature: { ...signature, signature: b64(64, 7) } };
+    await dm.receive({ ...delivered, id: 2, author_uid: a }, live);
+    expect(useOutbox.getState().failed).toHaveLength(1);
+    opened = plain;
+    await dm.receive({ ...delivered, id: 2, author_uid: a }, live);
+    expect(useOutbox.getState().failed).toEqual([]);
+  });
+  it("recovers a lost acknowledgement conflict from authenticated history, not from the conflict alone", async () => {
+    const retry = { message_id: b64(16, 13), created_at: Date.now() };
+    let stored: SealedMessage;
+    let plain: Plaintext;
+    request.mockImplementation(async op => {
+      if (op === "chat.sealed.send") {
+        plain = drafts.at(-1)!;
+        stored = { id: 10, conversation, group, epoch, author_uid: a, author_name: "Alice", message_id: retry.message_id,
+          revision: 0, ciphertext: "sealed", sent_at: retry.created_at, deleted: false };
+        throw new RequestError("conflict", "logical ID already reserved");
+      }
+      opened = plain;
+      return { sealed: [stored] };
+    });
+    await expect(dm.send(`dm:${b}`, "delivered", [], undefined, [], retry)).resolves.toBeUndefined();
+    expect(request).toHaveBeenCalledWith("chat.sealed.history", expect.objectContaining({ conversation }));
+    expect(useSession.getState().threads[`dm:${b}`]?.items).toEqual(expect.arrayContaining([expect.objectContaining({ authentic: true, msg: expect.objectContaining({ text: "delivered" }) })]));
+    request.mockImplementation(async op => {
+      if (op === "chat.sealed.send") throw new RequestError("conflict", "untrusted conflict");
+      return { sealed: [] };
+    });
+    await expect(dm.send(`dm:${b}`, "not delivered", [], undefined, [], { ...retry, message_id: b64(16, 14) })).rejects.toThrow("untrusted conflict");
+  });
+  it.each(["cannot_open", "author", "logical-id", "thread", "server"] as const)("rejects a forged acknowledgement with a mismatched %s", async mismatch => {
+    const retry = { message_id: b64(16, 30), created_at: Date.now() };
+    request.mockImplementation(async () => {
+      const sent = drafts.at(-1)!;
+      const signature = mismatch === "cannot_open" ? sent.signature : await signMessage(mismatch === "author" ? bob : alice,
+        { serverKey: mismatch === "server" ? b64(32, 31) : server, target: mismatch === "thread" ? "server" : conversation, sealed: { group, epoch } },
+        mismatch === "author" ? b : a, sent.text, [], [], undefined, { ...retry, message_id: mismatch === "logical-id" ? b64(16, 31) : retry.message_id });
+      opened = mismatch === "cannot_open" ? undefined : { ...sent, signature };
+      return { id: 30, conversation, group, epoch, author_uid: a, author_name: "Alice", message_id: retry.message_id,
+        revision: 0, ciphertext: "forged acknowledgement", sent_at: retry.created_at, deleted: false };
+    });
+    await expect(dm.send(`dm:${b}`, "keep this draft", [], undefined, [], retry)).rejects.toThrow();
+    expect(dm.delivered(`dm:${b}`, retry.message_id)).toBe(false);
+  });
+
+  it("recovers an attachment send whose lost acknowledgement is followed by bad_request", async () => {
+    const retry = { message_id: b64(16, 32), created_at: Date.now() };
+    const att: Attachment = { id: "already-attached", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/already-attached/file",
+      sha256: b64(32, 1), sealed: { key: b64(32, 2), sha256: b64(32, 3), size: 33 } };
+    let stored!: Plaintext, sends = 0;
+    request.mockImplementation(async op => {
+      if (op === "chat.sealed.send") {
+        if (sends++ === 0) { stored = drafts.at(-1)!; throw new Error("acknowledgement lost"); }
+        throw new RequestError("bad_request", "upload already attached");
+      }
+      opened = stored;
+      return { sealed: [{ id: 32, conversation, group, epoch, author_uid: a, author_name: "Alice", message_id: retry.message_id,
+        revision: 0, ciphertext: "stored", sent_at: retry.created_at, deleted: false }] };
+    });
+    await expect(dm.send(`dm:${b}`, "attachment", [], undefined, [att], retry)).rejects.toThrow("acknowledgement lost");
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "attachment", authorUid: a, serverKey: server, error: "lost", sealed: retry, attachments: [att.id], attachmentMetadata: [att] });
+    await expect(dm.send(`dm:${b}`, "attachment", [], undefined, [att], retry)).resolves.toBeUndefined();
+    expect(dm.delivered(`dm:${b}`, retry.message_id)).toBe(true);
+    expect(useOutbox.getState().failed).toEqual([]);
+  });
+
+  it.each(["fetch", "earlier-row"] as const)("keeps recovery tombstones while waiting for %s", async pause => {
+    const earlier = { ...await row("earlier"), id: 40 }, earlierPlain = opened!;
+    const retry = { message_id: b64(16, pause === "fetch" ? 33 : 34), created_at: Date.now() };
+    let stored!: Plaintext, release!: () => void, started!: () => void;
+    const waiting = new Promise<void>(resolve => { started = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    request.mockImplementation(async (op, data) => {
+      if (op === "chat.sealed.send") { stored = drafts.at(-1)!; throw new RequestError("conflict", "reserved logical ID"); }
+      if (data.before !== null) return { sealed: [] };
+      if (pause === "fetch") { started(); await held; }
+      return { sealed: [earlier, { id: 33, conversation, group, epoch, author_uid: a, author_name: "Alice", message_id: retry.message_id,
+        revision: 0, ciphertext: "stored", sent_at: retry.created_at, deleted: false }] };
+    });
+    runtime.openMessage = vi.fn(async message => {
+      if (message.id === earlier.id && pause === "earlier-row") { started(); await held; }
+      return { ok: message.id === earlier.id ? earlierPlain : stored };
+    });
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "removed while recovering", authorUid: a, serverKey: server, error: "lost", sealed: retry });
+    const sending = dm.send(`dm:${b}`, "removed while recovering", [], undefined, [], retry);
+    const outcome = sending.then(() => "delivered", () => "refused");
+    await waiting;
+    dm.remove(conversation, [33]);
+    release();
+    expect(await outcome).toBe("refused");
+    expect(useOutbox.getState().failed).toMatchObject([{ sealed: retry }]);
+    expect(useSession.getState().threads[`dm:${b}`]?.items.some(i => i.key === "e33")).not.toBe(true);
+    expect(dm.delivered(`dm:${b}`, retry.message_id)).toBe(false);
+    expect((dm as unknown as { busy: Map<string, number>; removed: Map<string, Set<number>> }).busy.size).toBe(0);
+    expect((dm as unknown as { removed: Map<string, Set<number>> }).removed.size).toBe(0);
+  });
+
+  it.each(["sign", "ack", "sync"] as const)("holds removals across the entire send while waiting for %s", async pause => {
+    const retry = { message_id: b64(16, pause === "sign" ? 61 : pause === "ack" ? 62 : 63), created_at: Date.now() };
+    let started!: () => void, release!: () => void, requests = 0;
+    const waiting = new Promise<void>(resolve => { started = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const seal = runtime.sealMessage;
+    runtime.sealMessage = async (...args) => { const result = await seal(...args); if (pause === "sign") { started(); await held; } return result; };
+    runtime.sync = async () => { started(); await held; };
+    request.mockImplementation(async () => {
+      if (pause === "sync" && requests++ === 0) throw new RequestError("stale", "stale");
+      const response = sentRow(60);
+      if (pause === "ack") { started(); await held; }
+      return response;
+    });
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "removed before acknowledgement", authorUid: a, serverKey: server, error: "lost", sealed: retry });
+    const sending = dm.send(`dm:${b}`, "removed before acknowledgement", [], undefined, [], retry);
+    const outcome = sending.then(() => "delivered", () => "refused");
+    await waiting; dm.remove(conversation, [60]); release();
+    expect(await outcome).toBe("refused");
+    expect(useOutbox.getState().failed).toHaveLength(1);
+    expect(useSession.getState().threads[`dm:${b}`]?.items.some(i => i.key === "e60")).not.toBe(true);
+    expect((dm as unknown as { busy: Map<string, number> }).busy.size).toBe(0);
+  });
+
   it("keeps message identity, revision and predecessor on stale and pending retries", async () => {
     const old = (await signMessage(alice, { serverKey: server, target: conversation, sealed: { group, epoch } }, a, "before", [], []));
     request.mockRejectedValueOnce(new RequestError("stale", "stale"))
       .mockRejectedValueOnce(new RequestError("pending", "pending"))
-      .mockImplementation(async () => ({ ...await row(), author_uid: a }));
+      .mockImplementation(async () => sentRow());
     await dm.send(`dm:${b}`, "edited", [], old);
     expect(request.mock.calls.map(c => c[0])).toEqual(Array(3).fill("chat.sealed.edit"));
     expect(drafts.map(d => d.signature.epoch)).toEqual(["0", "1", "2"]);
@@ -114,7 +265,7 @@ describe("encrypted attachments", () => {
   const file = (id: string, hint = 2): Attachment => ({ id, name: "a.png", mime: "image/png", size: 5, sha256: b64(32, 1), url: `/files/${id}/file`, width: hint, height: hint,
     sealed: { key: b64(32, 2), sha256: b64(32, 3), size: 33 } });
   it("ties the files to a new message only, and keeps them signed on edits but not on the deletion", async () => {
-    request.mockImplementation(async () => ({ ...await row(), author_uid: a }));
+    request.mockImplementation(async () => sentRow());
     await dm.send(`dm:${b}`, "files", [], undefined, [file("f1"), file("f2")]);
     expect(request.mock.calls[0]![1]).toMatchObject({ files: ["f1", "f2"] });
     expect(drafts[0]).toMatchObject({ attachments: [file("f1"), file("f2")] });
@@ -122,7 +273,7 @@ describe("encrypted attachments", () => {
     await dm.send(`dm:${b}`, "edited", [], original, [file("f1"), file("f2")]);
     expect(request.mock.calls[1]![0]).toBe("chat.sealed.edit"); expect(request.mock.calls[1]![1]).not.toHaveProperty("files");
     expect(drafts[1]).toMatchObject({ attachments: [file("f1"), file("f2")] });
-    await dm.send(`dm:${b}`, DELETION_TEXT, [], original, [file("f1")]);
+    await dm.send(`dm:${b}`, DELETION_TEXT, [], drafts[1]!.signature, [file("f1")]);
     expect(request.mock.calls[2]![0]).toBe("chat.delete_own"); expect(drafts[2]).toMatchObject({ attachments: [] });
     await expect(dm.send(`dm:${b}`, "plain", [], undefined, [{ ...file("f3"), sealed: undefined }])).rejects.toThrow("Unencrypted");
     expect(request).toHaveBeenCalledTimes(3);

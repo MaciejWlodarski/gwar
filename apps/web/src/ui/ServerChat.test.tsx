@@ -8,7 +8,7 @@ import { MessageVerificationCache } from "../net/message-verification-cache";
 import type { ChatItem } from "../state/types";
 import { controller } from "../state/controller";
 import { initialState } from "../state/reducer";
-import { useSession, useUi } from "../state/stores";
+import { useSession, useUi, useOutbox } from "../state/stores";
 import { useSettings } from "../state/settings";
 import { welcome } from "../net/testing";
 import { ChatArea } from "./Chat";
@@ -22,6 +22,7 @@ let root: Root, container: HTMLDivElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   request.mockClear(); send.mockClear();
+  useOutbox.getState().clear();
   vi.spyOn(MessageVerificationCache.prototype, "verify").mockImplementation(async msg => ({
     status: msg.text === "unverified" ? "invalid" : "verified", continuity: "proven",
     authorization: msg.text === "revoked" ? ["device-revoked"] : [],
@@ -32,7 +33,7 @@ beforeEach(() => {
     server: { ...welcome().server, upload_limit: 1000, server_chat: { encrypted: true, history: true } }, permissions: ["attach_files", "manage_messages", "send_messages"],
     threads: { server: { items: [], unread: 0, mentions: 0, hasMore: true, loaded: true, lastRead: 0, locked: false, securing: false } } });
   internals.conn = { request, serverKey: "", isOnline: true };
-  internals.sealed = { send };
+  internals.sealed = { send, delivered: () => true };
   internals.runtime = { roster: () => roster };
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
 });
@@ -43,6 +44,7 @@ afterEach(async () => {
 });
 const show = () => act(async () => root.render(<TooltipProvider><ChatArea /></TooltipProvider>));
 const button = (label: string) => container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+
 
 it.each([false, true])("does not offer header voice joining for a TeamSpeak spacer (mobile=%s)", async mobile => {
   vi.spyOn(window, "matchMedia").mockImplementation(query => ({ matches: mobile, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() }) as unknown as MediaQueryList);
@@ -88,12 +90,99 @@ it.each(["encrypted", "plaintext", "teamspeak"] as const)("uses the %s server se
   });
   await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
   if (encrypted) {
-    expect(send).toHaveBeenCalledWith("server", "server hello", [], undefined, []);
+    expect(send).toHaveBeenCalledWith("server", "server hello", [], undefined, [], { message_id: expect.any(String), created_at: expect.any(Number) }, expect.any(Function));
     expect(request).not.toHaveBeenCalled();
   } else {
     expect(send).not.toHaveBeenCalled();
     expect(request).toHaveBeenCalledWith("chat.send", expect.objectContaining({ target: "server", text: "server hello" }));
   }
+});
+
+it("keeps the composer text when a send is refused before admission", async () => {
+  vi.spyOn(controller, "sendChat").mockResolvedValue(false);
+  await show();
+  const input = container.querySelector("textarea")!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, "keep this draft");
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+  expect(input.value).toBe("keep this draft");
+});
+
+it("clears only the original retained draft when a later admission succeeds", async () => {
+  let admit!: () => void;
+  vi.spyOn(controller, "sendChat").mockImplementation(async (_key, _text, options) => { admit = options!.onRetained!; return false; });
+  await show();
+  const input = container.querySelector("textarea")!;
+  const type = async (value: string) => act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await type("original draft");
+  await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })));
+  expect(input.value).toBe("original draft");
+  await type("new edits");
+  await act(async () => admit());
+  expect(input.value).toBe("new edits");
+});
+
+it("shows a failed encrypted message in its timeline position with Polish retry labels", async () => {
+  useSettings.setState({ language: "pl" });
+  useOutbox.getState().add({ thread: "server", text: "failed earlier", at: 100, session: controller.sendSession, sealed: { message_id: "retry", created_at: 100 }, serverKey: "", error: "offline" });
+  useSession.setState(s => ({ threads: { server: { ...s.threads.server!, items: [{ kind: "msg", key: "e2", at: 200,
+    msg: { id: 2, target: "server", author: 2, author_uid: "other", author_name: "Other", text: "later message", sent_at: 200 } }] } } }));
+  await show();
+  const failed = container.querySelector('[role="alert"]')!;
+  const later = container.querySelector('[data-message]')!;
+  expect(failed.textContent).toContain("Nie wysłano");
+  expect(failed.textContent).toContain("Wyślij ponownie");
+  expect(failed.textContent).toContain("Odrzuć");
+  expect(failed.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+it("hides a retained in-flight attempt until delivery fails", async () => {
+  const item = useOutbox.getState().add({ thread: "server", text: "waiting for delivery", serverKey: "", error: "Not sent", sending: true,
+    sealed: { message_id: "pending-id", created_at: 100 }, session: controller.sendSession });
+  await show();
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  await act(async () => useOutbox.getState().update(item.id, { sending: false }));
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("Not sent");
+  expect(container.querySelector('[role="alert"]')?.textContent).toContain("Send again");
+});
+
+it("keeps attachment chips and requires an explicit fresh send after the session changes", async () => {
+  const retry = vi.spyOn(controller, "retrySend").mockResolvedValue();
+  useOutbox.getState().add({ thread: "server", text: "failed draft", serverKey: "", authorUid: "me", error: "connection lost",
+    attachments: ["f1"], sealed: { message_id: "old-id", created_at: 100 },
+    attachmentMetadata: [{ id: "f1", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/f1/file", sha256: "hash", sealed: { key: "key", sha256: "cipherhash", size: 33 } }] });
+  await show();
+  const failed = container.querySelector('[role="alert"]')!;
+  expect(failed.firstElementChild?.nextElementSibling?.firstElementChild?.textContent?.trim()).toBe("Not sent");
+  expect(failed.textContent).not.toMatch(/storage|encrypted|session|re-upload/i);
+  expect(failed.textContent).toContain("notes.txt");
+  expect(failed.querySelector('[data-attachment="file"]')?.textContent).toContain("notes.txt");
+  expect(failed.querySelector("[data-missing]")).toBeNull();
+  const fresh = [...failed.querySelectorAll("button")].find(b => b.textContent?.includes("Send again"))!;
+  expect(fresh.disabled).toBe(false);
+  await act(async () => fresh.click());
+  expect(retry).toHaveBeenCalledWith(useOutbox.getState().failed[0]!.id, true);
+});
+
+it("keeps a failed message visible when an attachment cannot be sent", async () => {
+  useOutbox.getState().add({ thread: "server", text: "text survives", serverKey: "", error: "lost",
+    attachments: ["lost-file"], sealed: { message_id: "old-id", created_at: 100 } });
+  await show();
+  const failed = container.querySelector('[role="alert"]')!;
+  expect(failed.textContent).toContain("text survives");
+  expect(failed.textContent).not.toMatch(/keys|storage|session/i);
+  expect(failed.querySelector('[data-attachment="file"][data-missing="true"]')?.textContent).toBe("Attachment");
+  const missing = failed.querySelector<HTMLElement>('[data-missing="true"]')!;
+  expect(missing.classList.contains("opacity-50")).toBe(true);
+  await act(async () => missing.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
+  expect(document.querySelector('[role="tooltip"]')?.textContent).toBe("Missing");
+  expect(failed.querySelector("button")!.disabled).toBe(true);
+  expect([...failed.querySelectorAll("button")].find(b => b.textContent === "Dismiss")!.disabled).toBe(false);
 });
 
 it("loads older sealed server rows and offers moderator removal", async () => {
