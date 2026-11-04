@@ -46,8 +46,11 @@ is the development exception.
 - **Screen video goes through the same port, on its own task.** The voice task
   reads the socket and hands datagrams from screen transports to the screen
   task over a bounded channel that never blocks voice. That task forwards
-  VP9/VP8 packets to up to 4 watch slots per session, starting each at a
-  keyframe ([screen-share.md](screen-share.md) §3).
+  H.264, AV1 or VP9 packets to up to 4 watch slots per session, starting each
+  at a keyframe ([screen-share.md](screen-share.md) §3). Screen transports
+  negotiate H.264 (packetization mode 1), AV1 profile 0 for plaintext shares
+  and VP9 profile 0 as the fallback; VP8 is not negotiated
+  ([native-media.md](native-media.md) §3).
 - **Speech gate on the server.** Browsers send their audio level (RFC 6464);
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.

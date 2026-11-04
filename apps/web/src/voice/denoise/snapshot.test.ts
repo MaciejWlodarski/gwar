@@ -109,6 +109,7 @@ type Processor = { port: { onmessage: ((event: { data: Request }) => void) | nul
 describe.skipIf(!present && !process.env.CI)("the worker hands the model to the worklet", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     vi.resetModules();
   });
 
@@ -177,9 +178,16 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
       return (seed / 2 ** 32 - 0.5) * 0.1;
     })]];
     const output = [[new Float32Array(QUANTUM)]];
-    // The audio clock keeps up with the wall clock here: the pace checks see a fast machine.
-    const started = Date.now();
-    const tick = () => { (globalThis as unknown as { currentTime: number }).currentTime = (Date.now() - started) / 1000; };
+    // Both clocks move one quantum per tick and stand still inside process(): this test is
+    // about the handover and the cleaned output, so a busy CI runner's model time must not
+    // make the warm-up report "slow". The budget and pace checks have their own tests.
+    let clock = Date.now();
+    const started = clock;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const tick = () => {
+      clock += (QUANTUM / 48_000) * 1000;
+      (globalThis as unknown as { currentTime: number }).currentTime = (clock - started) / 1000;
+    };
     for (let q = 0; q < 1000 && !reports.some(report => report.type === "ready"); q++) { tick(); processor.process([[]], output); }
     expect(reports).toEqual([{ type: "loaded" }, { type: "ready" }]);
     processor.port.onmessage!({ data: { type: "clear" } });
