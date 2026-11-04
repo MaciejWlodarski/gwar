@@ -171,6 +171,8 @@ and accept decimals (0 through 24 hours); percentages require `%` (0 through
   the total is clamped to zero. With no base delay, half of uniform draws pass
   immediately and half add up to 5 ms. `distribution=normal` uses a normal draw
   with sigma `jitter/3`, clipped to the same bounds; default is `uniform`.
+- `hold=10ms`: keep one jitter draw for this long, so packets are delayed in runs
+  as on a radio link. Default is a new draw per packet.
 - `keep_order` (or `keep_order=true`): hold a packet until the previous packet's
   scheduled release if needed. Default is false, so jitter may reorder packets.
 - `stall=270ms@12s`: block egress from 12.000 through 12.270 seconds on the
@@ -1248,24 +1250,45 @@ it on costs ~36 ms in Chromium and ~85 ms in WebKit: the microphone also crosses
 into the capture context and back out as a track, a MediaStream hop the 19 ms leaves
 out.
 
-The module and the model's archive (36 MB) are downloaded the first time
-suppression is on in a call and kept in the Cache API; the archive must match its
-SHA-256 pin (`crates/gwar-denoise-wasm/model.json`), which the build checks too. The
-browser's own suppression works until the model has loaded (~1.2 s once cached),
-then the microphone is opened again without it and sent through the model. A load
-belongs to its call: ending the call, or turning suppression off, cancels it and
-releases what it holds. The model runs only while the microphone is sent: muted,
-deafened or push-to-talk released, it idles, and starts over when sending resumes.
-The capture context resumes on the next user gesture whenever it is not running
-(not yet allowed to start, or interrupted by Safari); until then the microphone is
-sent as captured.
+The module and model archive (36 MB) are downloaded and checked during idle
+preparation after login, only while own suppression is enabled. The pristine
+Worker snapshot and one fully warmed processing instance are retained across
+joins and microphone changes. The prepared AudioContext is suspended without a
+caller. Turning suppression off or logging out releases both memories; no
+persisted setting was added. See [preparation lifecycle and memory costs](denoise-preparation.md).
+A cold call can share preparation already in progress. The browser's own
+suppression remains in use until the model is ready and the microphone can be
+attached. A call cancellation retires that call's controls without cancelling
+preparation needed by another caller. Muted, deafened or push-to-talk released,
+the model idles and starts over when sending resumes. A returned processor clears
+its buffers before reuse, and every new caller gets a fresh output stream/track.
+The context resumes on the next user gesture whenever browser policy requires it.
 
-The worklet compiles the module asynchronously; building the model (~0.3 s) is the
-one step that holds the audio thread, which Firefox shares with the page's other
-48 kHz contexts, so playback there can pause once while the model loads. 200 frames
-of quiet noise then run through the model, one every other render quantum, so the
-browser compiles it fully before it counts; if the second half of them averages
-more than 5 ms a frame, the model is too slow here.
+A dedicated worker downloads the module and the archive, checks the pin and builds the
+model (~0.5 s here, 2.6 to 8 s on a saturated four-core CI runner), all off the page
+and off the audio thread (`build-worker.ts`). It then hands the worklet a copy of the
+module's memory, 2 MiB per message, so each copy step is a short task of its own; the
+module keeps all its state in its memory (`scripts/denoise-wasm/check.mjs` asserts
+that its only mutable global is the stack pointer), so the copy cleans exactly as the
+model it was copied from (`snapshot.test.ts`, bit for bit). The worklet compiles the
+module itself (Chromium hands compiled modules only to cross-origin isolated
+worklets) and runs the warm-up's first frame before the page connects its output, so
+the browser's lazy compilation of a frame's code is out of the way too.
+
+The audio thread must never be held for long: a render of the capture context waits
+for it, and in Chromium the page's main thread waits for a render when the context
+gains a stream output (`SetDetectSilenceIfNecessary` takes a lock the audio device
+holds through `Render`). Building the model on the audio thread, as before, froze the
+page for as long as the build took, right after joining voice; on CI that held the
+first watch of `screen.mjs`'s `c3-restart` past its deadline. Firefox also plays the
+page's other 48 kHz contexts on that thread. `apps/web/e2e/denoise.mjs` now fails in
+Chromium if the audio thread runs a task of 150 ms or more while the model loads
+(328 ms before this change on an M-series Mac, 31 ms after).
+
+200 frames of quiet noise run through the model during preparation: the first as
+the model lands, the rest one every other render quantum, so the browser compiles
+it fully before it counts; if the second half of them averages more than 5 ms a
+frame, the model is too slow here.
 
 While it runs, three checks, over 2 s windows; any of them two windows in a row and
 the machine is too slow for the model beside everything else on the audio thread:
@@ -1300,8 +1323,9 @@ more than 20 dB with no trouble past two windows of checks, that a voice at -20 
 over it comes through (a vowel's harmonics, pitch and loudness moving like
 speech), and that it passes as captured while the microphone is not sent
 (Chromium and WebKit locally: noise from -30 dBFS to about -80, the voice out at
-about -18, loaded in ~1.2 s; all three in the Playwright Linux image as well, loaded
-in 1.6–2.6 s). Firefox's audio contexts start only with an audio device; CI gives it
+about -18; the historical worker-built implementation loaded in ~1.9 s locally
+and 1.6–2.6 s in the Playwright Linux image). Idle-prebuilt and cold join readiness
+are measured separately ([preparation](denoise-preparation.md#validation)). Firefox's audio contexts start only with an audio device; CI gives it
 a PulseAudio null sink. Without one the capture context never runs, and the browser's
 suppression stays on.
 
@@ -1659,3 +1683,167 @@ regressed the unimpaired relay (median 46.0 → 58.0 ms) and the documented mixe
 spec (concealments 246 → 411). The target only limits shrinking, and the
 five-second low-water rule already retains periodic spikes, so longer estimator
 memory mostly kept extra delay. Other relative-delay designs remain untested.
+
+## Screen-share jitter: known limitation and rejected recovery designs
+
+Receive jitter can freeze a share for 15 s or longer on a link with spare
+capacity. An approximately 8 ms probe cluster can read low when jitter stretches
+its receive interval. The estimate falls, the SFU budget follows it, failed
+keyframes pause the picture, and the first ordinary retry waits 15 s. With little
+media to acknowledge, the estimator may also remain application-limited.
+
+**PR #221 retains this known limitation.** Production str0m and SFU behavior are
+unchanged from main `1099a681`. The PR keeps `hold=`, test-only network models,
+pinned-main simulation coverage and explicit BWE unit tests in CI. It does not
+claim a picture or voice improvement.
+
+### Profiles and measurement rules
+
+All impaired browser rows use `seed=42;down:`. The screen is capped at 5 Mb/s.
+
+| Row | Network |
+| --- | --- |
+| plain | `normal` |
+| j5 | `delay=20ms,jitter=5ms,keep_order` |
+| j10 | `delay=20ms,jitter=10ms,keep_order` |
+| j20 | `delay=20ms,jitter=20ms,keep_order` |
+| r10 | `delay=20ms,jitter=10ms` |
+| h10 | `delay=20ms,jitter=10ms,hold=10ms,keep_order` |
+| cap | `delay=20ms,jitter=5ms,keep_order,rate=4mbit,queue=100ms` |
+| steps | `stall=270ms@10s,every=10s` |
+
+Local browser runs use Chromium with `--disable-audio-output`. The PID guard
+snapshots pre-existing `pmset -g assertions` and ignores the owner's Chrome. It
+stops only an audio-out assertion created by the test's Node/Playwright process
+tree, including a coreaudiod assertion's `Created for PID`, and logs the matched
+assertion. `uptime` is recorded at the start and end of each run. Load above 6 or
+a sleep/wake in `pmset -g log` makes the run void and requires a repeat. Timing
+runs must not overlap another worker's runs. A shared prebuilt web bundle can
+serve both arms, keeping repeated web builds outside the timing window.
+
+### Historical browser measurements: withdrawn estimator filter
+
+The original worker reported four 45 s browser runs per row, main to the withdrawn
+recent-cluster filter. These measurements describe a rejected estimator design;
+they do not validate the final PR or the later SFU experiments. The jitter gains
+could not be retained under the zero-regression voice requirement.
+
+| Downlink | Runs with long stops | Stopped, s | In-range samples | Frames |
+| --- | --- | --- | --- | --- |
+| plain | 0 → 0 | 0 → 0 | 133/136 → 134/136 | |
+| j5 | 0 → 0 | 0 → 0 | 125/137 → 123/137 | |
+| j10 | 4 → 1 | 76 → 27 | 39/77 → 76/83 | 404 → 746 |
+| j20 | 4 → 3 | 80 → 48 | 24/65 → 83/106 | |
+| r10 | 4 → 3 | 94 → 66 | 13/42 → 7/32 | 55 → 28 |
+| h10 | 2 → 3 | 38 → 62 | 74/97 → 46/63 | |
+| cap | 4 → 4 | 63 → 63 | 5/73 → 3/68 | |
+| steps | 2 → 1 | 23 → 11 | 65/111 → 83/125 | |
+
+### Rejected approaches and voice evidence
+
+Voice hurt time is the duration for which an independent 100 kb/s voice flow
+meets at least 50 ms of physical FIFO queue. Above-capacity time is the duration
+for which the screen estimate exceeds link capacity minus cross traffic. These
+are simulator metrics, not measurements of native device playout latency.
+
+| Approach | Evidence | Worst added voice hurt time | Worst added above-capacity time | Result |
+| --- | --- | --- | --- | --- |
+| Hold a lone low cluster against recent high clusters (`5deda792`) | 480 drop cases | 1,770 ms | 1,070 ms | Rejected |
+| Filter only stretched clusters (`e152948b`) | Evenly delivered drops passed, but a burst-delivered full link queued voice for 1,050 ms versus main's 220 ms | 830 ms in that counterexample | Not reported for that counterexample | Rejected |
+| Back off, then verify at 0.85 of the old estimate after 500 ms | 2,560 cases; voice worse in 128, above-capacity time worse in 206 | 1,390 ms | 4,140 ms | Rejected |
+| Keep main BWE; defer pause for 2 s after a sharp cut and resume after 300 ms of fit | 640 cases; voice worse in 5 and better in none; above-capacity time worse in 5 and better in 8 | 90 ms | 1,250 ms | Rejected |
+| Keep main pauses; resume after 2 s of settled feedback, adequate ACK rate and budget | All 2,560 drop pairs had delta 0 with no early resumes, as intended; all 48 jitter pairs also had no early resumes | 0 ms | 0 ms | Rejected: no picture benefit |
+
+The pause-grace counterexamples used seed 1 and a 6 → 2 Mb/s drop, 5 ms service,
+and no random loss:
+
+| Phase | Aggregation | Cross traffic | Metric | Main | Grace prototype |
+| --- | --- | --- | --- | --- | --- |
+| 400 ms | 5 ms | 1 Mb/s | Voice hurt time | 400 ms | 490 ms |
+| 600 ms | none | none | Above-capacity time | 2,830 ms | 4,080 ms |
+
+Unchanged estimator code and unchanged budgets did not make the grace safe:
+keeping a different packet stream flowing changed feedback while main still
+overestimated the reduced link. The final experiment therefore retained main's
+pause and required a non-decreasing estimate, normal delay detector, loss below
+2%, fresh reports and enough acknowledged bitrate throughout a two-second window.
+It did not restart BWE or raise its estimate. Constructed healthy-feedback tests
+passed, but the real simulated feedback never permitted an early jitter resume.
+
+### Settled-feedback experiment: paired jitter simulations
+
+Each arm ran 60 simulated seconds, using seeds 1, 2, 3 and 42, 5/10 ms SFU
+service, 20 ms downlink propagation, uniform signed jitter and `keep_order`.
+The free downlink had no rate cap. Shares ran at 60 fps, either 3 Mb/s with a
+32 KB keyframe or 5 Mb/s with a 150 KB keyframe. The draw and hold clock match the
+netem profile's SplitMix64 uniform distribution; these are synthetic packet
+sources and a str0m viewer, not a browser encoder/decoder measurement.
+
+| Profile | Paired cases | Pauses, main → prototype | Total paused, main → prototype | Completed resume waits, both arms | Early resumes |
+| --- | --- | --- | --- | --- | --- |
+| ±10 ms, independent draws | 16 | 12 → 12 | 165.15 s → 165.15 s | 15.10–15.40 s | 0 |
+| ±20 ms, independent draws | 16 | 24 → 24 | 356.55 s → 356.55 s | 15.10 s | 0 |
+| ±10 ms, `hold=10ms` | 16 | 13 → 13 | 198.70 s → 198.70 s | 12.30–21.50 s | 0 |
+
+All 48 paired result records were identical. Runs still paused when the 60 s
+window ended count toward total paused time; their incomplete waits are not
+included in the completed-wait range. There were 3, 13 and 2 such censored runs
+in the three rows respectively. [Per-case data](data/screen-jitter-recovery.csv)
+includes the completed waits and censored durations. The incomplete browser
+matrix was stopped after this simulator rejection; it is not acceptance evidence.
+
+### Retained simulation coverage
+
+`Link::aggregate` batches delivery after bottleneck serialization. `Sim::cross`
+adds full-size cross-traffic packets to the same physical FIFO. The jitter model
+uses signed uniform delay, a hold interval and explicit order preservation.
+With jitter disabled, it consumes no new random draws or delay conversions.
+
+The drop matrix covers two service cadences, 0/1% loss, 0/2/5/10 ms aggregation,
+0/1 Mb/s cross traffic, step cuts 20 → 5, 20 → 4 and 6 → 2 Mb/s, a 20 → 5 Mb/s
+two-second ramp, and five phases through the probe interval. Four seeds produce
+2,560 cases. The [baseline fixture](../crates/gwar-server/src/media/screen/drop-baseline.csv)
+pins main `1099a681`; the restored main code is checked against every stored
+result. It is a measured simulator baseline, not an analytical safety bound.
+Changes may improve either metric but may not exceed the pinned value.
+
+The ordinary `drop_matrix_matches_main_baseline` test runs 80 representative
+cases in CI, including the burst/cross-traffic combinations that broke earlier
+designs. It compares against stored main results rather than comparing the same
+current implementation with itself. The full sweep and jitter report are manual:
+
+```sh
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test --release -p gwar-server --lib drop_sweep -- --ignored --nocapture
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test --release -p gwar-server --lib jitter_matrix -- --ignored --nocapture
+```
+
+`SWEEP_SEEDS=1` selects a quick drop run; omit it for all four seeds. A baseline
+update requires an explicit new source pin and review of every changed metric.
+The BWE crate is excluded from workspace tests, so CI separately runs:
+
+```sh
+cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --lib bwe_::
+```
+
+### Validation of the final fallback
+
+- Screen suite: 226 passed, 5 manual matrix/report tests ignored.
+- Full drop sweep: all 2,560 cases reproduced the main baseline; maximum added
+  voice hurt time and above-capacity time were both 0 ms.
+- The restored main reproduced every metric in all 48 recorded jitter cases.
+- Vendored str0m BWE: 93 unit tests passed, explicitly through its own manifest.
+- Netem example: 16 tests passed, including the held-jitter profile.
+- Workspace formatting, server/test clippy with warnings denied, and CI
+  coverage-selection checks passed.
+
+### State / next steps
+
+- Final scope: profiles, simulation tools, pinned-main coverage, BWE tests in CI
+  and this known-limitation report. No estimator or SFU behavior change remains.
+- The settled-feedback design is rejected because it made no early resumes in
+  the jitter matrix. The freeze remains a known limitation.
+- Future recovery proposals need both activation with substantially shorter
+  jitter pauses and a zero-regression capacity-drop gate. Inactivity during a
+  real capacity drop is intended; inactivity under jitter rejected this design.
+  Current senders have one encoded layer; lower-layer selection or encoder
+  adaptation needs separate implementation work.

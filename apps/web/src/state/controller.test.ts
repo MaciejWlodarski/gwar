@@ -1,4 +1,5 @@
 import { notificationServerKey } from "../lib/notification-scope";
+import type { SealedConversations } from "./sealed";
 import type { Attachment } from "../proto/Attachment";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Client } from "../proto/Client";
@@ -11,6 +12,7 @@ import type { EventName, Op } from "../net/protocol";
 import { welcome } from "../net/testing";
 import type { VoiceEngine, VoiceEvents, VoiceState } from "../voice/engine";
 import { defaultSounds } from "../sound/catalog";
+import { denoiseModels } from "../voice/denoise/model-cache";
 
 // Native file commands, recording where uploads would go (only the desktop upload test turns the app native).
 const native = vi.hoisted(() => ({ origin: null as string | null, session: null as string | null, sent: [] as Array<{ origin: string | null; bytes: Uint8Array }>, attachment: {} }));
@@ -222,6 +224,28 @@ beforeEach(() => {
 afterEach(async () => {
   vi.useRealTimers();
   await controller.disconnect(true);
+});
+
+describe("idle suppression preparation", () => {
+  it("follows login, enable/disable, reconnect and logout without waiting for voice", async () => {
+    const configure = vi.spyOn(denoiseModels, "configure");
+    const originalAudio = settings.useSettings.getState().audio;
+    const enabled = (noiseSuppression: boolean) => settings.useSettings.setState({ audio: { ...settings.useSettings.getState().audio, noiseSuppression } });
+    try {
+      enabled(false);
+      connectFake();
+      expect(configure).toHaveBeenLastCalledWith(false, true);
+      expect(engine.start).not.toHaveBeenCalled();
+      enabled(true);
+      expect(configure).toHaveBeenLastCalledWith(true, true);
+      session().dispatch({ type: "phase", phase: "reconnecting" });
+      expect(configure).toHaveBeenLastCalledWith(true, true);
+      enabled(false);
+      expect(configure).toHaveBeenLastCalledWith(false, true);
+      await controller.disconnect(true);
+      expect(configure).toHaveBeenLastCalledWith(false, false);
+    } finally { settings.useSettings.setState({ audio: originalAudio }); configure.mockRestore(); }
+  });
 });
 
 describe("sound cue wiring", () => {
@@ -2740,7 +2764,13 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
   const connectPublic = () => { connectFake({ encrypted: [1], serverChat: kind === "server" }); if (kind === "server") session().dispatch({ type: "setActive", key: "server" }); };
   const sealedRow = (id: number) => ({ id, conversation: target, group: "g", epoch: 0, author_uid: "u2", author_name: "n2",
     message_id: `m${id}`, revision: 0, ciphertext: "x", sent_at: 1000 + id, deleted: false });
-  const fakeSealed = () => ({ open: vi.fn(async () => {}), send: vi.fn(async () => {}), close: vi.fn() });
+  const fakeSealed = () => {
+    const delivered = new Set<string>();
+    return { open: vi.fn(async () => {}), close: vi.fn(), recover: vi.fn(async () => false),
+      send: vi.fn(async (...args: Parameters<SealedConversations["send"]>) => { if (args[5]) delivered.add(`${args[0]}:${args[5].message_id}`); }),
+      delivered: vi.fn((thread: string, messageId: string) => delivered.has(`${thread}:${messageId}`)),
+    };
+  };
   const install = (sealed: unknown) => { (controller as unknown as { sealed: unknown }).sealed = sealed; };
   beforeEach(() => session().dispatch({ type: "focus", focused: true }));
   afterEach(() => install(null));
@@ -2759,7 +2789,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     connectPublic();
     const sealed = fakeSealed(); install(sealed);
     expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi", { mentions: ["u2"] })).toBe(true);
-    expect(sealed.send).toHaveBeenCalledWith(thread, "hi", ["u2"], undefined, []);
+    expect(sealed.send).toHaveBeenCalledWith(thread, "hi", ["u2"], undefined, [], expect.objectContaining({ message_id: expect.any(String), created_at: expect.any(Number) }), expect.any(Function));
     expect(link.sent("chat.send")).toEqual([]);
     const row = sealedRow(5);
     session().dispatch({ type: "sealed", thread, live: false,
@@ -2776,7 +2806,85 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     const sealed = fakeSealed(); install(sealed);
     sealed.send.mockRejectedValueOnce(new Error("Securing this conversation"));
     expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi")).toBe(false);
-    expect(stores.useUi.getState().toasts.map(t => [t.kind, t.text])).toEqual([["error", "Securing this conversation"]]);
+    const failed = stores.useOutbox.getState().failed.at(-1)!;
+    expect(failed).toMatchObject({ thread, text: "hi", error: "Securing this conversation", sealed: { message_id: expect.any(String) } });
+    expect(stores.useUi.getState().toasts).toEqual([]);
+    await controller.retrySend(failed.id);
+    expect(sealed.send).toHaveBeenLastCalledWith(thread, "hi", [], undefined, [], failed.sealed, expect.any(Function));
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    expect(link.sent("chat.send")).toEqual([]);
+  });
+
+  it("keeps a failed send fenced after a resync and requires an explicit fresh send", async () => {
+    connectPublic();
+    const sealed = fakeSealed(); install(sealed);
+    sealed.send.mockRejectedValueOnce(new Error("answer lost"));
+    await controller.sendChat(kind === "server" ? "server" : "channel", "before resync");
+    const failed = stores.useOutbox.getState().failed[0]!;
+    stores.useSession.setState({ epoch: session().epoch + 1 });
+    await controller.retrySend(failed.id);
+    expect(sealed.send).toHaveBeenCalledTimes(1);
+    expect(stores.useOutbox.getState().failed).toHaveLength(1);
+    await controller.retrySend(failed.id, true);
+    expect(sealed.send).toHaveBeenCalledTimes(2);
+    expect((sealed.send.mock.calls as unknown as unknown[][]).at(-1)?.[5]).toEqual(failed.sealed);
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+  });
+
+  it("owns failed attachment keys after more than 64 uploads have left the pending cache", async () => {
+    connectPublic();
+    const sealed = fakeSealed(); install(sealed);
+    const uploaded = (controller as unknown as { uploaded: Map<string, { conn: unknown; att: Attachment }> }).uploaded;
+    const att = (id: number): Attachment => ({ id: `own-${id}`, name: "note.txt", mime: "text/plain", size: 5, url: `/files/own-${id}/file`, sha256: "s",
+      sealed: { key: `key-${id}`, sha256: "cipherhash", size: 33 } });
+    for (let i = 0; i < 65; i++) {
+      uploaded.set(att(i).id, { conn: link, att: att(i) });
+      while (uploaded.size > 64) uploaded.delete(uploaded.keys().next().value!);
+      sealed.send.mockRejectedValueOnce(new Error("lost"));
+      await controller.sendChat(kind === "server" ? "server" : "channel", `attachment ${i}`, { attachments: [att(i).id] });
+    }
+    const first = stores.useOutbox.getState().failed[0]!;
+    uploaded.clear();
+    await controller.retrySend(first.id);
+    expect(sealed.send).toHaveBeenLastCalledWith(thread, "attachment 0", [], undefined, [att(0)], first.sealed, expect.any(Function));
+    expect(stores.useOutbox.getState().failed).toHaveLength(64);
+  });
+
+  it("keeps a rejected fresh retry in one row, and a dismissed in-flight retry stays dismissed", async () => {
+    connectPublic();
+    const sealed = fakeSealed(); install(sealed);
+    sealed.send.mockRejectedValueOnce(new Error("lost"));
+    await controller.sendChat(kind === "server" ? "server" : "channel", "draft");
+    const failed = stores.useOutbox.getState().failed[0]!;
+    stores.useSession.setState({ epoch: session().epoch + 1 });
+    sealed.send.mockRejectedValueOnce(new Error("still lost"));
+    await controller.retrySend(failed.id, true);
+    expect(stores.useOutbox.getState().failed).toHaveLength(1);
+    expect(stores.useOutbox.getState().failed[0]).toMatchObject({ id: failed.id, session: controller.sendSession });
+    expect(stores.useOutbox.getState().failed[0]!.sealed).toEqual(failed.sealed);
+    let reject!: (error: Error) => void;
+    sealed.send.mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; }));
+    const sending = controller.retrySend(failed.id);
+    await controller.retrySend(failed.id); // Double-click does not start another send.
+    expect(sealed.send).toHaveBeenCalledTimes(3);
+    stores.useOutbox.getState().remove(failed.id);
+    reject(new Error("late failure"));
+    await sending;
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+  });
+
+  it("retains an encrypted failure with its originating session after a resync", async () => {
+    connectPublic();
+    let reject!: (error: Error) => void;
+    const sealed = fakeSealed(); install(sealed);
+    sealed.send.mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; }));
+    const origin = controller.sendSession;
+    const sending = controller.sendChat(kind === "server" ? "server" : "channel", "old session");
+    await Promise.resolve();
+    stores.useSession.setState({ epoch: session().epoch + 1 });
+    reject(new Error("lost connection"));
+    expect(await sending).toBe(false);
+    expect(stores.useOutbox.getState().failed).toMatchObject([{ text: "old session", session: origin, sending: false }]);
   });
 
   it("sends only this connection's encrypted uploads with a sealed message, and keeps them on edits", async () => {
@@ -2790,7 +2898,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     expect(sealed.send).not.toHaveBeenCalled();
     uploaded.set("f1", { conn: link, att });
     expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi", { attachments: ["f1"] })).toBe(true);
-    expect(sealed.send).toHaveBeenCalledWith(thread, "hi", [], undefined, [att]);
+    expect(sealed.send).toHaveBeenCalledWith(thread, "hi", [], undefined, [att], expect.objectContaining({ message_id: expect.any(String) }), expect.any(Function));
     expect(uploaded.has("f1")).toBe(false);
   });
 

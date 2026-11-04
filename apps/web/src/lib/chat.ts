@@ -48,6 +48,7 @@ export const GROUP_WINDOW_MS = 5 * 60 * 1000;
 
 export type Row =
   | { type: "day"; key: string; at: number }
+  | { type: "failed"; key: string; at: number }
   | { type: "msg"; key: string; item: Extract<ChatItem, { kind: "msg" }>; first: boolean }
   | { type: "sys"; key: string; item: Extract<ChatItem, { kind: "sys" }> };
 
@@ -62,11 +63,24 @@ function dayKey(at: number): string {
  * than 5 minutes after the previous message, a system line or a day break
  * in between).
  */
-export function buildRows(items: ChatItem[]): Row[] {
+export function buildRows(items: ChatItem[], failed: { key: string; at: number }[] = []): Row[] {
   const rows: Row[] = [];
+  const waiting = failed.map(f => ({ ...f, kind: "failed" as const })).sort((a, b) => a.at - b.at);
+  const ordered: (ChatItem | typeof waiting[number])[] = [];
+  const time = (i: ChatItem) => {
+    const signed = i.kind === "msg" ? i.msg.signature?.created_at : undefined;
+    return signed != null && Number.isFinite(new Date(signed).getTime()) ? signed : i.at;
+  };
+  let next = 0;
+  for (const item of items) {
+    // Retain the server's message order; insert local failures before later messages.
+    while (next < waiting.length && waiting[next]!.at <= time(item)) ordered.push(waiting[next++]!);
+    ordered.push(item);
+  }
+  ordered.push(...waiting.slice(next));
   let prev: Row | null = null;
   let lastDay = "";
-  for (const original of items) {
+  for (const original of ordered) {
     const signedAt = original.kind === "msg" ? original.msg.signature?.created_at : undefined;
     const item = signedAt != null && Number.isFinite(new Date(signedAt).getTime()) ? { ...original, at: signedAt } : original;
     const day = dayKey(item.at);
@@ -75,6 +89,12 @@ export function buildRows(items: ChatItem[]): Row[] {
       const row: Row = { type: "day", key: `d${day}`, at: item.at };
       rows.push(row);
       prev = row;
+    }
+    if (item.kind === "failed") {
+      const row: Row = { type: "failed", key: item.key, at: item.at };
+      rows.push(row);
+      prev = row;
+      continue;
     }
     if (item.kind === "sys") {
       const row: Row = { type: "sys", key: item.key, item };

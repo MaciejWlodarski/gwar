@@ -285,40 +285,69 @@ export const useUi = create<UiStore>()((set) => ({
 
 // ------------------------------------------------------------------- outbox
 
-/** A message the server refused or never acknowledged; shown inline with a retry. */
-export interface FailedSend {
+/** In-memory failures only: a reload discards their text and attachment keys. */
+interface FailedMessage {
   id: number;
   /** Storage key of the thread it belongs to (`ch:<id>`, `server`, `dm:<uid>`). */
   thread: string;
-  target: ChatTarget;
-  /** For private messages: re-resolved on retry because session ids change. */
-  dmUid?: string;
+  /** The original send attempt's place in the conversation, retained through Retry. */
+  at?: number;
   text: string;
   mentions?: string[];
   attachments?: string[];
   /** The server (key) the draft was written for; a retry goes nowhere else. */
   serverKey: string | null;
   error: string;
+  /** The page/connection/session that owns this attempt. */
+  session?: string;
+  authorUid?: string;
+  /** Owned by the failure, independent of the pending upload cache. No File bytes. */
+  attachmentMetadata?: Attachment[];
+  /** Retained before delivery and hidden until failure. */
+  sending?: boolean;
 }
+
+export type FailedSend = FailedMessage & (
+  | { target: ChatTarget; dmUid?: string; sealed?: never }
+  | { sealed: { message_id: string; created_at: number }; target?: never; dmUid?: never }
+);
 
 interface OutboxStore {
   failed: FailedSend[];
-  add(item: Omit<FailedSend, "id">): void;
+  add(item: Omit<FailedMessage, "id"> & { id?: number } & (
+    | { target: ChatTarget; dmUid?: string; sealed?: never }
+    | { sealed: { message_id: string; created_at: number }; target?: never; dmUid?: never }
+  )): FailedSend;
   remove(id: number): FailedSend | undefined;
   clear(): void;
+  update(id: number, patch: Partial<FailedMessage>): void;
+  reconcile(serverKey: string, thread: string, authorUid: string, messageId: string): void;
 }
 
 let failedId = 1;
 
 export const useOutbox = create<OutboxStore>()((set, get) => ({
   failed: [],
-  add: (item) => set((s) => ({ failed: [...s.failed, { ...item, id: failedId++ }] })),
+  add: (item) => {
+    let next!: FailedSend;
+    set((s) => {
+      const old = s.failed.find(f => f.id === item.id) ?? (item.sealed && s.failed.find(f => f.sealed?.message_id === item.sealed!.message_id && f.thread === item.thread && f.serverKey === item.serverKey && f.authorUid === item.authorUid));
+      next = { ...item, at: item.at ?? item.sealed?.created_at ?? Date.now(), id: old?.id ?? failedId++ } as FailedSend;
+      return { failed: old ? s.failed.map(f => f.id === old.id ? next : f) : [...s.failed, next] };
+    });
+    return next;
+  },
   remove: (id) => {
     const found = get().failed.find((f) => f.id === id);
-    set((s) => ({ failed: s.failed.filter((f) => f.id !== id) }));
+    if (found) set((s) => ({ failed: s.failed.filter((f) => f.id !== id) }));
     return found;
   },
   clear: () => set({ failed: [] }),
+  update: (id, patch) => set(s => ({ failed: s.failed.map(f => f.id === id ? { ...f, ...patch } : f) })),
+  reconcile: (serverKey, thread, authorUid, messageId) => {
+    const matches = (f: FailedSend) => f.sealed?.message_id === messageId && f.serverKey === serverKey && f.thread === thread && f.authorUid === authorUid;
+    set(s => ({ failed: s.failed.filter(f => !matches(f)) }));
+  },
 }));
 
 // ------------------------------------------------------------ connect screen

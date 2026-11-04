@@ -36,6 +36,9 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { installMicPrivacyGuard } from "./mic-privacy.mjs";
+import { sendComposer } from "./composer-actions.mjs";
+import { stopProcesses } from "./processes.mjs";
+import { settledVerificationState } from "./verification-state.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -99,8 +102,8 @@ async function ensureServer(connectUrl) {
   const bin = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
   const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-endpoint", CLIENT_ADDR, "--public-endpoint", CLIENT_ALIAS, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
   const child = existsSync(bin)
-    ? spawn(bin, args, { cwd: repoRoot })
-    : spawn("cargo", ["run", "-q", "-p", "gwar-server", "--", ...args], { cwd: repoRoot });
+    ? spawn(bin, args, { cwd: repoRoot, detached: true })
+    : spawn("cargo", ["run", "-q", "-p", "gwar-server", "--", ...args], { cwd: repoRoot, detached: true });
   child.on("exit", (code) => code && console.error(`server exited with code ${code}`));
   children.push(child);
   let log = "";
@@ -145,8 +148,8 @@ async function ensureConnect() {
   const bin = process.env.GWAR_CONNECT_BIN ?? path.join(repoRoot, "target/debug/gwar-connect");
   const args = ["--data-dir", dataDir, "--http", `127.0.0.1:${port}`, "--origin", new URL(WEB_URL).origin];
   const child = existsSync(bin)
-    ? spawn(bin, args, { cwd: repoRoot })
-    : spawn("cargo", ["run", "-q", "-p", "gwar-connect", "--", ...args], { cwd: repoRoot });
+    ? spawn(bin, args, { cwd: repoRoot, detached: true })
+    : spawn("cargo", ["run", "-q", "-p", "gwar-connect", "--", ...args], { cwd: repoRoot, detached: true });
   child.on("exit", (code) => code && console.error(`gwar-connect exited with code ${code}`));
   children.push(child);
   const base = `http://127.0.0.1:${port}`;
@@ -167,7 +170,8 @@ async function ensureWeb(connectUrl) {
   // builds still require HTTPS. The test serves dist, with a loopback-only test CSP exception.
   const build = spawnSync("npx", ["vite", "build", "--mode", "e2e"], { cwd: webRoot, env: { ...process.env, NODE_ENV: "development", VITE_CONNECT_URL: connectUrl }, encoding: "utf8" });
   if (build.status !== 0) throw new Error(`e2e web build failed: ${build.stdout} ${build.stderr}`);
-  const child = spawn("npx", ["vite", "preview", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
+  const viteCli = path.join(path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin/vite.js");
+  const child = spawn(process.execPath, [viteCli, "preview", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl }, detached: true });
   children.push(child);
   await waitFor(() => reachable(WEB_URL), "vite preview", 30000);
   console.log("started vite preview serving apps/web/dist");
@@ -234,6 +238,7 @@ async function check(name, fn) {
   } catch (e) {
     results.push({ name, ok: false, error: e });
     console.log(`  FAIL ${name}\n${e.stack ?? e}`);
+    if (/private messages|message verification warnings/.test(name)) await explainPrivate(`private messages at failure (${name})`, debugPages.slice(0, 2).map((page, i) => [i === 0 ? "a" : "b", page]));
     for (const [i, p] of debugPages.entries()) {
       await p.screenshot({ path: path.join(shots, `fail-${results.length}-${i}.png`) }).catch(() => {});
       // What failed may have left a dialog open; the next check starts without it.
@@ -242,27 +247,47 @@ async function check(name, fn) {
   }
 }
 
-/** Collects gwar/1 frames received over any websocket of a page. */
+/** Bounded warning and protocol timelines, retained before an action fails. */
+const pageWarnings = new WeakMap(), pageWire = new WeakMap();
+function recordWarnings(page) {
+  const warnings = [];
+  pageWarnings.set(page, warnings);
+  page.on("console", message => {
+    if (!["warning", "error"].includes(message.type())) return;
+    warnings.push({ at: Date.now(), type: message.type(), text: message.text().slice(0, 1200) });
+    if (warnings.length > 40) warnings.shift();
+  });
+}
+/** Collects gwar/1 events and a bounded request/answer timeline. */
 function recordFrames(page) {
-  const frames = [];
-  page.on("websocket", (ws) => {
+  const frames = [], wire = [], asked = new Map();
+  pageWire.set(page, wire);
+  const note = (direction, frame) => {
+    if (direction === "sent" && frame.id !== undefined) asked.set(frame.id, frame.op);
+    const op = frame.op ?? frame.ev ?? (frame.re !== undefined ? `${asked.get(frame.re)} (answer)` : undefined);
+    wire.push({ at: Date.now(), direction, op, id: frame.id ?? frame.re, ok: frame.ok === undefined ? undefined : !!frame.ok, error: frame.err });
+    if (frame.re !== undefined) asked.delete(frame.re);
+    if (wire.length > 400) wire.shift();
+  };
+  page.on("websocket", ws => {
+    ws.on("framesent", ({ payload }) => { try { note("sent", JSON.parse(String(payload))); } catch { /* non-JSON frame */ } });
     ws.on("framereceived", ({ payload }) => {
-      try {
-        frames.push(JSON.parse(String(payload)));
-      } catch {
-        /* ignore */
-      }
+      try { const frame = JSON.parse(String(payload)); frames.push(frame); note("received", frame); }
+      catch { /* non-JSON frame */ }
     });
   });
   return {
     frames,
-    events: (name) => frames.filter((f) => f.ev === name).map((f) => f.d),
-    /** Clients as announced by Welcome and later updates. */
-    clients: () => [
-      ...frames.flatMap((f) => (f.ok?.clients ? f.ok.clients : [])),
-      ...frames.filter((f) => f.ev === "client.updated" || f.ev === "client.joined").map((f) => f.d),
-    ],
+    events: name => frames.filter(frame => frame.ev === name).map(frame => frame.d),
+    clients: () => [...frames.flatMap(frame => frame.ok?.clients ?? []), ...frames.filter(frame => frame.ev === "client.updated" || frame.ev === "client.joined").map(frame => frame.d)],
   };
+}
+async function explainPrivate(label, pages) {
+  for (const [name, page] of pages) {
+    const state = await privateState(page).catch(String);
+    const wire = (pageWire.get(page) ?? []).filter(frame => frame.op?.startsWith("mls.") || frame.op?.startsWith("chat."));
+    console.log(`${label}: ${name}: ${JSON.stringify({ state, warnings: pageWarnings.get(page) ?? [], wire: wire.slice(-80) })}`);
+  }
 }
 
 /** Set the identity's profile through Settings, before the first join. */
@@ -340,6 +365,24 @@ const privateState = (page) => page.evaluate(async () => {
     }),
     toasts: useUi.getState().toasts.map(toast => [toast.kind, toast.text]),
     composer: box && { value: box.value, disabled: box.disabled },
+    mls: (() => {
+      const runtime = controller.sealed?.runtime;
+      if (!runtime) return null;
+      try {
+        const encoded = value => btoa(String.fromCharCode(...value)).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+        return {
+          stopped: runtime.stopped, syncing: !!runtime.syncing,
+          held: [...runtime.held], waiting: [...runtime.waiting],
+          statuses: Object.fromEntries(runtime.statuses), opening: Object.fromEntries(runtime.openingDms ?? []),
+          generation: runtime.generation, activeGeneration: runtime.activeGeneration,
+          groups: runtime.inventory().filter(group => group.conversation.startsWith("dm:")).map(group => {
+            let gate;
+            try { gate = runtime.gate(encoded(group.group)); } catch (error) { gate = String(error); }
+            return { conversation: group.conversation, status: group.record.status, live: group.live, members: group.members?.length, gate };
+          }),
+        };
+      } catch (error) { return { error: String(error) }; }
+    })(),
   };
 });
 const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -448,6 +491,7 @@ async function main() {
     p.on("console", (m) => m.type() === "error" && errors.push(`${who} console: ${m.text()}`));
   }
   debugPages.push(a, b);
+  recordWarnings(a); recordWarnings(b);
   const fa = recordFrames(a);
   const fb = recordFrames(b);
 
@@ -701,7 +745,7 @@ async function main() {
     await alert.waitFor({ timeout: 8000 });
     await alert.getByText("retry me").waitFor();
     await b.evaluate(() => window.__restoreSend());
-    await alert.getByRole("button", { name: "Retry" }).click();
+    await alert.getByRole("button", { name: "Send again" }).click();
     await a.getByText("retry me").waitFor({ timeout: 8000 });
     await alert.waitFor({ state: "detached" });
   });
@@ -771,11 +815,15 @@ async function main() {
   await check("private messages verify in both directions across endpoint aliases, with unread badges", async () => {
     await treeItem(b, /Alice/).dblclick();
     await b.getByRole("tab", { name: "Alice", exact: true, selected: true }).waitFor();
-    await composer(b).fill("psst");
-    // Opening an encrypted conversation can disable the composer again while its group settles.
-    // press() sends a key even then; click() waits for the Send button to be enabled.
-    await b.getByRole("button", { name: "Send message", exact: true }).click();
-    await a.getByRole("tab", { name: /Bob/ }).waitFor();
+    const diagnosed = async (step, action) => {
+      try { return await action(); }
+      catch (error) {
+        await explainPrivate(`private messages at failure (${step})`, [["a", a], ["b", b]]);
+        throw error;
+      }
+    };
+    await diagnosed("bob sends", () => sendComposer(b, "psst"));
+    await diagnosed("alice gets the tab", () => a.getByRole("tab", { name: /Bob/ }).waitFor());
     await a.getByRole("tab", { name: /Bob 1/ }).waitFor();
     await a.getByRole("tab", { name: /Bob/ }).click();
     await a.getByText("psst").waitFor();
@@ -784,12 +832,67 @@ async function main() {
       const row = page.locator("[data-message]").filter({ hasText: "psst" });
       await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified private message");
     }
-    await composer(a).fill(`alias DM reply ${rid}`);
-    await a.getByRole("button", { name: "Send message", exact: true }).click();
+    await diagnosed("alice replies", () => sendComposer(a, `alias DM reply ${rid}`));
     for (const page of [a, b]) {
       const row = page.locator("[data-message]").filter({ hasText: `alias DM reply ${rid}` });
       await row.waitFor();
       await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified reply across endpoint aliases");
+    }
+  });
+
+  await check("an encrypted failure stays in its timeline and Retry preserves its identity", async () => {
+    await a.evaluate(() => {
+      const ws = window.__sockets.find(x => x.readyState === WebSocket.OPEN && x.url.endsWith("/ws"));
+      const original = ws.send.bind(ws);
+      window.__sealedRetryFrames = [];
+      window.__rejectSealed = true;
+      window.__restoreSealedSend = () => { ws.send = original; };
+      ws.send = data => {
+        const frame = JSON.parse(data);
+        if (frame.op === "chat.sealed.send") {
+          window.__sealedRetryFrames.push({ op: frame.op, id: frame.d.message_id });
+          if (window.__rejectSealed) frame.d.group = "invalid";
+        } else if (frame.op === "chat.send") window.__sealedRetryFrames.push({ op: frame.op });
+        original(JSON.stringify(frame));
+      };
+    });
+    const failedText = `encrypted retry ${rid}`, laterText = `later than the failed send ${rid}`;
+    try {
+      await composer(a).fill(failedText);
+      await a.getByRole("button", { name: "Send message", exact: true }).click();
+      const failed = a.getByRole("alert").filter({ hasText: failedText });
+      await failed.waitFor({ timeout: 8000 });
+      if (await composer(a).inputValue()) throw new Error("the failed message returned to the composer");
+      await a.evaluate(async () => { (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "pl" }); });
+      await failed.getByText(/Nie wysłano/).waitFor();
+      await failed.getByRole("button", { name: "Wyślij ponownie", exact: true }).waitFor();
+      await failed.getByRole("button", { name: "Odrzuć", exact: true }).waitFor();
+      await a.evaluate(async () => {
+        (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "en" });
+        window.__rejectSealed = false;
+      });
+      await composer(a).fill(laterText);
+      await a.getByRole("button", { name: "Send message", exact: true }).click();
+      await b.getByText(laterText, { exact: true }).waitFor({ timeout: 8000 });
+      if (!await failed.evaluate((el, text) => {
+        const later = [...el.parentElement.querySelectorAll('[data-message]')].find(row => row.textContent.includes(text));
+        return !!later && !!(el.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING);
+      }, laterText)) throw new Error("the failed message moved after its follow-up");
+      await failed.getByRole("button", { name: "Send again", exact: true }).click();
+      for (const page of [a, b]) {
+        const row = page.locator('[data-message]').filter({ hasText: failedText });
+        await row.waitFor({ timeout: 8000 });
+        await waitFor(() => row.getAttribute("data-message-verification").then(v => v === "verified"), "verified encrypted retry");
+        if (await row.count() !== 1) throw new Error("Retry duplicated the encrypted message");
+      }
+      await failed.waitFor({ state: "detached" });
+      const frames = await a.evaluate(() => window.__sealedRetryFrames);
+      if (frames.some(f => f.op === "chat.send") || frames[0].id !== frames.at(-1).id) throw new Error(`encrypted Retry changed its route or identity: ${JSON.stringify(frames)}`);
+    } finally {
+      await a.evaluate(async () => {
+        window.__restoreSealedSend();
+        (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "en" });
+      });
     }
   });
 
@@ -1753,7 +1856,7 @@ async function main() {
       const child = spawn(
         bin,
         ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist, "--no-connect"],
-        { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" } },
+        { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" }, detached: true },
       );
       children.push(child);
       try {
@@ -2005,29 +2108,37 @@ async function main() {
           }
           await page.getByText(`verification private ${rid}`, { exact: true }).waitFor().catch(async error => {
             // One run in 240 timed out here: which side lost the message, and what each side saw.
-            for (const [name, side] of [["a", a], ["b", b]]) console.log(`private message at failure (waiting on ${page === a ? "a" : "b"}): ${name}: ${JSON.stringify(await privateState(side).catch(String))}`);
+            await explainPrivate(`private message at failure (waiting on ${page === a ? "a" : "b"})`, [["a", a], ["b", b]]);
             throw error;
           });
         } else if (tab) await page.getByRole("tab", { name: tab }).click();
-        await waitFor(() => page.locator('[data-message][data-message-verification="pending"]').count().then((n) => n === 0), "message verification complete");
-        if (await page.locator('[data-testid^="message-verification-"]').count() || await page.getByText("Signature valid", { exact: true }).count()) {
+        const verification = await settledVerificationState(page);
+        if (verification.pending || verification.flags || verification.signatureValid) {
           const diagnostic = await page.evaluate(async () => {
+            const snapshot = () => ({
+              pending: [...document.querySelectorAll('[data-message][data-message-verification="pending"]')].map(row => row.getAttribute("data-message")),
+              flags: [...document.querySelectorAll('[data-testid^="message-verification-"]')].map(mark => ({ id: mark.closest("[data-message]")?.getAttribute("data-message"), kind: mark.dataset.testid, label: mark.getAttribute("aria-label") })),
+              signatureValid: [...document.querySelectorAll('[role="tooltip"]')].map(tooltip => tooltip.textContent),
+            });
+            // Capture before asynchronous verification can finish or a new row can arrive.
+            const before = snapshot();
             const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
             const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
             const { storedKey } = await window.__gwarE2eImport("/src/state/reducer.ts");
             const { verifyMessage } = await window.__gwarE2eImport("/src/net/message-signature.ts");
             const { messageTarget } = await window.__gwarE2eImport("/src/lib/chat.ts");
-            const state = useSession.getState();
-            const key = storedKey(state, state.activeThread);
-            const uid = await controller.messageUid;
-            const messages = await Promise.all((state.threads[key]?.items ?? []).filter((i) => i.kind === "msg").map(async (i) => {
-              const target = messageTarget(key, i.msg.author_uid, uid);
-              return { id: i.msg.id, text: i.msg.text, verification: await verifyMessage(i.msg, { serverKey: controller.messageServerKey, target }) };
+            const state = useSession.getState(), key = storedKey(state, state.activeThread), uid = await controller.messageUid;
+            const messages = await Promise.all((state.threads[key]?.items ?? []).filter(item => item.kind === "msg").map(async item => {
+              const target = item.sealed?.conversation ?? messageTarget(key, item.msg.author_uid, uid);
+              const context = { serverKey: controller.messageServerKey, target, participants: key.startsWith("dm:") ? [uid, key.slice(3)] : undefined,
+                sealed: item.sealed && { group: item.sealed.group, epoch: item.sealed.epoch } };
+              return { id: item.msg.id, text: item.msg.text, verification: await verifyMessage(item.msg, context) };
             }));
-            return { serverKey: controller.messageServerKey, key, messages };
+            return { serverKey: controller.messageServerKey, key, before, after: snapshot(), messages };
           });
           const flags = await page.locator('[data-testid^="message-verification-"]').evaluateAll(marks => marks.map(mark => [mark.dataset.testid, mark.getAttribute("aria-label")]));
-          throw new Error(`valid message was flagged: ${JSON.stringify({ ...diagnostic, flags })}`);
+          await explainPrivate("verification warning", [["page", page]]);
+          throw new Error(`valid message was flagged: ${JSON.stringify({ ...diagnostic, decision: verification, flags })}`);
         }
       }
     }
@@ -2105,11 +2216,14 @@ async function main() {
   await browser.close();
 }
 
+let cleaning;
+const cleanup = () => cleaning ??= (async () => {
+  // The latency proxy has no PID; every spawned child owns a detached process group.
+  for (const child of children) if (!child.pid) child.kill();
+  await stopProcesses(children.filter(child => child.pid));
+})();
 for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => {
-    for (const c of children) c.kill();
-    process.exit(130);
-  });
+  process.on(sig, () => { void cleanup().finally(() => process.exit(130)); });
 }
 
 let failed = false;
@@ -2119,7 +2233,7 @@ try {
   console.error(e);
   failed = true;
 } finally {
-  for (const c of children) c.kill();
+  await cleanup();
 }
 const bad = results.filter((r) => !r.ok);
 console.log(`\n${results.length - bad.length}/${results.length} checks passed`);

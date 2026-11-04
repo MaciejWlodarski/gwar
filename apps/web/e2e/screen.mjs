@@ -85,16 +85,30 @@ async function waitFor(check, what, timeout = 30_000) {
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
 function devicePatch({ frequency, sources, sendCodec, receiveCodec, trace }, stamp, read, capture) {
   window.__screenTrace = [];
-  if (trace) {
+  window.__screenAudioTrace = [];
+  {
     const record = (type, data) => window.__screenTrace.push({ at: Date.now(), type, ...data });
-    window.__traceScreen = record;
+    if (trace) window.__traceScreen = record;
+    const pending = new Map();
+    const audioRecord = row => { window.__screenAudioTrace.push({ at: Date.now(), ...row }); if (window.__screenAudioTrace.length > 160) window.__screenAudioTrace.shift(); };
     window.WebSocket = new Proxy(window.WebSocket, {
       construct(target, args) {
         const socket = new target(...args);
         const inspect = (direction, data) => {
           try {
             const frame = JSON.parse(data);
-            if ((frame.ev ?? frame.op ?? "").startsWith("screen.")) record(direction, { frame });
+            if (trace && (frame.ev ?? frame.op ?? "").startsWith("screen.")) record(direction, { frame });
+            if (direction === "request" && /^(screen\.audio\.|screen\.publish\.offer)/.test(frame.op ?? "")) {
+              const row = { op: frame.op, share: frame.d?.share, stopped: frame.d?.stopped, started: Date.now() };
+              pending.set(frame.id, row);
+              if (pending.size > 64) pending.delete(pending.keys().next().value);
+              audioRecord({ direction, id: frame.id, ...row });
+            } else if (frame.re !== undefined && pending.has(frame.re)) {
+              const row = pending.get(frame.re); pending.delete(frame.re);
+              audioRecord({ direction, id: frame.re, ...row, elapsedMs: Date.now() - row.started, audio: frame.ok?.audio, error: frame.err });
+            } else if ((frame.ev ?? "").startsWith("screen.")) {
+              audioRecord({ direction, event: frame.ev, share: frame.d?.share, reason: frame.d?.reason, audio: frame.d?.audio });
+            }
           } catch { /* Not a JSON screen frame. */ }
         };
         socket.addEventListener("message", event => inspect("event", event.data));
@@ -167,7 +181,10 @@ async function soundReceived(page, share) {
 /** What a failure prints per device: each open peer connection's RTP streams and the stage's videos. */
 const diagnostics = page => page.evaluate(async () => ({
   userAgent: navigator.userAgent, platform: navigator.platform,
+  audioTrace: window.__screenAudioTrace,
+  focusState: window.__screenFocusState,
   rtp: await Promise.all(window.__pcs.filter(pc => pc.connectionState !== "closed").map(async pc => {
+    try {
     const stats = await pc.getStats();
     const codecs = {};
     const streams = [];
@@ -178,6 +195,7 @@ const diagnostics = page => page.evaluate(async () => ({
         fps: s.framesPerSecond, limitation: s.qualityLimitationReason, encoder: s.encoderImplementation, frames: s.framesDecoded ?? s.framesEncoded, keyFrames: s.keyFramesDecoded ?? s.keyFramesEncoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, size: `${s.frameWidth}x${s.frameHeight}` });
     });
     return { state: pc.connectionState, streams, offeredCodecs: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(AV1|H264|VP9|VP8)/i.test(l)), answeredCodecs: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(AV1|H264|VP9|VP8)/i.test(l)) };
+    } catch (error) { return { state: pc.connectionState, diagnosticError: String(error) }; }
   })),
   capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track).map(s => ({ kind: s.track.kind, label: s.track.label, settings: s.track.getSettings(), parameters: s.getParameters() }))),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
@@ -815,12 +833,15 @@ async function run(browsers, web, server, token) {
   // `audio` until the first answer about the share's sound, a poll a stalled page sends late.
   await waitFor(() => session(wv, (_, screen) => screen.watches.every(w => w.audio !== undefined)), "the watches know their share's sound", 10_000);
   const beforeFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
+  await wv.evaluate(state => { window.__screenFocusState = { at: Date.now(), before: state }; }, beforeFocus);
   await wv.evaluate(() => { window.__stageVideos = new Map([...document.querySelectorAll("video[data-share]")].map(v => [v.dataset.share, v])); });
   await wv.evaluate(share => document.querySelector(`video[data-share="${share}"]`).closest('[role="button"]').click(), csShare);
   await sees(wv, csShare, 1, "stage switch keeps the focused share's player rendering");
   await sees(wv, wsShare, 2, "stage switch keeps the thumbnail's player rendering");
   assert.ok(await wv.evaluate(() => [...window.__stageVideos].every(([share, video]) => document.querySelector(`video[data-share="${share}"]`) === video)), "a focus change preserves both attached media players");
-  assert.deepEqual(await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches })), beforeFocus, "a focus change keeps the transport and watches");
+  const afterFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
+  await wv.evaluate(state => { window.__screenFocusState.after = state; window.__screenFocusState.finishedAt = Date.now(); }, afterFocus);
+  assert.deepEqual(afterFocus, beforeFocus, "a focus change keeps the transport and watches");
 
   if (process.env.E2E_SCREEN_RECONNECT_ONLY === "1") {
     await reconnectAndScreenshots(cs, cv, [cv, wv], chromiumTab);

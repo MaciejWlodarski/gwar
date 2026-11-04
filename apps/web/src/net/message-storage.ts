@@ -171,6 +171,17 @@ export class MessageStorage {
   }
   /** `order`: when, among complete feed reads, this device stored the revision it returns as proven or unproven. */
   async checkpoint(key: string, next: Omit<Checkpoint, "order">, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean; order?: number }> {
+    // A view rechecks the page admission already persisted. Read those duplicates together:
+    // exclusive transactions would put every visible row ahead of the next history page.
+    const duplicate = await this.transaction(["checkpoints"], "readonly", async tx => {
+      const old = await requestValue<Checkpoint | undefined>(tx.objectStore("checkpoints").get(key));
+      if (!old || old.revision !== next.revision || old.hash !== next.hash || old.created !== next.created
+          || old.conversation !== next.conversation || (!next.deleted && old.files !== undefined && old.files !== next.files)) return;
+      return { continuity: old.proven ? "proven" as const : "unproven" as const, duplicate: true, order: old.order };
+    });
+    if (duplicate) return duplicate;
+    // A revision can change in another tab after that read. All mutation guards run again under
+    // the exclusive transaction; only an exact persisted duplicate can return above.
     return this.transaction(["checkpoints", ORDER], "readwrite", async (tx) => {
       const store = tx.objectStore("checkpoints");
       const old: Checkpoint | undefined = await requestValue(store.get(key));

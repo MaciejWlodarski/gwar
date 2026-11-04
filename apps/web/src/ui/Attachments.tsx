@@ -242,22 +242,37 @@ function AudioAttachment({ att, verified }: { att: Attachment; verified: boolean
   );
 }
 
+/** Shared file chip; unsent files use the same presentation without a download action. */
+export function AttachmentChip({ att, missing = false, detail, children }: {
+  att: Pick<Attachment, "name" | "mime"> & Partial<Pick<Attachment, "size">>;
+  missing?: boolean;
+  detail?: ReactNode;
+  children?: ReactNode;
+}) {
+  const t = useT();
+  const chip = (
+    <div data-attachment="file" data-missing={missing || undefined} tabIndex={missing ? 0 : undefined}
+      className={cn("flex w-full max-w-[400px] items-center gap-3 rounded-lg border border-line bg-side px-3 py-2.5", missing && "opacity-50")}>
+      <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">{KIND_ICON[fileKind(att.mime, att.name)]}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-medium" title={att.name}>{att.name}</span>
+        {detail ?? (att.size !== undefined && <span className="block text-xs text-subtle">{formatBytes(att.size)}</span>)}
+      </span>
+      {children}
+    </div>
+  );
+  return missing ? <Tooltip label={t("file.missing")}>{chip}</Tooltip> : chip;
+}
+
 function FileCard({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
   const { busy, run, failed } = useSave(att, verified);
   return (
-    <div data-attachment="file" className="flex w-full max-w-[400px] items-center gap-3 rounded-lg border border-line bg-side px-3 py-2.5">
-      <span className="flex size-9 shrink-0 items-center justify-center rounded-md bg-accent-soft text-accent">{KIND_ICON[fileKind(att.mime, att.name)]}</span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-sm font-medium" title={att.name}>
-          {att.name}
-        </span>
-        <span role={failed ? "alert" : undefined} className="block text-xs text-subtle">{failed ? t(att.sealed ? "file.cannotOpen" : "file.notVerified") : formatBytes(att.size)}</span>
-      </span>
+    <AttachmentChip att={att} detail={failed ? <span role="alert" className="block text-xs text-subtle">{t(att.sealed ? "file.cannotOpen" : "file.notVerified")}</span> : undefined}>
       <IconButton label={(failed && !att.sealed) || !verified ? t("file.downloadUnverifiedNamed", { name: att.name }) : t("file.downloadNamed", { name: att.name })} onClick={() => void run(failed || !verified)} disabled={busy}>
         {busy ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
       </IconButton>
-    </div>
+    </AttachmentChip>
   );
 }
 
