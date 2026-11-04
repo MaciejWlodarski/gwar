@@ -2178,7 +2178,9 @@ class Controller {
         const upload = this.uploaded.get(uploadId);
         return upload?.conn === conn && upload.att.sealed ? [structuredClone(upload.att)] : [];
       });
-      id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata,
+      // Anchor a new attempt after what is on screen now; a retry keeps the original place.
+      const after = retryId === undefined ? useSession.getState().threads[m.thread]?.items.at(-1)?.key : m.after;
+      id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata, after,
         sending: retryId === undefined, error: tNow("chat.notSent") }).id;
       this.sendAttempts.set(id, attempt);
       const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id!) === attempt && ownsView() && session === this.sendSession
