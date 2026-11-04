@@ -12,6 +12,7 @@ import type { EventName, Op } from "../net/protocol";
 import { welcome } from "../net/testing";
 import type { VoiceEngine, VoiceEvents, VoiceState } from "../voice/engine";
 import { defaultSounds } from "../sound/catalog";
+import { denoiseModels } from "../voice/denoise/model-cache";
 
 // Native file commands, recording where uploads would go (only the desktop upload test turns the app native).
 const native = vi.hoisted(() => ({ origin: null as string | null, session: null as string | null, sent: [] as Array<{ origin: string | null; bytes: Uint8Array }>, attachment: {} }));
@@ -223,6 +224,28 @@ beforeEach(() => {
 afterEach(async () => {
   vi.useRealTimers();
   await controller.disconnect(true);
+});
+
+describe("idle suppression preparation", () => {
+  it("follows login, enable/disable, reconnect and logout without waiting for voice", async () => {
+    const configure = vi.spyOn(denoiseModels, "configure");
+    const originalAudio = settings.useSettings.getState().audio;
+    const enabled = (noiseSuppression: boolean) => settings.useSettings.setState({ audio: { ...settings.useSettings.getState().audio, noiseSuppression } });
+    try {
+      enabled(false);
+      connectFake();
+      expect(configure).toHaveBeenLastCalledWith(false, true);
+      expect(engine.start).not.toHaveBeenCalled();
+      enabled(true);
+      expect(configure).toHaveBeenLastCalledWith(true, true);
+      session().dispatch({ type: "phase", phase: "reconnecting" });
+      expect(configure).toHaveBeenLastCalledWith(true, true);
+      enabled(false);
+      expect(configure).toHaveBeenLastCalledWith(false, true);
+      await controller.disconnect(true);
+      expect(configure).toHaveBeenLastCalledWith(false, false);
+    } finally { settings.useSettings.setState({ audio: originalAudio }); configure.mockRestore(); }
+  });
 });
 
 describe("sound cue wiring", () => {

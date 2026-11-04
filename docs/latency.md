@@ -1250,24 +1250,45 @@ it on costs ~36 ms in Chromium and ~85 ms in WebKit: the microphone also crosses
 into the capture context and back out as a track, a MediaStream hop the 19 ms leaves
 out.
 
-The module and the model's archive (36 MB) are downloaded the first time
-suppression is on in a call and kept in the Cache API; the archive must match its
-SHA-256 pin (`crates/gwar-denoise-wasm/model.json`), which the build checks too. The
-browser's own suppression works until the model has loaded (~1.2 s once cached),
-then the microphone is opened again without it and sent through the model. A load
-belongs to its call: ending the call, or turning suppression off, cancels it and
-releases what it holds. The model runs only while the microphone is sent: muted,
-deafened or push-to-talk released, it idles, and starts over when sending resumes.
-The capture context resumes on the next user gesture whenever it is not running
-(not yet allowed to start, or interrupted by Safari); until then the microphone is
-sent as captured.
+The module and model archive (36 MB) are downloaded and checked during idle
+preparation after login, only while own suppression is enabled. The pristine
+Worker snapshot and one fully warmed processing instance are retained across
+joins and microphone changes. The prepared AudioContext is suspended without a
+caller. Turning suppression off or logging out releases both memories; no
+persisted setting was added. See [preparation lifecycle and memory costs](denoise-preparation.md).
+A cold call can share preparation already in progress. The browser's own
+suppression remains in use until the model is ready and the microphone can be
+attached. A call cancellation retires that call's controls without cancelling
+preparation needed by another caller. Muted, deafened or push-to-talk released,
+the model idles and starts over when sending resumes. A returned processor clears
+its buffers before reuse, and every new caller gets a fresh output stream/track.
+The context resumes on the next user gesture whenever browser policy requires it.
 
-The worklet compiles the module asynchronously; building the model (~0.3 s) is the
-one step that holds the audio thread, which Firefox shares with the page's other
-48 kHz contexts, so playback there can pause once while the model loads. 200 frames
-of quiet noise then run through the model, one every other render quantum, so the
-browser compiles it fully before it counts; if the second half of them averages
-more than 5 ms a frame, the model is too slow here.
+A dedicated worker downloads the module and the archive, checks the pin and builds the
+model (~0.5 s here, 2.6 to 8 s on a saturated four-core CI runner), all off the page
+and off the audio thread (`build-worker.ts`). It then hands the worklet a copy of the
+module's memory, 2 MiB per message, so each copy step is a short task of its own; the
+module keeps all its state in its memory (`scripts/denoise-wasm/check.mjs` asserts
+that its only mutable global is the stack pointer), so the copy cleans exactly as the
+model it was copied from (`snapshot.test.ts`, bit for bit). The worklet compiles the
+module itself (Chromium hands compiled modules only to cross-origin isolated
+worklets) and runs the warm-up's first frame before the page connects its output, so
+the browser's lazy compilation of a frame's code is out of the way too.
+
+The audio thread must never be held for long: a render of the capture context waits
+for it, and in Chromium the page's main thread waits for a render when the context
+gains a stream output (`SetDetectSilenceIfNecessary` takes a lock the audio device
+holds through `Render`). Building the model on the audio thread, as before, froze the
+page for as long as the build took, right after joining voice; on CI that held the
+first watch of `screen.mjs`'s `c3-restart` past its deadline. Firefox also plays the
+page's other 48 kHz contexts on that thread. `apps/web/e2e/denoise.mjs` now fails in
+Chromium if the audio thread runs a task of 150 ms or more while the model loads
+(328 ms before this change on an M-series Mac, 31 ms after).
+
+200 frames of quiet noise run through the model during preparation: the first as
+the model lands, the rest one every other render quantum, so the browser compiles
+it fully before it counts; if the second half of them averages more than 5 ms a
+frame, the model is too slow here.
 
 While it runs, three checks, over 2 s windows; any of them two windows in a row and
 the machine is too slow for the model beside everything else on the audio thread:
@@ -1302,8 +1323,9 @@ more than 20 dB with no trouble past two windows of checks, that a voice at -20 
 over it comes through (a vowel's harmonics, pitch and loudness moving like
 speech), and that it passes as captured while the microphone is not sent
 (Chromium and WebKit locally: noise from -30 dBFS to about -80, the voice out at
-about -18, loaded in ~1.2 s; all three in the Playwright Linux image as well, loaded
-in 1.6–2.6 s). Firefox's audio contexts start only with an audio device; CI gives it
+about -18; the historical worker-built implementation loaded in ~1.9 s locally
+and 1.6–2.6 s in the Playwright Linux image). Idle-prebuilt and cold join readiness
+are measured separately ([preparation](denoise-preparation.md#validation)). Firefox's audio contexts start only with an audio device; CI gives it
 a PulseAudio null sink. Without one the capture context never runs, and the browser's
 suppression stays on.
 
