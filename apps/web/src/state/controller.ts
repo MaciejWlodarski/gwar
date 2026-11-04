@@ -2237,15 +2237,14 @@ class Controller {
         if (!sealed) return;
         const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id) === attempt && bound.current()
           && (useOutbox.getState().failed.some(f => f.id === id) || sealed.delivered(item.thread as SealedKey, item.sealed!.message_id));
-        // Recover the original ID before a fresh send can replace it, including uploads
-        // that the server already attached before its acknowledgement was lost.
+        // Recover a delivery whose acknowledgement was lost, including uploads the server
+        // already attached; a fresh send then keeps the same logical ID and creation time.
         if (fresh && await sealed.recover(item.thread as SealedKey, item.sealed.message_id, currentAttempt)) {
           bound.check(); useOutbox.getState().remove(id); return;
         }
         bound.check();
         if (!currentAttempt() || !useOutbox.getState().failed.some(f => f.id === id)) return;
-        const message = fresh ? { ...item, sealed: { message_id: encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))), created_at: Date.now() } } : item;
-        await this.deliverSealed(message, id, undefined, attempt);
+        await this.deliverSealed(item, id, undefined, attempt);
       } catch { /* Keep the existing card for another explicit attempt. */ }
       finally { if (this.sendAttempts.get(id) === attempt) this.sendAttempts.delete(id); }
       return;

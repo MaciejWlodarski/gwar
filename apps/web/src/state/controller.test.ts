@@ -2804,7 +2804,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     expect(stores.useOutbox.getState().failed).toHaveLength(1);
     await controller.retrySend(failed.id, true);
     expect(sealed.send).toHaveBeenCalledTimes(2);
-    expect((sealed.send.mock.calls as unknown as unknown[][]).at(-1)?.[5]).not.toEqual(failed.sealed);
+    expect((sealed.send.mock.calls as unknown as unknown[][]).at(-1)?.[5]).toEqual(failed.sealed);
     expect(stores.useOutbox.getState().failed).toEqual([]);
   });
 
@@ -2838,7 +2838,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     await controller.retrySend(failed.id, true);
     expect(stores.useOutbox.getState().failed).toHaveLength(1);
     expect(stores.useOutbox.getState().failed[0]).toMatchObject({ id: failed.id, session: controller.sendSession });
-    expect(stores.useOutbox.getState().failed[0]!.sealed).not.toEqual(failed.sealed);
+    expect(stores.useOutbox.getState().failed[0]!.sealed).toEqual(failed.sealed);
     let reject!: (error: Error) => void;
     sealed.send.mockImplementationOnce(() => new Promise<void>((_, fail) => { reject = fail; }));
     const sending = controller.retrySend(failed.id);

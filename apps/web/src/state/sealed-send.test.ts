@@ -146,7 +146,7 @@ it("retains the initial attempt before delivery and fences its failure after a r
   expect(request).toHaveBeenCalledTimes(1);
   request.mockImplementation(async op => op === "chat.sealed.history" ? { sealed: [] } : acknowledgement());
   await controller.retrySend(failed.id, true);
-  expect(plain.signature.message_id).not.toBe(failed.sealed?.message_id);
+  expect(plain.signature).toMatchObject({ message_id: failed.sealed?.message_id, created_at: failed.sealed?.created_at });
   expect(useOutbox.getState().failed).toEqual([]);
 });
 
@@ -164,7 +164,7 @@ it("does not repopulate a successor connection with a late send failure", async 
   expect(useOutbox.getState().failed).toEqual([]);
 });
 
-it("recovers the original attachment delivery before an explicit fresh send replaces its logical ID", async () => {
+it("recovers the original attachment delivery before an explicit fresh send", async () => {
   let stored!: Plaintext, original!: ReturnType<typeof acknowledgement>, sends = 0;
   request.mockImplementation(async op => {
     if (op === "chat.sealed.send") {
