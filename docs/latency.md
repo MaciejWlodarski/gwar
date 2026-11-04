@@ -1272,8 +1272,8 @@ module keeps all its state in its memory (`scripts/denoise-wasm/check.mjs` asser
 that its only mutable global is the stack pointer), so the copy cleans exactly as the
 model it was copied from (`snapshot.test.ts`, bit for bit). The worklet compiles the
 module itself (Chromium hands compiled modules only to cross-origin isolated
-worklets) and runs one frame before the page connects its output, so the browser's
-lazy compilation of a frame's code is out of the way too.
+worklets) and runs the warm-up's first frame before the page connects its output, so
+the browser's lazy compilation of a frame's code is out of the way too.
 
 The audio thread must never be held for long: a render of the capture context waits
 for it, and in Chromium the page's main thread waits for a render when the context
@@ -1285,12 +1285,10 @@ page's other 48 kHz contexts on that thread. `apps/web/e2e/denoise.mjs` now fail
 Chromium if the audio thread runs a task of 150 ms or more while the model loads
 (328 ms before this change on an M-series Mac, 31 ms after).
 
-200 frames of quiet noise run through the model during preparation, at most one
-per quantum. The original every-other-quantum cadence remains when frames have
-higher measured cost; average CPU below half a render quantum can use the next
-quantum too.
-This compiles the model fully before it counts; if the second half of
-them averages more than 5 ms a frame, the model is too slow here.
+200 frames of quiet noise run through the model during preparation: the first as
+the model lands, the rest one every other render quantum, so the browser compiles
+it fully before it counts; if the second half of them averages more than 5 ms a
+frame, the model is too slow here.
 
 While it runs, three checks, over 2 s windows; any of them two windows in a row and
 the machine is too slow for the model beside everything else on the audio thread:

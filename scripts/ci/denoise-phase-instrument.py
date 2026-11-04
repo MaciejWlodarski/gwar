@@ -49,14 +49,13 @@ if (root / 'build-worker.ts').exists():
         ('    if (last) return detach(id);\n', '    if (last) { _mark("sent"); return detach(id); }\n'),
     ], prefix='')
     patch('worklet.ts', [
-        ('  private receive(request: Request): void {\n', '  private mark(stage: string): void { this.port.postMessage({ type: "mark", stage: `worklet:${stage}`, at: Date.now() }); }\n  private fast = 0;\n\n  private receive(request: Request): void {\n'),
+        ('  private receive(request: Request): void {\n', '  private mark(stage: string): void { this.port.postMessage({ type: "mark", stage: `worklet:${stage}`, at: Date.now() }); }\n\n  private receive(request: Request): void {\n'),
         ('      case "code":\n', '      case "code":\n        this.mark("code");\n'),
         ('            this.loading = instance.exports as unknown as Exports;\n', '            this.loading = instance.exports as unknown as Exports;\n            this.mark("instantiated");\n'),
         ('        growMemory(this.loading!.memory, message.size);\n', '        this.mark("model");\n        growMemory(this.loading!.memory, message.size);\n'),
         ('        this.worker!.close();\n        this.worker = null;\n        this.loaded(this.loading!);', '        this.mark("copied");\n        this.worker!.close();\n        this.worker = null;\n        this.loaded(this.loading!);'),
         ('    const frame = this.noise();\n    const started = Date.now();\n    if (!this.run(frame, false)) return;\n', '    if (this.warming === WARM_UP) this.mark("warm-start");\n    const frame = this.noise();\n    const started = Date.now();\n    if (!this.run(frame, false)) return;\n'),
-        ('    const mean = this.warmUpMs / (WARM_UP / 2);\n', '    const mean = this.warmUpMs / (WARM_UP / 2);\n    this.mark(`warm-done fast=${this.fast} mean=${mean.toFixed(2)} cpu=${this.warmCpuMs}`);\n'),
-        ('(this.quanta++ % 2 === 0 || fast)) this.warmUp();', '(this.quanta++ % 2 === 0 || fast)) { if (this.quanta % 2 === 0) this.fast++; this.warmUp(); }'),
+        ('    const mean = this.warmUpMs / (WARM_UP / 2);\n', '    const mean = this.warmUpMs / (WARM_UP / 2);\n    this.mark(`warm-done mean=${mean.toFixed(2)}`);\n'),
     ], prefix='')
 else:
     # The main control: one load message, the model built on the audio thread.

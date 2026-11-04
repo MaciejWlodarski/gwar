@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Report, Request } from "./protocol";
+import type { Handover, Report, Request } from "./protocol";
 import { QUANTUM } from "./framing";
 
 interface Processor {
@@ -20,7 +20,7 @@ async function processor() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.resetModules(); });
 
 describe("worklet warm-up and ownership boundaries", () => {
-  it.each([{ ms: 0, quanta: 200, outcome: "ready" }, { ms: 1, quanta: 200, outcome: "ready" }, { ms: 2, quanta: 399, outcome: "ready" }, { ms: 3, quanta: 399, outcome: "ready" }, { ms: 6, quanta: 399, outcome: "slow" }])("runs all 200 frames at $ms ms, never twice per quantum, and retains the 5 ms budget", async ({ ms, quanta, outcome }) => {
+  it.each([{ ms: 0, outcome: "ready" }, { ms: 1, outcome: "ready" }, { ms: 2, outcome: "ready" }, { ms: 3, outcome: "ready" }, { ms: 6, outcome: "slow" }])("runs all 200 frames at $ms ms, one every other quantum, and retains the 5 ms budget", async ({ ms, outcome }) => {
       const { node, reports } = await processor();
       let clock = 0, frames = 0;
       vi.spyOn(Date, "now").mockImplementation(() => clock);
@@ -36,11 +36,45 @@ describe("worklet warm-up and ownership boundaries", () => {
         node.process([[]], output);
         expect(frames - before).toBeLessThanOrEqual(1);
       }
-      expect(rendered).toBe(quanta);
+      // Main's cadence: frames on quanta 0, 2, ..., 398.
+      expect(rendered).toBe(399);
       expect(frames).toBe(200);
       expect(reports[0]!.type).toBe(outcome);
       if (outcome === "slow") expect(reports).toEqual([{ type: "slow", reason: "6.0 ms a frame" }]);
     });
+
+  it.each([0, 1, 3])("through the whole handover, runs exactly 200 frames at %i ms: the first before the output, then one every other quantum", async ms => {
+    const { node, reports } = await processor();
+    let clock = 0, frames = 0;
+    vi.spyOn(Date, "now").mockImplementation(() => clock);
+    const buffer = new ArrayBuffer(65_536);
+    const exports = {
+      memory: { buffer, grow: vi.fn() },
+      gwar_denoise_frame: () => 0,
+      gwar_denoise_process: () => { clock += ms; frames++; return 1; },
+      gwar_denoise_reset: () => {},
+    };
+    vi.spyOn(WebAssembly, "compile").mockResolvedValue({} as WebAssembly.Module);
+    vi.spyOn(WebAssembly, "instantiate").mockResolvedValue({ exports } as unknown as WebAssembly.Instance);
+    const worker = { onmessage: null as ((event: { data: Handover }) => void) | null, postMessage: vi.fn(), close: vi.fn() };
+    node.port.onmessage({ data: { type: "load", worker: worker as unknown as MessagePort } });
+    worker.onmessage!({ data: { type: "code", code: new ArrayBuffer(8) } });
+    await vi.waitFor(() => expect(worker.postMessage).toHaveBeenCalled());
+    worker.onmessage!({ data: { type: "model", size: buffer.byteLength, denoiser: 8 } });
+    worker.onmessage!({ data: { type: "memory", offset: 0, bytes: new ArrayBuffer(buffer.byteLength) } });
+    expect(reports).toEqual([{ type: "loaded" }]);
+    expect(frames).toBe(1);
+    const output = [[new Float32Array(QUANTUM)]];
+    let rendered = 0;
+    for (; rendered < 1000 && reports.length === 1; rendered++) {
+      const before = frames;
+      node.process([[]], output);
+      expect(frames - before).toBe(rendered % 2 === 0 ? 1 : 0);
+    }
+    expect(reports.at(-1)).toEqual({ type: "ready" });
+    expect(frames).toBe(200);
+    expect(rendered).toBe(397);
+  });
 
   it("acknowledges clear only after retiring queued and partial source audio", async () => {
     const { node, reports } = await processor();

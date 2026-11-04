@@ -10,9 +10,9 @@ the Cache API keeps them for the next load.
 
 Snapshot transfer alone does not remove the worklet warm-up from joining voice.
 The same idle preparation therefore validates one processing worklet with the
-full 200-frame warm-up and existing 5 ms budget. It uses consecutive render
-quanta only when cumulative measured frame CPU stays below half a 128-sample
-quantum (1.33 ms); slower frames keep the original every-other-quantum cadence. It clears its frame/ring buffers,
+full 200-frame warm-up and existing 5 ms budget, as on main: the first frame as the
+model lands (before the page connects the output), the other 199 one every other
+render quantum. It clears its frame/ring buffers,
 stops its output track, and suspends its AudioContext before retaining it. An
 unowned prepared context does not run continuously. Joining resumes that context
 and waits for a real render-quantum acknowledgement before attaching the local

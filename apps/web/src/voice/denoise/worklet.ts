@@ -4,7 +4,7 @@
  * model is built in a worker and arrives as a copy of the module's memory (snapshot.ts): nothing
  * here takes the thread for long, so a render never waits long for it.
  */
-import { FRAME, Framing, QUANTUM } from "./framing";
+import { FRAME, Framing } from "./framing";
 import { BUDGET_MS, Pace } from "./pace";
 import type { Handover, Next, Report, Request } from "./protocol";
 import { growMemory, modelError, writeChunk } from "./snapshot";
@@ -25,9 +25,8 @@ interface Exports {
   gwar_denoise_error_len(): number;
 }
 
-/** All frames run before readiness; faster cadence requires less than half a quantum of CPU. */
+/** Frames run through the model after loading, one every other render quantum, before it counts. */
 const WARM_UP = 200;
-const WARM_QUANTUM_BUDGET_MS = (QUANTUM / 48_000) * 1000 / 2;
 class DenoiseProcessor extends AudioWorkletProcessor {
   private exports: Exports | null = null;
   /** The instance the model is being copied into, and the copy's size. */
@@ -39,8 +38,6 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   /** Warm-up frames still to run; the model cleans nothing until they have. */
   private warming = WARM_UP;
   private warmUpMs = 0;
-  private lastWarmMs = Infinity;
-  private warmCpuMs = 0;
   private quanta = 0;
   private seed = 1;
   private active = false;
@@ -141,16 +138,15 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   }
 
   /**
-   * The model is in place. One frame first, before the page makes the output: the browser
-   * compiles the functions a frame runs on their first call, on this thread.
+   * The model is in place. The warm-up's first frame runs now, before the page makes the
+   * output: the browser compiles the functions a frame runs on their first call, on this thread.
    */
   private loaded(exports: Exports): void {
     this.exports = exports;
     this.loading = null;
-    if (!this.run(this.noise(), false)) return;
-    this.report({ type: "loaded" });
+    this.warmUp();
+    if (!this.failed) this.report({ type: "loaded" });
   }
-
 
   /** Cleans `frame` in place with the model; false if it failed, the frame left as it was. */
   private run(frame: Float32Array, reset: boolean): boolean {
@@ -177,9 +173,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     const started = Date.now();
     if (!this.run(frame, false)) return;
     // The second half counts: the browser compiles the model fully while the first runs.
-    this.lastWarmMs = Date.now() - started;
-    this.warmCpuMs += this.lastWarmMs;
-    if (this.warming <= WARM_UP / 2) this.warmUpMs += this.lastWarmMs;
+    if (this.warming <= WARM_UP / 2) this.warmUpMs += Date.now() - started;
     if (--this.warming > 0) return;
     const mean = this.warmUpMs / (WARM_UP / 2);
     if (mean > BUDGET_MS) return this.report({ type: "slow", reason: `${mean.toFixed(1)} ms a frame` });
@@ -207,11 +201,9 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-    // Keep every-other-quantum cadence unless measured CPU stays below half a quantum.
-    // Date.now rounds individual frames to ms; the cumulative mean prevents rounding from
-    // repeatedly admitting an expensive frame. Always run all 200, at most one per quantum.
-    const fast = this.lastWarmMs <= Math.ceil(WARM_QUANTUM_BUDGET_MS) && this.warmCpuMs < (WARM_UP - this.warming) * WARM_QUANTUM_BUDGET_MS;
-    if (this.exports && this.warming > 0 && !this.failed && (this.quanta++ % 2 === 0 || fast)) this.warmUp();
+    // Every other quantum, so as not to take the thread over (Firefox shares it with the page's
+    // other 48 kHz contexts).
+    if (this.exports && this.warming > 0 && !this.failed && this.quanta++ % 2 === 0) this.warmUp();
     this.frameMs = null;
     const output = outputs[0]?.[0];
     if (output) this.framing.push(inputs[0]?.[0] ?? null, output);
