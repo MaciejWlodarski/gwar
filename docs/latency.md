@@ -1327,7 +1327,7 @@ speech), and that it passes as captured while the microphone is not sent
 (Chromium and WebKit locally: noise from -30 dBFS to about -80, the voice out at
 about -18; the historical worker-built implementation loaded in ~1.9 s locally
 and 1.6–2.6 s in the Playwright Linux image). Idle-prebuilt and cold join readiness
-are measured separately before accepting the prepared-runtime implementation. Firefox's audio contexts start only with an audio device; CI gives it
+are measured separately ([preparation](denoise-preparation.md#validation)). Firefox's audio contexts start only with an audio device; CI gives it
 a PulseAudio null sink. Without one the capture context never runs, and the browser's
 suppression stays on.
 
