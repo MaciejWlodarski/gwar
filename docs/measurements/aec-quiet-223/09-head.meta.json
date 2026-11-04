@@ -1,0 +1,87 @@
+{
+  "arm": "head",
+  "sha": "7699190642dc4ff737f7218a22ce1a319902c7fc",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9",
+  "binary_sha256": "071fbe3ef779d92484de1b76ec52d945e83d6eea4ddd85588b128dc7b6e42cd8",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T20:48:06.391678+00:00",
+    "load": [
+      3.02978515625,
+      3.4814453125,
+      3.40283203125
+    ],
+    "uptime": "21:48  up  9:11, 2 users, load averages: 3.03 3.48 3.40",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": false,
+  "invalid_reasons": [
+    "overlap with another cargo/test or #213 timing",
+    "overlap at end"
+  ],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T20:48:06.478495+00:00",
+    "load": [
+      3.02978515625,
+      3.4814453125,
+      3.40283203125
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 22820,
+  "test_nice": 10,
+  "exit_code": -15,
+  "after": {
+    "at": "2026-11-04T20:49:43.411943+00:00",
+    "load": [
+      2.05517578125,
+      3.01708984375,
+      3.22802734375
+    ],
+    "uptime": "21:49  up  9:13, 2 users, load averages: 2.06 3.02 3.23",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": [
+        {
+          "pid": 24111,
+          "parent": 24097,
+          "nice": 0,
+          "command": "/opt/homebrew/Cellar/rust/1.99.1/bin/cargo"
+        },
+        {
+          "pid": 24295,
+          "parent": 24111,
+          "nice": 0,
+          "command": "rustc"
+        }
+      ]
+    }
+  },
+  "peak_load_1m": 3.02978515625,
+  "pair_count": 2
+}

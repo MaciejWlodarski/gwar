@@ -1,0 +1,671 @@
+   Compiling gwar-client v0.1.2 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-client)
+    Finished `release` profile [optimized] target(s) in 1m 44s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/gwar_client-63cb5b99089087a9)
+
+running 1 test
+test voice::apm::tests::native_paired_echo_gate ... native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=0-1,current=-70.201782227,candidate=-70.202171326,delta=-0.000389099,cold=-71.058906555
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=1-2,current=-70.805114746,candidate=-70.805809021,delta=-0.000694275,cold=-71.788063049
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=2-3,current=-71.063591003,candidate=-71.069778442,delta=-0.006187439,cold=-72.122245789
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=3-4,current=-70.671585083,candidate=-70.642784119,delta=0.028800964,cold=-65.251510620
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=4-5,current=-70.887580872,candidate=-70.885955811,delta=0.001625061,cold=-65.808135986
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=5-6,current=-71.125358582,candidate=-71.105865479,delta=0.019493103,cold=-67.606094360
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=6-7,current=-71.077217102,candidate=-71.068374634,delta=0.008842468,cold=-68.857185364
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=7-8,current=-70.947135925,candidate=-70.942695618,delta=0.004440308,cold=-69.321601868
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=8-12,current=-71.281890869,candidate=-71.269332886,delta=0.012557983,cold=-70.020149231
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=12-16,current=-72.733024597,candidate=-72.727813721,delta=0.005210876,cold=-71.662719727
+native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=16-24,current=-72.365951538,candidate=-72.359748840,delta=0.006202698,cold=-72.905639648
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=0-1,current=-70.201782227,candidate=-70.202171326,delta=-0.000389099,cold=-71.058906555
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=1-2,current=-70.805114746,candidate=-70.805809021,delta=-0.000694275,cold=-71.788063049
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=2-3,current=-71.063591003,candidate=-71.069778442,delta=-0.006187439,cold=-72.122245789
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=3-4,current=-70.671585083,candidate=-70.642784119,delta=0.028800964,cold=-65.251510620
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=4-5,current=-70.887580872,candidate=-70.885955811,delta=0.001625061,cold=-65.808135986
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=5-6,current=-71.125358582,candidate=-71.105865479,delta=0.019493103,cold=-67.606094360
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=6-7,current=-71.077217102,candidate=-71.068374634,delta=0.008842468,cold=-68.857185364
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=7-8,current=-70.947135925,candidate=-70.942695618,delta=0.004440308,cold=-69.321601868
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=8-12,current=-71.281890869,candidate=-71.269332886,delta=0.012557983,cold=-70.020149231
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=12-16,current=-72.733024597,candidate=-72.727813721,delta=0.005210876,cold=-71.662719727
+native-echo-pair,mono,pin=6,far=100,delay=20,near=280,s=16-24,current=-72.365951538,candidate=-72.359748840,delta=0.006202698,cold=-72.905639648
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=0-1,current=-69.668014526,candidate=-69.669487000,delta=-0.001472473,cold=-69.693580627
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=1-2,current=-71.189422607,candidate=-71.204284668,delta=-0.014862061,cold=-71.213981628
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=2-3,current=-71.632293701,candidate=-71.634323120,delta=-0.002029419,cold=-71.757957458
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=3-4,current=-71.287162781,candidate=-71.299453735,delta=-0.012290955,cold=-60.605854034
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=4-5,current=-71.190277100,candidate=-71.178733826,delta=0.011543274,cold=-61.251216888
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=5-6,current=-71.020217896,candidate=-71.019256592,delta=0.000961304,cold=-65.818115234
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=6-7,current=-71.085617065,candidate=-71.086181641,delta=-0.000564575,cold=-68.480834961
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=7-8,current=-70.898513794,candidate=-70.899307251,delta=-0.000793457,cold=-69.134689331
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=8-12,current=-71.120651245,candidate=-71.126533508,delta=-0.005882263,cold=-69.726921082
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=12-16,current=-72.402191162,candidate=-72.403175354,delta=-0.000984192,cold=-71.279525757
+native-echo-pair,mono,pin=6,far=100,delay=60,near=180,s=16-24,current=-72.363723755,candidate=-72.359779358,delta=0.003944397,cold=-72.876068115
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=0-1,current=-69.668014526,candidate=-69.669487000,delta=-0.001472473,cold=-69.693580627
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=1-2,current=-71.189422607,candidate=-71.204284668,delta=-0.014862061,cold=-71.213981628
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=2-3,current=-71.632293701,candidate=-71.634323120,delta=-0.002029419,cold=-71.757957458
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=3-4,current=-71.287162781,candidate=-71.299453735,delta=-0.012290955,cold=-60.605854034
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=4-5,current=-71.190277100,candidate=-71.178733826,delta=0.011543274,cold=-61.251216888
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=5-6,current=-71.020217896,candidate=-71.019256592,delta=0.000961304,cold=-65.818115234
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=6-7,current=-71.085617065,candidate=-71.086181641,delta=-0.000564575,cold=-68.480834961
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=7-8,current=-70.898513794,candidate=-70.899307251,delta=-0.000793457,cold=-69.134689331
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=8-12,current=-71.120651245,candidate=-71.126533508,delta=-0.005882263,cold=-69.726921082
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=12-16,current=-72.402191162,candidate=-72.403175354,delta=-0.000984192,cold=-71.279525757
+native-echo-pair,mono,pin=6,far=100,delay=60,near=280,s=16-24,current=-72.363723755,candidate=-72.359779358,delta=0.003944397,cold=-72.876068115
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=0-1,current=-72.263954163,candidate=-72.261421204,delta=0.002532959,cold=-72.469810486
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=1-2,current=-73.072700500,candidate=-73.069252014,delta=0.003448486,cold=-73.222259521
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=2-3,current=-73.418991089,candidate=-73.376861572,delta=0.042129517,cold=-73.491302490
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=3-4,current=-72.840270996,candidate=-72.769180298,delta=0.071090698,cold=-69.269729614
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=4-5,current=-72.653694153,candidate=-72.629768372,delta=0.023925781,cold=-68.707458496
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=5-6,current=-72.644844055,candidate=-72.612800598,delta=0.032043457,cold=-70.308235168
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=6-7,current=-73.329475403,candidate=-73.314956665,delta=0.014518738,cold=-71.359451294
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=7-8,current=-73.471366882,candidate=-73.475296021,delta=-0.003929138,cold=-71.169952393
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=8-12,current=-73.037826538,candidate=-73.016349792,delta=0.021476746,cold=-71.345794678
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=12-16,current=-72.303359985,candidate=-72.285774231,delta=0.017585754,cold=-71.706787109
+native-echo-pair,mono,pin=6,far=100,delay=150,near=180,s=16-24,current=-72.073883057,candidate=-72.068893433,delta=0.004989624,cold=-72.399971008
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=0-1,current=-72.263954163,candidate=-72.261421204,delta=0.002532959,cold=-72.469810486
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=1-2,current=-73.072700500,candidate=-73.069252014,delta=0.003448486,cold=-73.222259521
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=2-3,current=-73.418991089,candidate=-73.376861572,delta=0.042129517,cold=-73.491302490
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=3-4,current=-72.840270996,candidate=-72.769180298,delta=0.071090698,cold=-69.269729614
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=4-5,current=-72.653694153,candidate=-72.629768372,delta=0.023925781,cold=-68.707458496
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=5-6,current=-72.644844055,candidate=-72.612800598,delta=0.032043457,cold=-70.308235168
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=6-7,current=-73.329475403,candidate=-73.314956665,delta=0.014518738,cold=-71.359451294
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=7-8,current=-73.471366882,candidate=-73.475296021,delta=-0.003929138,cold=-71.169952393
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=8-12,current=-73.037826538,candidate=-73.016349792,delta=0.021476746,cold=-71.345794678
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=12-16,current=-72.303359985,candidate=-72.285774231,delta=0.017585754,cold=-71.706787109
+native-echo-pair,mono,pin=6,far=100,delay=150,near=280,s=16-24,current=-72.073883057,candidate=-72.068893433,delta=0.004989624,cold=-72.399971008
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=0-1,current=-76.764663696,candidate=-76.722091675,delta=0.042572021,cold=-75.109992981
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=1-2,current=-76.967422485,candidate=-76.954292297,delta=0.013130188,cold=-75.045455933
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=2-3,current=-77.317535400,candidate=-77.316726685,delta=0.000808716,cold=-75.455947876
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=3-4,current=-76.794815063,candidate=-76.795677185,delta=-0.000862122,cold=-66.035255432
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=4-5,current=-76.516609192,candidate=-76.518493652,delta=-0.001884460,cold=-66.306190491
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=5-6,current=-76.203834534,candidate=-76.201011658,delta=0.002822876,cold=-67.483978271
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=6-7,current=-76.028472900,candidate=-75.993965149,delta=0.034507751,cold=-70.050460815
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=7-8,current=-75.953765869,candidate=-75.951652527,delta=0.002113342,cold=-73.677139282
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=8-12,current=-76.188575745,candidate=-76.180892944,delta=0.007682800,cold=-75.243972778
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=12-16,current=-75.523674011,candidate=-75.527336121,delta=-0.003662109,cold=-75.255455017
+native-echo-pair,mono,pin=6,far=150,delay=20,near=180,s=16-24,current=-74.457771301,candidate=-74.459312439,delta=-0.001541138,cold=-75.447929382
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=0-1,current=-76.764663696,candidate=-76.722091675,delta=0.042572021,cold=-75.109992981
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=1-2,current=-76.967422485,candidate=-76.954292297,delta=0.013130188,cold=-75.045455933
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=2-3,current=-77.317535400,candidate=-77.316726685,delta=0.000808716,cold=-75.455947876
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=3-4,current=-76.794815063,candidate=-76.795677185,delta=-0.000862122,cold=-66.035255432
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=4-5,current=-76.516609192,candidate=-76.518493652,delta=-0.001884460,cold=-66.306190491
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=5-6,current=-76.203834534,candidate=-76.201011658,delta=0.002822876,cold=-67.483978271
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=6-7,current=-76.028472900,candidate=-75.993965149,delta=0.034507751,cold=-70.050460815
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=7-8,current=-75.953765869,candidate=-75.951652527,delta=0.002113342,cold=-73.677139282
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=8-12,current=-76.188575745,candidate=-76.180892944,delta=0.007682800,cold=-75.243972778
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=12-16,current=-75.523674011,candidate=-75.527336121,delta=-0.003662109,cold=-75.255455017
+native-echo-pair,mono,pin=6,far=150,delay=20,near=280,s=16-24,current=-74.457771301,candidate=-74.459312439,delta=-0.001541138,cold=-75.447929382
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=0-1,current=-75.696395874,candidate=-75.622779846,delta=0.073616028,cold=-75.782157898
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=1-2,current=-75.542861938,candidate=-75.521018982,delta=0.021842957,cold=-75.600296021
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=2-3,current=-75.878540039,candidate=-75.844673157,delta=0.033866882,cold=-75.903244019
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=3-4,current=-75.375205994,candidate=-75.373695374,delta=0.001510620,cold=-64.264083862
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=4-5,current=-75.132202148,candidate=-75.137115479,delta=-0.004913330,cold=-66.925354004
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=5-6,current=-74.755165100,candidate=-74.750801086,delta=0.004364014,cold=-68.404708862
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=6-7,current=-74.645355225,candidate=-74.617240906,delta=0.028114319,cold=-69.567855835
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=7-8,current=-74.898773193,candidate=-74.897544861,delta=0.001228333,cold=-72.286132812
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=8-12,current=-76.343299866,candidate=-76.312240601,delta=0.031059265,cold=-74.248672485
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=12-16,current=-76.015075684,candidate=-76.012275696,delta=0.002799988,cold=-74.207443237
+native-echo-pair,mono,pin=6,far=150,delay=60,near=180,s=16-24,current=-74.741935730,candidate=-74.742042542,delta=-0.000106812,cold=-74.328826904
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=0-1,current=-75.696395874,candidate=-75.622779846,delta=0.073616028,cold=-75.782157898
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=1-2,current=-75.542861938,candidate=-75.521018982,delta=0.021842957,cold=-75.600296021
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=2-3,current=-75.878540039,candidate=-75.844673157,delta=0.033866882,cold=-75.903244019
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=3-4,current=-75.375205994,candidate=-75.373695374,delta=0.001510620,cold=-64.264083862
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=4-5,current=-75.132202148,candidate=-75.137115479,delta=-0.004913330,cold=-66.925354004
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=5-6,current=-74.755165100,candidate=-74.750801086,delta=0.004364014,cold=-68.404708862
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=6-7,current=-74.645355225,candidate=-74.617240906,delta=0.028114319,cold=-69.567855835
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=7-8,current=-74.898773193,candidate=-74.897544861,delta=0.001228333,cold=-72.286132812
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=8-12,current=-76.343299866,candidate=-76.312240601,delta=0.031059265,cold=-74.248672485
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=12-16,current=-76.015075684,candidate=-76.012275696,delta=0.002799988,cold=-74.207443237
+native-echo-pair,mono,pin=6,far=150,delay=60,near=280,s=16-24,current=-74.741935730,candidate=-74.742042542,delta=-0.000106812,cold=-74.328826904
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=0-1,current=-80.541160583,candidate=-80.233291626,delta=0.307868958,cold=-79.176002502
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=1-2,current=-81.314231873,candidate=-81.188423157,delta=0.125808716,cold=-79.420463562
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=2-3,current=-82.426528931,candidate=-82.426155090,delta=0.000373840,cold=-80.055099487
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=3-4,current=-82.048278809,candidate=-82.048728943,delta=-0.000450134,cold=-70.268814087
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=4-5,current=-81.780838013,candidate=-81.534469604,delta=0.246368408,cold=-72.234558105
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=5-6,current=-81.514343262,candidate=-81.504249573,delta=0.010093689,cold=-74.351203918
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=6-7,current=-81.323097229,candidate=-81.293418884,delta=0.029678345,cold=-75.481575012
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=7-8,current=-81.156547546,candidate=-81.141586304,delta=0.014961243,cold=-77.804351807
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=8-12,current=-80.920272827,candidate=-80.834335327,delta=0.085937500,cold=-80.227958679
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=12-16,current=-80.278076172,candidate=-80.278251648,delta=-0.000175476,cold=-81.566307068
+native-echo-pair,mono,pin=6,far=150,delay=150,near=180,s=16-24,current=-79.179183960,candidate=-79.173133850,delta=0.006050110,cold=-80.515983582
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=0-1,current=-80.541160583,candidate=-80.233291626,delta=0.307868958,cold=-79.176002502
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=1-2,current=-81.314231873,candidate=-81.188423157,delta=0.125808716,cold=-79.420463562
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=2-3,current=-82.426528931,candidate=-82.426155090,delta=0.000373840,cold=-80.055099487
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=3-4,current=-82.048278809,candidate=-82.048728943,delta=-0.000450134,cold=-70.268814087
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=4-5,current=-81.780838013,candidate=-81.534469604,delta=0.246368408,cold=-72.234558105
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=5-6,current=-81.514343262,candidate=-81.504249573,delta=0.010093689,cold=-74.351203918
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=6-7,current=-81.323097229,candidate=-81.293418884,delta=0.029678345,cold=-75.481575012
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=7-8,current=-81.156547546,candidate=-81.141586304,delta=0.014961243,cold=-77.804351807
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=8-12,current=-80.920272827,candidate=-80.834335327,delta=0.085937500,cold=-80.227958679
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=12-16,current=-80.278076172,candidate=-80.278251648,delta=-0.000175476,cold=-81.566307068
+native-echo-pair,mono,pin=6,far=150,delay=150,near=280,s=16-24,current=-79.179183960,candidate=-79.173133850,delta=0.006050110,cold=-80.515983582
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=0-1,current=-40.199779510,candidate=-40.184818268,delta=0.014961243,cold=-38.823299408
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=1-2,current=-39.009738922,candidate=-39.007293701,delta=0.002445221,cold=-37.470508575
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=2-3,current=-42.077873230,candidate=-42.048530579,delta=0.029342651,cold=-40.381370544
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=3-4,current=-42.726482391,candidate=-42.675621033,delta=0.050861359,cold=-45.500888824
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=4-5,current=-43.751140594,candidate=-43.738552094,delta=0.012588501,cold=-41.306415558
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=5-6,current=-48.884063721,candidate=-48.537448883,delta=0.346614838,cold=-42.665878296
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=6-7,current=-43.341476440,candidate=-43.330326080,delta=0.011150360,cold=-42.890586853
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=7-8,current=-42.789726257,candidate=-42.786975861,delta=0.002750397,cold=-41.497695923
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=8-12,current=-44.530261993,candidate=-44.468994141,delta=0.061267853,cold=-42.779766083
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=12-16,current=-50.232406616,candidate=-50.110584259,delta=0.121822357,cold=-48.046211243
+native-echo-pair,mono,pin=6,far=230,delay=20,near=180,s=16-24,current=-55.188247681,candidate=-55.124629974,delta=0.063617706,cold=-50.244270325
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=0-1,current=-40.199779510,candidate=-40.184818268,delta=0.014961243,cold=-38.823299408
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=1-2,current=-39.009738922,candidate=-39.007293701,delta=0.002445221,cold=-37.470508575
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=2-3,current=-42.077873230,candidate=-42.048530579,delta=0.029342651,cold=-40.381370544
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=3-4,current=-42.726482391,candidate=-42.675621033,delta=0.050861359,cold=-45.500888824
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=4-5,current=-43.751140594,candidate=-43.738552094,delta=0.012588501,cold=-41.306415558
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=5-6,current=-48.884063721,candidate=-48.537448883,delta=0.346614838,cold=-42.665878296
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=6-7,current=-43.341476440,candidate=-43.330326080,delta=0.011150360,cold=-42.890586853
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=7-8,current=-42.789726257,candidate=-42.786975861,delta=0.002750397,cold=-41.497695923
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=8-12,current=-44.530261993,candidate=-44.468994141,delta=0.061267853,cold=-42.779766083
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=12-16,current=-50.232406616,candidate=-50.110584259,delta=0.121822357,cold=-48.046211243
+native-echo-pair,mono,pin=6,far=230,delay=20,near=280,s=16-24,current=-55.188247681,candidate=-55.124629974,delta=0.063617706,cold=-50.244270325
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=0-1,current=-40.300895691,candidate=-40.259952545,delta=0.040943146,cold=-38.853343964
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=1-2,current=-39.314689636,candidate=-39.306297302,delta=0.008392334,cold=-37.552692413
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=2-3,current=-42.097972870,candidate=-42.079261780,delta=0.018711090,cold=-40.328170776
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=3-4,current=-42.993164062,candidate=-42.771881104,delta=0.221282959,cold=-44.993976593
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=4-5,current=-43.566307068,candidate=-43.542533875,delta=0.023773193,cold=-41.021781921
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=5-6,current=-51.280349731,candidate=-50.849132538,delta=0.431217194,cold=-42.382854462
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=6-7,current=-42.781356812,candidate=-42.773021698,delta=0.008335114,cold=-41.921901703
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=7-8,current=-41.887680054,candidate=-41.874481201,delta=0.013198853,cold=-41.070972443
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=8-12,current=-44.051666260,candidate=-44.037918091,delta=0.013748169,cold=-42.647323608
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=12-16,current=-50.013320923,candidate=-49.844726562,delta=0.168594360,cold=-48.219429016
+native-echo-pair,mono,pin=6,far=230,delay=60,near=180,s=16-24,current=-56.284107208,candidate=-56.277290344,delta=0.006816864,cold=-49.612506866
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=0-1,current=-40.300895691,candidate=-40.259952545,delta=0.040943146,cold=-38.853343964
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=1-2,current=-39.314689636,candidate=-39.306297302,delta=0.008392334,cold=-37.552692413
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=2-3,current=-42.097972870,candidate=-42.079261780,delta=0.018711090,cold=-40.328170776
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=3-4,current=-42.993164062,candidate=-42.771881104,delta=0.221282959,cold=-44.993976593
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=4-5,current=-43.566307068,candidate=-43.542533875,delta=0.023773193,cold=-41.021781921
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=5-6,current=-51.280349731,candidate=-50.849132538,delta=0.431217194,cold=-42.382854462
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=6-7,current=-42.781356812,candidate=-42.773021698,delta=0.008335114,cold=-41.921901703
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=7-8,current=-41.887680054,candidate=-41.874481201,delta=0.013198853,cold=-41.070972443
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=8-12,current=-44.051666260,candidate=-44.037918091,delta=0.013748169,cold=-42.647323608
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=12-16,current=-50.013320923,candidate=-49.844726562,delta=0.168594360,cold=-48.219429016
+native-echo-pair,mono,pin=6,far=230,delay=60,near=280,s=16-24,current=-56.284107208,candidate=-56.277290344,delta=0.006816864,cold=-49.612506866
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=0-1,current=-46.331447601,candidate=-46.308971405,delta=0.022476196,cold=-44.635013580
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=1-2,current=-46.739574432,candidate=-46.673126221,delta=0.066448212,cold=-44.865386963
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=2-3,current=-43.499530792,candidate=-43.471088409,delta=0.028442383,cold=-42.320953369
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=3-4,current=-48.121738434,candidate=-47.976516724,delta=0.145221710,cold=-43.343078613
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=4-5,current=-54.574310303,candidate=-54.521209717,delta=0.053100586,cold=-44.324859619
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=5-6,current=-46.758789062,candidate=-46.703269958,delta=0.055519104,cold=-42.958404541
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=6-7,current=-52.200702667,candidate=-52.124729156,delta=0.075973511,cold=-44.238285065
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=7-8,current=-54.107250214,candidate=-54.057342529,delta=0.049907684,cold=-46.711891174
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=8-12,current=-55.422256470,candidate=-55.010963440,delta=0.411293030,cold=-46.898075104
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=12-16,current=-61.802463531,candidate=-61.701412201,delta=0.101051331,cold=-49.776226044
+native-echo-pair,mono,pin=6,far=230,delay=150,near=180,s=16-24,current=-62.375991821,candidate=-62.327331543,delta=0.048660278,cold=-52.231594086
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=0-1,current=-46.331447601,candidate=-46.308971405,delta=0.022476196,cold=-44.635013580
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=1-2,current=-46.739574432,candidate=-46.673126221,delta=0.066448212,cold=-44.865386963
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=2-3,current=-43.499530792,candidate=-43.471088409,delta=0.028442383,cold=-42.320953369
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=3-4,current=-48.121738434,candidate=-47.976516724,delta=0.145221710,cold=-43.343078613
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=4-5,current=-54.574310303,candidate=-54.521209717,delta=0.053100586,cold=-44.324859619
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=5-6,current=-46.758789062,candidate=-46.703269958,delta=0.055519104,cold=-42.958404541
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=6-7,current=-52.200702667,candidate=-52.124729156,delta=0.075973511,cold=-44.238285065
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=7-8,current=-54.107250214,candidate=-54.057342529,delta=0.049907684,cold=-46.711891174
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=8-12,current=-55.422256470,candidate=-55.010963440,delta=0.411293030,cold=-46.898075104
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=12-16,current=-61.802463531,candidate=-61.701412201,delta=0.101051331,cold=-49.776226044
+native-echo-pair,mono,pin=6,far=230,delay=150,near=280,s=16-24,current=-62.375991821,candidate=-62.327331543,delta=0.048660278,cold=-52.231594086
+pin 6 echo 0-1 s: stay -62.8 cold -62.8 warm -63.6, worst room 0.0/0.9 dB, loudest -38.8/-40.2
+pin 6 echo 1-2 s: stay -62.9 cold -62.9 warm -63.8, worst room 0.0/1.0 dB, loudest -37.5/-39.0
+pin 6 echo 2-3 s: stay -63.5 cold -63.5 warm -64.4, worst room 0.0/1.1 dB, loudest -40.3/-42.1
+pin 6 echo 3-4 s: stay -63.6 cold -58.8 warm -64.8, worst room 11.1/1.2 dB, loudest -43.3/-42.7
+pin 6 echo 4-5 s: stay -63.3 cold -58.7 warm -65.6, worst room 10.1/1.1 dB, loudest -41.0/-43.6
+pin 6 echo 5-6 s: stay -64.3 cold -60.2 warm -66.0, worst room 6.8/0.9 dB, loudest -42.4/-46.8
+pin 6 echo 6-7 s: stay -64.0 cold -61.4 warm -65.1, worst room 5.1/0.9 dB, loudest -41.9/-42.8
+pin 6 echo 7-8 s: stay -64.0 cold -62.5 warm -65.1, worst room 2.6/0.9 dB, loudest -41.1/-41.9
+pin 6 echo 8-12 s: stay -65.0 cold -63.7 warm -65.9, worst room 4.0/0.6 dB, loudest -42.6/-44.1
+pin 6 echo 12-16 s: stay -66.7 cold -65.7 warm -67.9, worst room 8.6/0.3 dB, loudest -48.0/-50.0
+pin 6 echo 16-24 s: stay -66.4 cold -66.7 warm -68.8, worst room 2.5/0.1 dB, loudest -49.6/-55.2
+pin 6 level 0-1 s: stay -25.8 cold -25.8 warm -25.8, worst room 0.0/0.7 dB, loudest -24.5/-24.5
+pin 6 level 1-2 s: stay -25.2 cold -25.2 warm -25.4, worst room 0.0/0.5 dB, loudest -24.0/-24.0
+pin 6 level 2-3 s: stay -26.3 cold -26.3 warm -26.5, worst room 0.0/1.5 dB, loudest -24.9/-24.9
+pin 6 level 3-4 s: stay -26.2 cold -27.3 warm -26.7, worst room 4.5/3.8 dB, loudest -24.0/-25.2
+pin 6 level 4-5 s: stay -25.2 cold -26.2 warm -25.8, worst room 5.8/4.0 dB, loudest -22.9/-24.4
+pin 6 level 5-6 s: stay -26.2 cold -27.0 warm -26.5, worst room 6.0/4.7 dB, loudest -24.0/-24.7
+pin 6 level 6-7 s: stay -26.3 cold -28.4 warm -26.7, worst room 17.3/2.5 dB, loudest -24.0/-25.0
+pin 6 level 7-8 s: stay -25.5 cold -27.7 warm -26.3, worst room 10.2/4.8 dB, loudest -23.6/-24.5
+pin 6 level 8-12 s: stay -25.8 cold -26.4 warm -26.1, worst room 2.4/2.4 dB, loudest -23.7/-24.7
+pin 6 level 12-16 s: stay -25.9 cold -26.9 warm -26.3, worst room 5.5/3.1 dB, loudest -23.8/-24.6
+pin 6 level 16-24 s: stay -25.9 cold -26.2 warm -26.1, worst room 3.6/2.3 dB, loudest -24.3/-24.5
+pin 6 kept beside wide share 0-1 s: stay -8.1 cold -7.9 warm -8.5, worst room 0.6/1.6 dB, loudest -5.9/-6.0
+pin 6 kept beside wide share 1-2 s: stay -8.1 cold -7.9 warm -8.9, worst room 1.9/3.3 dB, loudest -6.2/-6.2
+pin 6 kept beside wide share 2-3 s: stay -8.4 cold -8.2 warm -9.8, worst room 3.3/9.3 dB, loudest -6.1/-6.1
+pin 6 kept beside wide share 3-4 s: stay -8.2 cold -12.6 warm -11.3, worst room 10.2/9.1 dB, loudest -5.3/-6.0
+pin 6 kept beside wide share 4-5 s: stay -7.6 cold -13.0 warm -11.7, worst room 21.8/18.8 dB, loudest -4.8/-5.6
+pin 6 kept beside wide share 5-6 s: stay -8.7 cold -14.0 warm -11.8, worst room 23.5/9.2 dB, loudest -5.6/-7.2
+pin 6 kept beside wide share 6-7 s: stay -8.4 cold -16.0 warm -12.4, worst room 24.6/18.9 dB, loudest -5.5/-7.2
+pin 6 kept beside wide share 7-8 s: stay -8.1 cold -12.4 warm -11.1, worst room 16.7/10.5 dB, loudest -5.8/-6.9
+pin 6 kept beside wide share 8-12 s: stay -8.1 cold -14.0 warm -11.3, worst room 24.6/20.4 dB, loudest -5.5/-6.7
+pin 6 kept beside wide share 12-16 s: stay -8.1 cold -13.3 warm -11.3, worst room 23.6/23.6 dB, loudest -5.6/-6.6
+pin 6 kept beside wide share 16-24 s: stay -8.1 cold -12.5 warm -9.9, worst room 21.9/9.9 dB, loudest -5.9/-6.6
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=0-1,current=-72.758171082,candidate=-72.758895874,delta=-0.000724792,cold=-72.874931335
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=1-2,current=-72.552757263,candidate=-72.545150757,delta=0.007606506,cold=-72.607963562
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=2-3,current=-72.643714905,candidate=-72.642456055,delta=0.001258850,cold=-72.585533142
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=3-4,current=-72.330368042,candidate=-72.326637268,delta=0.003730774,cold=-66.447875977
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=4-5,current=-72.380645752,candidate=-72.373184204,delta=0.007461548,cold=-66.266014099
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=5-6,current=-71.817062378,candidate=-71.821792603,delta=-0.004730225,cold=-68.461181641
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=6-7,current=-72.448226929,candidate=-72.445663452,delta=0.002563477,cold=-68.913482666
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=7-8,current=-72.497474670,candidate=-72.487396240,delta=0.010078430,cold=-71.410987854
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=8-12,current=-73.110778809,candidate=-73.091285706,delta=0.019493103,cold=-73.098373413
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=12-16,current=-75.751815796,candidate=-75.724082947,delta=0.027732849,cold=-74.012023926
+native-echo-pair,mono,pin=20,far=100,delay=20,near=180,s=16-24,current=-75.246177673,candidate=-75.236167908,delta=0.010009766,cold=-74.145523071
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=0-1,current=-72.758171082,candidate=-72.758895874,delta=-0.000724792,cold=-72.874931335
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=1-2,current=-72.552757263,candidate=-72.545150757,delta=0.007606506,cold=-72.607963562
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=2-3,current=-72.643714905,candidate=-72.642456055,delta=0.001258850,cold=-72.585533142
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=3-4,current=-72.330368042,candidate=-72.326637268,delta=0.003730774,cold=-66.447875977
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=4-5,current=-72.380645752,candidate=-72.373184204,delta=0.007461548,cold=-66.266014099
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=5-6,current=-71.817062378,candidate=-71.821792603,delta=-0.004730225,cold=-68.461181641
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=6-7,current=-72.448226929,candidate=-72.445663452,delta=0.002563477,cold=-68.913482666
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=7-8,current=-72.497474670,candidate=-72.487396240,delta=0.010078430,cold=-71.410987854
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=8-12,current=-73.110778809,candidate=-73.091285706,delta=0.019493103,cold=-73.098373413
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=12-16,current=-75.751815796,candidate=-75.724082947,delta=0.027732849,cold=-74.012023926
+native-echo-pair,mono,pin=20,far=100,delay=20,near=280,s=16-24,current=-75.246177673,candidate=-75.236167908,delta=0.010009766,cold=-74.145523071
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=0-1,current=-72.706481934,candidate=-72.707916260,delta=-0.001434326,cold=-73.005752563
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=1-2,current=-72.519966125,candidate=-72.523262024,delta=-0.003295898,cold=-72.805068970
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=2-3,current=-72.503044128,candidate=-72.508399963,delta=-0.005355835,cold=-72.782623291
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=3-4,current=-72.141128540,candidate=-72.138839722,delta=0.002288818,cold=-60.702899933
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=4-5,current=-72.314529419,candidate=-72.319091797,delta=-0.004562378,cold=-62.312164307
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=5-6,current=-71.767875671,candidate=-71.739242554,delta=0.028633118,cold=-66.826019287
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=6-7,current=-72.600067139,candidate=-72.611175537,delta=-0.011108398,cold=-67.628890991
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=7-8,current=-72.732292175,candidate=-72.728187561,delta=0.004104614,cold=-70.343887329
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=8-12,current=-73.228210449,candidate=-73.211181641,delta=0.017028809,cold=-72.335525513
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=12-16,current=-75.855606079,candidate=-75.824050903,delta=0.031555176,cold=-73.224731445
+native-echo-pair,mono,pin=20,far=100,delay=60,near=180,s=16-24,current=-75.227821350,candidate=-75.218017578,delta=0.009803772,cold=-73.947631836
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=0-1,current=-72.706481934,candidate=-72.707916260,delta=-0.001434326,cold=-73.005752563
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=1-2,current=-72.519966125,candidate=-72.523262024,delta=-0.003295898,cold=-72.805068970
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=2-3,current=-72.503044128,candidate=-72.508399963,delta=-0.005355835,cold=-72.782623291
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=3-4,current=-72.141128540,candidate=-72.138839722,delta=0.002288818,cold=-60.702899933
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=4-5,current=-72.314529419,candidate=-72.319091797,delta=-0.004562378,cold=-62.312164307
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=5-6,current=-71.767875671,candidate=-71.739242554,delta=0.028633118,cold=-66.826019287
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=6-7,current=-72.600067139,candidate=-72.611175537,delta=-0.011108398,cold=-67.628890991
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=7-8,current=-72.732292175,candidate=-72.728187561,delta=0.004104614,cold=-70.343887329
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=8-12,current=-73.228210449,candidate=-73.211181641,delta=0.017028809,cold=-72.335525513
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=12-16,current=-75.855606079,candidate=-75.824050903,delta=0.031555176,cold=-73.224731445
+native-echo-pair,mono,pin=20,far=100,delay=60,near=280,s=16-24,current=-75.227821350,candidate=-75.218017578,delta=0.009803772,cold=-73.947631836
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=0-1,current=-72.096359253,candidate=-72.077323914,delta=0.019035339,cold=-71.950210571
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=1-2,current=-71.975059509,candidate=-71.963653564,delta=0.011405945,cold=-71.781036377
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=2-3,current=-72.008827209,candidate=-72.019989014,delta=-0.011161804,cold=-71.865188599
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=3-4,current=-71.685997009,candidate=-71.690307617,delta=-0.004310608,cold=-68.673454285
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=4-5,current=-72.507797241,candidate=-72.501617432,delta=0.006179810,cold=-69.486022949
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=5-6,current=-71.966979980,candidate=-71.948219299,delta=0.018760681,cold=-70.601097107
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=6-7,current=-72.153747559,candidate=-72.155929565,delta=-0.002182007,cold=-71.974601746
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=7-8,current=-71.979591370,candidate=-71.977333069,delta=0.002258301,cold=-72.125579834
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=8-12,current=-73.052665710,candidate=-73.040534973,delta=0.012130737,cold=-73.376953125
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=12-16,current=-75.177467346,candidate=-75.148223877,delta=0.029243469,cold=-75.782600403
+native-echo-pair,mono,pin=20,far=100,delay=150,near=180,s=16-24,current=-74.648353577,candidate=-74.622001648,delta=0.026351929,cold=-75.055244446
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=0-1,current=-72.096359253,candidate=-72.077323914,delta=0.019035339,cold=-71.950210571
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=1-2,current=-71.975059509,candidate=-71.963653564,delta=0.011405945,cold=-71.781036377
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=2-3,current=-72.008827209,candidate=-72.019989014,delta=-0.011161804,cold=-71.865188599
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=3-4,current=-71.685997009,candidate=-71.690307617,delta=-0.004310608,cold=-68.673454285
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=4-5,current=-72.507797241,candidate=-72.501617432,delta=0.006179810,cold=-69.486022949
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=5-6,current=-71.966979980,candidate=-71.948219299,delta=0.018760681,cold=-70.601097107
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=6-7,current=-72.153747559,candidate=-72.155929565,delta=-0.002182007,cold=-71.974601746
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=7-8,current=-71.979591370,candidate=-71.977333069,delta=0.002258301,cold=-72.125579834
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=8-12,current=-73.052665710,candidate=-73.040534973,delta=0.012130737,cold=-73.376953125
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=12-16,current=-75.177467346,candidate=-75.148223877,delta=0.029243469,cold=-75.782600403
+native-echo-pair,mono,pin=20,far=100,delay=150,near=280,s=16-24,current=-74.648353577,candidate=-74.622001648,delta=0.026351929,cold=-75.055244446
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=0-1,current=-75.343017578,candidate=-75.348014832,delta=-0.004997253,cold=-75.439788818
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=1-2,current=-75.165695190,candidate=-75.167602539,delta=-0.001907349,cold=-75.232315063
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=2-3,current=-75.060630798,candidate=-75.062446594,delta=-0.001815796,cold=-75.089561462
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=3-4,current=-74.712059021,candidate=-74.706504822,delta=0.005554199,cold=-64.814865112
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=4-5,current=-74.731353760,candidate=-74.724792480,delta=0.006561279,cold=-68.215133667
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=5-6,current=-74.225296021,candidate=-74.233261108,delta=-0.007965088,cold=-73.318168640
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=6-7,current=-74.438850403,candidate=-74.439559937,delta=-0.000709534,cold=-75.776000977
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=7-8,current=-74.151550293,candidate=-74.161140442,delta=-0.009590149,cold=-76.629325867
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=8-12,current=-74.304946899,candidate=-74.307678223,delta=-0.002731323,cold=-79.050949097
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=12-16,current=-73.539497375,candidate=-73.524505615,delta=0.014991760,cold=-78.714744568
+native-echo-pair,mono,pin=20,far=150,delay=20,near=180,s=16-24,current=-72.881065369,candidate=-72.815521240,delta=0.065544128,cold=-77.955848694
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=0-1,current=-75.343017578,candidate=-75.348014832,delta=-0.004997253,cold=-75.439788818
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=1-2,current=-75.165695190,candidate=-75.167602539,delta=-0.001907349,cold=-75.232315063
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=2-3,current=-75.060630798,candidate=-75.062446594,delta=-0.001815796,cold=-75.089561462
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=3-4,current=-74.712059021,candidate=-74.706504822,delta=0.005554199,cold=-64.814865112
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=4-5,current=-74.731353760,candidate=-74.724792480,delta=0.006561279,cold=-68.215133667
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=5-6,current=-74.225296021,candidate=-74.233261108,delta=-0.007965088,cold=-73.318168640
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=6-7,current=-74.438850403,candidate=-74.439559937,delta=-0.000709534,cold=-75.776000977
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=7-8,current=-74.151550293,candidate=-74.161140442,delta=-0.009590149,cold=-76.629325867
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=8-12,current=-74.304946899,candidate=-74.307678223,delta=-0.002731323,cold=-79.050949097
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=12-16,current=-73.539497375,candidate=-73.524505615,delta=0.014991760,cold=-78.714744568
+native-echo-pair,mono,pin=20,far=150,delay=20,near=280,s=16-24,current=-72.881065369,candidate=-72.815521240,delta=0.065544128,cold=-77.955848694
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=0-1,current=-75.815422058,candidate=-75.803962708,delta=0.011459351,cold=-75.846755981
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=1-2,current=-75.625450134,candidate=-75.626167297,delta=-0.000717163,cold=-75.656059265
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=2-3,current=-75.501152039,candidate=-75.500732422,delta=0.000419617,cold=-75.528198242
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=3-4,current=-75.140502930,candidate=-75.138084412,delta=0.002418518,cold=-65.439453125
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=4-5,current=-75.142395020,candidate=-75.148651123,delta=-0.006256104,cold=-67.887680054
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=5-6,current=-74.621360779,candidate=-74.625671387,delta=-0.004310608,cold=-71.526268005
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=6-7,current=-74.752166748,candidate=-74.755867004,delta=-0.003700256,cold=-73.737266541
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=7-8,current=-74.436355591,candidate=-74.430564880,delta=0.005790710,cold=-74.444030762
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=8-12,current=-74.225685120,candidate=-74.222785950,delta=0.002899170,cold=-75.543357849
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=12-16,current=-73.374343872,candidate=-73.348876953,delta=0.025466919,cold=-74.783599854
+native-echo-pair,mono,pin=20,far=150,delay=60,near=180,s=16-24,current=-72.248229980,candidate=-71.939765930,delta=0.308464050,cold=-74.018989563
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=0-1,current=-75.815422058,candidate=-75.803962708,delta=0.011459351,cold=-75.846755981
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=1-2,current=-75.625450134,candidate=-75.626167297,delta=-0.000717163,cold=-75.656059265
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=2-3,current=-75.501152039,candidate=-75.500732422,delta=0.000419617,cold=-75.528198242
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=3-4,current=-75.140502930,candidate=-75.138084412,delta=0.002418518,cold=-65.439453125
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=4-5,current=-75.142395020,candidate=-75.148651123,delta=-0.006256104,cold=-67.887680054
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=5-6,current=-74.621360779,candidate=-74.625671387,delta=-0.004310608,cold=-71.526268005
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=6-7,current=-74.752166748,candidate=-74.755867004,delta=-0.003700256,cold=-73.737266541
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=7-8,current=-74.436355591,candidate=-74.430564880,delta=0.005790710,cold=-74.444030762
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=8-12,current=-74.225685120,candidate=-74.222785950,delta=0.002899170,cold=-75.543357849
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=12-16,current=-73.374343872,candidate=-73.348876953,delta=0.025466919,cold=-74.783599854
+native-echo-pair,mono,pin=20,far=150,delay=60,near=280,s=16-24,current=-72.248229980,candidate=-71.939765930,delta=0.308464050,cold=-74.018989563
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=0-1,current=-80.043800354,candidate=-80.041687012,delta=0.002113342,cold=-79.801071167
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=1-2,current=-79.912963867,candidate=-79.914741516,delta=-0.001777649,cold=-79.631225586
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=2-3,current=-79.835655212,candidate=-79.838394165,delta=-0.002738953,cold=-79.523460388
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=3-4,current=-79.480010986,candidate=-79.484855652,delta=-0.004844666,cold=-67.521583557
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=4-5,current=-79.492774963,candidate=-79.485504150,delta=0.007270813,cold=-69.763618469
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=5-6,current=-78.947937012,candidate=-78.942657471,delta=0.005279541,cold=-72.420593262
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=6-7,current=-79.184944153,candidate=-79.183738708,delta=0.001205444,cold=-73.750259399
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=7-8,current=-79.109970093,candidate=-79.076789856,delta=0.033180237,cold=-75.150062561
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=8-12,current=-78.602210999,candidate=-78.600067139,delta=0.002143860,cold=-76.524139404
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=12-16,current=-77.655982971,candidate=-77.537353516,delta=0.118629456,cold=-75.792221069
+native-echo-pair,mono,pin=20,far=150,delay=150,near=180,s=16-24,current=-76.506347656,candidate=-76.434829712,delta=0.071517944,cold=-74.650924683
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=0-1,current=-80.043800354,candidate=-80.041687012,delta=0.002113342,cold=-79.801071167
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=1-2,current=-79.912963867,candidate=-79.914741516,delta=-0.001777649,cold=-79.631225586
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=2-3,current=-79.835655212,candidate=-79.838394165,delta=-0.002738953,cold=-79.523460388
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=3-4,current=-79.480010986,candidate=-79.484855652,delta=-0.004844666,cold=-67.521583557
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=4-5,current=-79.492774963,candidate=-79.485504150,delta=0.007270813,cold=-69.763618469
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=5-6,current=-78.947937012,candidate=-78.942657471,delta=0.005279541,cold=-72.420593262
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=6-7,current=-79.184944153,candidate=-79.183738708,delta=0.001205444,cold=-73.750259399
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=7-8,current=-79.109970093,candidate=-79.076789856,delta=0.033180237,cold=-75.150062561
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=8-12,current=-78.602210999,candidate=-78.600067139,delta=0.002143860,cold=-76.524139404
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=12-16,current=-77.655982971,candidate=-77.537353516,delta=0.118629456,cold=-75.792221069
+native-echo-pair,mono,pin=20,far=150,delay=150,near=280,s=16-24,current=-76.506347656,candidate=-76.434829712,delta=0.071517944,cold=-74.650924683
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=0-1,current=-50.810947418,candidate=-50.557891846,delta=0.253055573,cold=-44.417186737
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=1-2,current=-56.069522858,candidate=-56.026187897,delta=0.043334961,cold=-53.229370117
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=2-3,current=-54.615478516,candidate=-54.587234497,delta=0.028244019,cold=-51.014526367
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=3-4,current=-54.576698303,candidate=-54.564167023,delta=0.012531281,cold=-40.884227753
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=4-5,current=-50.127029419,candidate=-50.120262146,delta=0.006767273,cold=-39.775642395
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=5-6,current=-55.500911713,candidate=-55.446704865,delta=0.054206848,cold=-44.313316345
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=6-7,current=-57.450050354,candidate=-57.371524811,delta=0.078525543,cold=-52.058559418
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=7-8,current=-62.157066345,candidate=-60.696693420,delta=1.460372925,cold=-55.193916321
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=8-12,current=-54.127532959,candidate=-53.554695129,delta=0.572837830,cold=-45.937881470
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=12-16,current=-49.970657349,candidate=-49.909294128,delta=0.061363220,cold=-60.332244873
+native-echo-pair,mono,pin=20,far=230,delay=20,near=180,s=16-24,current=-51.280143738,candidate=-51.233348846,delta=0.046794891,cold=-49.219383240
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=0-1,current=-50.810947418,candidate=-50.557891846,delta=0.253055573,cold=-44.417186737
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=1-2,current=-56.069522858,candidate=-56.026187897,delta=0.043334961,cold=-53.229370117
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=2-3,current=-54.615478516,candidate=-54.587234497,delta=0.028244019,cold=-51.014526367
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=3-4,current=-54.576698303,candidate=-54.564167023,delta=0.012531281,cold=-40.884227753
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=4-5,current=-50.127029419,candidate=-50.120262146,delta=0.006767273,cold=-39.775642395
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=5-6,current=-55.500911713,candidate=-55.446704865,delta=0.054206848,cold=-44.313316345
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=6-7,current=-57.450050354,candidate=-57.371524811,delta=0.078525543,cold=-52.058559418
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=7-8,current=-62.157066345,candidate=-60.696693420,delta=1.460372925,cold=-55.193916321
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=8-12,current=-54.127532959,candidate=-53.554695129,delta=0.572837830,cold=-45.937881470
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=12-16,current=-49.970657349,candidate=-49.909294128,delta=0.061363220,cold=-60.332244873
+native-echo-pair,mono,pin=20,far=230,delay=20,near=280,s=16-24,current=-51.280143738,candidate=-51.233348846,delta=0.046794891,cold=-49.219383240
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=0-1,current=-48.278877258,candidate=-48.278007507,delta=0.000869751,cold=-45.341194153
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=1-2,current=-58.564308167,candidate=-58.569976807,delta=-0.005668640,cold=-52.879005432
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=2-3,current=-54.235839844,candidate=-54.215396881,delta=0.020442963,cold=-50.393375397
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=3-4,current=-53.990535736,candidate=-53.984916687,delta=0.005619049,cold=-41.152580261
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=4-5,current=-52.552108765,candidate=-52.549285889,delta=0.002822876,cold=-39.815032959
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=5-6,current=-54.485050201,candidate=-54.484676361,delta=0.000373840,cold=-51.688453674
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=6-7,current=-60.559455872,candidate=-60.541015625,delta=0.018440247,cold=-49.402763367
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=7-8,current=-62.371948242,candidate=-62.373348236,delta=-0.001399994,cold=-53.424201965
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=8-12,current=-64.194778442,candidate=-63.825798035,delta=0.368980408,cold=-47.768806458
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=12-16,current=-61.569755554,candidate=-61.494026184,delta=0.075729370,cold=-47.197719574
+native-echo-pair,mono,pin=20,far=230,delay=60,near=180,s=16-24,current=-59.254447937,candidate=-59.207054138,delta=0.047393799,cold=-52.151466370
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=0-1,current=-48.278877258,candidate=-48.278007507,delta=0.000869751,cold=-45.341194153
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=1-2,current=-58.564308167,candidate=-58.569976807,delta=-0.005668640,cold=-52.879005432
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=2-3,current=-54.235839844,candidate=-54.215396881,delta=0.020442963,cold=-50.393375397
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=3-4,current=-53.990535736,candidate=-53.984916687,delta=0.005619049,cold=-41.152580261
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=4-5,current=-52.552108765,candidate=-52.549285889,delta=0.002822876,cold=-39.815032959
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=5-6,current=-54.485050201,candidate=-54.484676361,delta=0.000373840,cold=-51.688453674
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=6-7,current=-60.559455872,candidate=-60.541015625,delta=0.018440247,cold=-49.402763367
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=7-8,current=-62.371948242,candidate=-62.373348236,delta=-0.001399994,cold=-53.424201965
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=8-12,current=-64.194778442,candidate=-63.825798035,delta=0.368980408,cold=-47.768806458
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=12-16,current=-61.569755554,candidate=-61.494026184,delta=0.075729370,cold=-47.197719574
+native-echo-pair,mono,pin=20,far=230,delay=60,near=280,s=16-24,current=-59.254447937,candidate=-59.207054138,delta=0.047393799,cold=-52.151466370
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=0-1,current=-63.069934845,candidate=-62.979091644,delta=0.090843201,cold=-60.025726318
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=1-2,current=-63.951957703,candidate=-63.734451294,delta=0.217506409,cold=-60.112480164
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=2-3,current=-64.164093018,candidate=-63.830619812,delta=0.333473206,cold=-62.944213867
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=3-4,current=-65.063758850,candidate=-64.958198547,delta=0.105560303,cold=-47.608127594
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=4-5,current=-66.139457703,candidate=-66.134887695,delta=0.004570007,cold=-57.654190063
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=5-6,current=-57.895683289,candidate=-57.880649567,delta=0.015033722,cold=-45.053749084
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=6-7,current=-64.681709290,candidate=-64.660247803,delta=0.021461487,cold=-61.092483521
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=7-8,current=-65.256050110,candidate=-65.250640869,delta=0.005409241,cold=-61.008941650
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=8-12,current=-63.290195465,candidate=-62.977787018,delta=0.312408447,cold=-45.475517273
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=12-16,current=-62.341152191,candidate=-56.230167389,delta=6.110984802,cold=-55.398540497
+native-echo-pair,mono,pin=20,far=230,delay=150,near=180,s=16-24,current=-57.648124695,candidate=-55.275119781,delta=2.373004913,cold=-49.678615570
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=0-1,current=-63.069934845,candidate=-62.979091644,delta=0.090843201,cold=-60.025726318
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=1-2,current=-63.951957703,candidate=-63.734451294,delta=0.217506409,cold=-60.112480164
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=2-3,current=-64.164093018,candidate=-63.830619812,delta=0.333473206,cold=-62.944213867
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=3-4,current=-65.063758850,candidate=-64.958198547,delta=0.105560303,cold=-47.608127594
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=4-5,current=-66.139457703,candidate=-66.134887695,delta=0.004570007,cold=-57.654190063
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=5-6,current=-57.895683289,candidate=-57.880649567,delta=0.015033722,cold=-45.053749084
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=6-7,current=-64.681709290,candidate=-64.660247803,delta=0.021461487,cold=-61.092483521
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=7-8,current=-65.256050110,candidate=-65.250640869,delta=0.005409241,cold=-61.008941650
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=8-12,current=-63.290195465,candidate=-62.977787018,delta=0.312408447,cold=-45.475517273
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=12-16,current=-62.341152191,candidate=-56.230167389,delta=6.110984802,cold=-55.398540497
+native-echo-pair,mono,pin=20,far=230,delay=150,near=280,s=16-24,current=-57.648124695,candidate=-55.275119781,delta=2.373004913,cold=-49.678615570
+pin 20 echo 0-1 s: stay -66.5 cold -66.5 warm -67.9, worst room 0.0/0.3 dB, loudest -44.4/-48.3
+pin 20 echo 1-2 s: stay -68.2 cold -68.2 warm -69.6, worst room 0.0/0.3 dB, loudest -52.9/-56.1
+pin 20 echo 2-3 s: stay -68.0 cold -68.0 warm -69.0, worst room 0.0/0.3 dB, loudest -50.4/-54.2
+pin 20 echo 3-4 s: stay -68.1 cold -58.1 warm -68.8, worst room 15.4/0.3 dB, loudest -40.9/-54.0
+pin 20 echo 4-5 s: stay -67.9 cold -60.1 warm -68.4, worst room 11.3/0.1 dB, loudest -39.8/-50.1
+pin 20 echo 5-6 s: stay -66.2 cold -62.7 warm -67.9, worst room 7.7/0.1 dB, loudest -44.3/-54.5
+pin 20 echo 6-7 s: stay -67.8 cold -66.0 warm -69.8, worst room 5.0/0.1 dB, loudest -49.4/-57.5
+pin 20 echo 7-8 s: stay -69.5 cold -67.7 warm -70.5, worst room 10.1/1.1 dB, loudest -53.4/-62.2
+pin 20 echo 8-12 s: stay -67.5 cold -65.5 warm -69.8, worst room 15.4/0.1 dB, loudest -45.5/-54.1
+pin 20 echo 12-16 s: stay -68.6 cold -68.4 warm -69.5, worst room 13.4/2.2 dB, loudest -47.2/-50.0
+pin 20 echo 16-24 s: stay -68.2 cold -66.8 warm -68.3, worst room 11.8/4.7 dB, loudest -49.2/-51.3
+pin 20 level 0-1 s: stay -25.2 cold -25.2 warm -25.4, worst room 0.0/1.0 dB, loudest -24.0/-24.0
+pin 20 level 1-2 s: stay -26.1 cold -26.1 warm -26.3, worst room 0.0/1.4 dB, loudest -25.0/-25.0
+pin 20 level 2-3 s: stay -26.1 cold -26.1 warm -26.4, worst room 0.0/1.8 dB, loudest -25.0/-25.0
+pin 20 level 3-4 s: stay -25.5 cold -27.4 warm -26.1, worst room 5.2/5.2 dB, loudest -24.5/-24.5
+pin 20 level 4-5 s: stay -25.5 cold -29.1 warm -26.4, worst room 12.9/9.1 dB, loudest -24.3/-24.7
+pin 20 level 5-6 s: stay -26.2 cold -29.1 warm -27.8, worst room 16.2/16.2 dB, loudest -24.8/-25.1
+pin 20 level 6-7 s: stay -26.1 cold -28.2 warm -26.6, worst room 7.4/4.2 dB, loudest -24.6/-24.9
+pin 20 level 7-8 s: stay -25.6 cold -26.7 warm -25.5, worst room 10.4/1.9 dB, loudest -23.5/-23.5
+pin 20 level 8-12 s: stay -26.0 cold -26.4 warm -26.1, worst room 5.7/1.9 dB, loudest -24.4/-24.4
+pin 20 level 12-16 s: stay -26.0 cold -26.3 warm -26.1, worst room 5.6/2.6 dB, loudest -24.3/-24.3
+pin 20 level 16-24 s: stay -26.1 cold -26.1 warm -26.2, worst room 3.0/2.8 dB, loudest -24.8/-24.8
+pin 20 kept beside wide share 0-1 s: stay -7.5 cold -7.2 warm -8.8, worst room 0.3/6.1 dB, loudest -5.0/-5.0
+pin 20 kept beside wide share 1-2 s: stay -8.4 cold -8.2 warm -9.8, worst room 1.2/7.0 dB, loudest -6.2/-6.4
+pin 20 kept beside wide share 2-3 s: stay -7.9 cold -7.7 warm -9.4, worst room 0.5/6.5 dB, loudest -6.1/-6.4
+pin 20 kept beside wide share 3-4 s: stay -8.0 cold -11.9 warm -10.2, worst room 9.8/9.8 dB, loudest -6.0/-7.1
+pin 20 kept beside wide share 4-5 s: stay -7.4 cold -15.2 warm -10.8, worst room 28.7/25.6 dB, loudest -5.1/-6.1
+pin 20 kept beside wide share 5-6 s: stay -7.7 cold -17.1 warm -10.9, worst room 31.9/24.1 dB, loudest -4.8/-5.8
+pin 20 kept beside wide share 6-7 s: stay -8.5 cold -15.4 warm -11.7, worst room 24.5/23.6 dB, loudest -5.9/-6.5
+pin 20 kept beside wide share 7-8 s: stay -8.5 cold -14.6 warm -10.4, worst room 23.2/7.2 dB, loudest -6.0/-7.2
+pin 20 kept beside wide share 8-12 s: stay -8.2 cold -11.4 warm -9.6, worst room 20.5/5.4 dB, loudest -6.6/-6.5
+pin 20 kept beside wide share 12-16 s: stay -8.2 cold -11.7 warm -9.4, worst room 23.2/4.2 dB, loudest -6.7/-6.7
+pin 20 kept beside wide share 16-24 s: stay -8.5 cold -9.6 warm -9.0, worst room 10.1/3.3 dB, loudest -6.8/-6.7
+wide same 120->120 pin 6 cold: -27.5 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -53.3 -64.8
+wide same 120->120 pin 6 warm: -67.2 -66.8 -67.4 -67.5 -68.5 -69.2 -69.7 -73.3 -72.6
+native-echo-pair,wide,same 120->120 pin 6,q=0-1,current=-67.173355103,candidate=-67.157043457,delta=0.016311646,cold=-27.477401733
+native-echo-pair,wide,same 120->120 pin 6,q=1-2,current=-66.833251953,candidate=-66.820709229,delta=0.012542725,cold=-27.562551498
+native-echo-pair,wide,same 120->120 pin 6,q=2-4,current=-67.436744690,candidate=-67.443023682,delta=-0.006278992,cold=-28.052536011
+native-echo-pair,wide,same 120->120 pin 6,q=4-6,current=-67.488891602,candidate=-67.491622925,delta=-0.002731323,cold=-28.190393448
+native-echo-pair,wide,same 120->120 pin 6,q=6-8,current=-68.538681030,candidate=-68.547500610,delta=-0.008819580,cold=-27.186868668
+native-echo-pair,wide,same 120->120 pin 6,q=8-12,current=-69.161003113,candidate=-69.154174805,delta=0.006828308,cold=-28.104887009
+native-echo-pair,wide,same 120->120 pin 6,q=12-16,current=-69.651542664,candidate=-69.643905640,delta=0.007637024,cold=-33.107627869
+native-echo-pair,wide,same 120->120 pin 6,q=16-24,current=-73.308044434,candidate=-73.292297363,delta=0.015747070,cold=-53.257720947
+native-echo-pair,wide,same 120->120 pin 6,q=32-48,current=-72.558105469,candidate=-72.551185608,delta=0.006919861,cold=-64.779350281
+wide same 190->190 pin 6 cold: -28.7 -27.7 -28.7 -28.6 -27.8 -28.7 -33.6 -73.5 -78.9
+wide same 190->190 pin 6 warm: -74.7 -75.4 -75.8 -76.6 -77.8 -78.1 -77.9 -78.2 -81.7
+native-echo-pair,wide,same 190->190 pin 6,q=0-1,current=-74.744308472,candidate=-74.620170593,delta=0.124137878,cold=-28.671100616
+native-echo-pair,wide,same 190->190 pin 6,q=1-2,current=-75.355384827,candidate=-75.332969666,delta=0.022415161,cold=-27.694915771
+native-echo-pair,wide,same 190->190 pin 6,q=2-4,current=-75.824836731,candidate=-75.827690125,delta=-0.002853394,cold=-28.739471436
+native-echo-pair,wide,same 190->190 pin 6,q=4-6,current=-76.628936768,candidate=-76.628555298,delta=0.000381470,cold=-28.551595688
+native-echo-pair,wide,same 190->190 pin 6,q=6-8,current=-77.804588318,candidate=-77.806030273,delta=-0.001441956,cold=-27.812555313
+native-echo-pair,wide,same 190->190 pin 6,q=8-12,current=-78.105537415,candidate=-78.106849670,delta=-0.001312256,cold=-28.651527405
+native-echo-pair,wide,same 190->190 pin 6,q=12-16,current=-77.937904358,candidate=-77.938400269,delta=-0.000495911,cold=-33.640647888
+native-echo-pair,wide,same 190->190 pin 6,q=16-24,current=-78.168861389,candidate=-78.168930054,delta=-0.000068665,cold=-73.524215698
+native-echo-pair,wide,same 190->190 pin 6,q=32-48,current=-81.652603149,candidate=-81.603256226,delta=0.049346924,cold=-78.933494568
+wide new 150->120 pin 6 cold: -27.5 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -55.1 -70.5
+wide new 150->120 pin 6 warm: -75.3 -74.9 -74.1 -75.3 -75.2 -75.4 -74.9 -74.6 -73.7
+native-echo-pair,wide,new 150->120 pin 6,q=0-1,current=-75.284866333,candidate=-75.284614563,delta=0.000251770,cold=-27.469350815
+native-echo-pair,wide,new 150->120 pin 6,q=1-2,current=-74.933074951,candidate=-74.590240479,delta=0.342834473,cold=-27.562543869
+native-echo-pair,wide,new 150->120 pin 6,q=2-4,current=-74.117477417,candidate=-74.091011047,delta=0.026466370,cold=-28.052536011
+native-echo-pair,wide,new 150->120 pin 6,q=4-6,current=-75.260353088,candidate=-75.185173035,delta=0.075180054,cold=-28.190393448
+native-echo-pair,wide,new 150->120 pin 6,q=6-8,current=-75.156105042,candidate=-75.159706116,delta=-0.003601074,cold=-27.186868668
+native-echo-pair,wide,new 150->120 pin 6,q=8-12,current=-75.413291931,candidate=-75.421485901,delta=-0.008193970,cold=-28.104887009
+native-echo-pair,wide,new 150->120 pin 6,q=12-16,current=-74.893455505,candidate=-74.883628845,delta=0.009826660,cold=-33.112567902
+native-echo-pair,wide,new 150->120 pin 6,q=16-24,current=-74.610824585,candidate=-74.601058960,delta=0.009765625,cold=-55.104743958
+native-echo-pair,wide,new 150->120 pin 6,q=32-48,current=-73.701484680,candidate=-73.688369751,delta=0.013114929,cold=-70.494606018
+wide speakers pin 6 cold: -38.0 -43.3 -43.3 -57.8 -58.0 -58.0 -55.0 -53.1 -52.6
+wide speakers pin 6 warm: -58.2 -51.9 -58.8 -58.7 -58.5 -58.6 -58.2 -57.9 -56.8
+native-echo-pair,wide,speakers pin 6,q=0-1,current=-58.187690735,candidate=-56.842521667,delta=1.345169067,cold=-37.986965179
+native-echo-pair,wide,speakers pin 6,q=1-2,current=-51.865558624,candidate=-49.036373138,delta=2.829185486,cold=-43.258853912
+native-echo-pair,wide,speakers pin 6,q=2-4,current=-58.846282959,candidate=-58.791118622,delta=0.055164337,cold=-43.274131775
+native-echo-pair,wide,speakers pin 6,q=4-6,current=-58.710243225,candidate=-58.651294708,delta=0.058948517,cold=-57.813446045
+native-echo-pair,wide,speakers pin 6,q=6-8,current=-58.481521606,candidate=-58.407829285,delta=0.073692322,cold=-58.045707703
+native-echo-pair,wide,speakers pin 6,q=8-12,current=-58.606658936,candidate=-58.518997192,delta=0.087661743,cold=-58.046527863
+native-echo-pair,wide,speakers pin 6,q=12-16,current=-58.204956055,candidate=-58.124465942,delta=0.080490112,cold=-54.997180939
+native-echo-pair,wide,speakers pin 6,q=16-24,current=-57.882484436,candidate=-57.797237396,delta=0.085247040,cold=-53.060226440
+native-echo-pair,wide,speakers pin 6,q=32-48,current=-56.829494476,candidate=-56.753990173,delta=0.075504303,cold=-52.600433350
+wide same 120->120 pin 20 cold: -27.5 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -61.2 -70.7
+wide same 120->120 pin 20 warm: -72.3 -72.5 -72.4 -72.5 -71.9 -72.1 -72.0 -74.6 -73.8
+native-echo-pair,wide,same 120->120 pin 20,q=0-1,current=-72.295982361,candidate=-72.301223755,delta=-0.005241394,cold=-27.494510651
+native-echo-pair,wide,same 120->120 pin 20,q=1-2,current=-72.533370972,candidate=-72.521675110,delta=0.011695862,cold=-27.562526703
+native-echo-pair,wide,same 120->120 pin 20,q=2-4,current=-72.381065369,candidate=-72.355789185,delta=0.025276184,cold=-28.052547455
+native-echo-pair,wide,same 120->120 pin 20,q=4-6,current=-72.497001648,candidate=-72.497772217,delta=-0.000770569,cold=-28.190364838
+native-echo-pair,wide,same 120->120 pin 20,q=6-8,current=-71.878807068,candidate=-71.872146606,delta=0.006660461,cold=-27.186874390
+native-echo-pair,wide,same 120->120 pin 20,q=8-12,current=-72.103973389,candidate=-72.104598999,delta=-0.000625610,cold=-28.104879379
+native-echo-pair,wide,same 120->120 pin 20,q=12-16,current=-72.027099609,candidate=-72.019683838,delta=0.007415771,cold=-33.116844177
+native-echo-pair,wide,same 120->120 pin 20,q=16-24,current=-74.607872009,candidate=-74.609344482,delta=-0.001472473,cold=-61.209403992
+native-echo-pair,wide,same 120->120 pin 20,q=32-48,current=-73.798210144,candidate=-73.792366028,delta=0.005844116,cold=-70.696609497
+wide same 190->190 pin 20 cold: -28.7 -27.7 -28.7 -28.6 -27.8 -28.7 -33.6 -73.2 -78.5
+wide same 190->190 pin 20 warm: -83.7 -83.6 -83.6 -83.7 -83.3 -83.4 -83.1 -82.9 -84.6
+native-echo-pair,wide,same 190->190 pin 20,q=0-1,current=-83.677780151,candidate=-83.678092957,delta=-0.000312805,cold=-28.720453262
+native-echo-pair,wide,same 190->190 pin 20,q=1-2,current=-83.597869873,candidate=-83.598472595,delta=-0.000602722,cold=-27.694919586
+native-echo-pair,wide,same 190->190 pin 20,q=2-4,current=-83.628623962,candidate=-83.628463745,delta=0.000160217,cold=-28.739471436
+native-echo-pair,wide,same 190->190 pin 20,q=4-6,current=-83.705070496,candidate=-83.704895020,delta=0.000175476,cold=-28.551599503
+native-echo-pair,wide,same 190->190 pin 20,q=6-8,current=-83.292533875,candidate=-83.291488647,delta=0.001045227,cold=-27.812555313
+native-echo-pair,wide,same 190->190 pin 20,q=8-12,current=-83.351837158,candidate=-83.350746155,delta=0.001091003,cold=-28.651527405
+native-echo-pair,wide,same 190->190 pin 20,q=12-16,current=-83.105575562,candidate=-83.104904175,delta=0.000671387,cold=-33.640651703
+native-echo-pair,wide,same 190->190 pin 20,q=16-24,current=-82.905586243,candidate=-82.905303955,delta=0.000282288,cold=-73.223365784
+native-echo-pair,wide,same 190->190 pin 20,q=32-48,current=-84.649353027,candidate=-84.649261475,delta=0.000091553,cold=-78.530395508
+wide new 150->120 pin 20 cold: -27.6 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -60.9 -70.8
+wide new 150->120 pin 20 warm: -76.4 -76.4 -76.4 -76.6 -76.0 -76.2 -75.9 -75.6 -74.7
+native-echo-pair,wide,new 150->120 pin 20,q=0-1,current=-76.364295959,candidate=-76.337081909,delta=0.027214050,cold=-27.550065994
+native-echo-pair,wide,new 150->120 pin 20,q=1-2,current=-76.370422363,candidate=-75.837623596,delta=0.532798767,cold=-27.562545776
+native-echo-pair,wide,new 150->120 pin 20,q=2-4,current=-76.386344910,candidate=-76.352012634,delta=0.034332275,cold=-28.052537918
+native-echo-pair,wide,new 150->120 pin 20,q=4-6,current=-76.582710266,candidate=-76.581886292,delta=0.000823975,cold=-28.190393448
+native-echo-pair,wide,new 150->120 pin 20,q=6-8,current=-76.030494690,candidate=-76.005050659,delta=0.025444031,cold=-27.186868668
+native-echo-pair,wide,new 150->120 pin 20,q=8-12,current=-76.227691650,candidate=-76.221565247,delta=0.006126404,cold=-28.104887009
+native-echo-pair,wide,new 150->120 pin 20,q=12-16,current=-75.859893799,candidate=-75.863105774,delta=-0.003211975,cold=-33.118106842
+native-echo-pair,wide,new 150->120 pin 20,q=16-24,current=-75.598480225,candidate=-75.590583801,delta=0.007896423,cold=-60.915904999
+native-echo-pair,wide,new 150->120 pin 20,q=32-48,current=-74.687690735,candidate=-74.673011780,delta=0.014678955,cold=-70.785301208
+wide speakers pin 20 cold: -58.7 -58.6 -48.7 -56.0 -58.0 -58.7 -55.1 -53.2 -52.6
+wide speakers pin 20 warm: -59.1 -58.8 -59.0 -58.9 -58.7 -58.7 -58.4 -58.1 -57.1
+native-echo-pair,wide,speakers pin 20,q=0-1,current=-59.116382599,candidate=-58.969139099,delta=0.147243500,cold=-58.738510132
+native-echo-pair,wide,speakers pin 20,q=1-2,current=-58.783821106,candidate=-55.500862122,delta=3.282958984,cold=-58.617576599
+native-echo-pair,wide,speakers pin 20,q=2-4,current=-59.032859802,candidate=-54.089870453,delta=4.942989349,cold=-48.687877655
+native-echo-pair,wide,speakers pin 20,q=4-6,current=-58.887207031,candidate=-58.807483673,delta=0.079723358,cold=-56.013565063
+native-echo-pair,wide,speakers pin 20,q=6-8,current=-58.723602295,candidate=-58.655181885,delta=0.068420410,cold=-57.972442627
+native-echo-pair,wide,speakers pin 20,q=8-12,current=-58.737098694,candidate=-58.671684265,delta=0.065414429,cold=-58.682670593
+native-echo-pair,wide,speakers pin 20,q=12-16,current=-58.431076050,candidate=-58.338081360,delta=0.092994690,cold=-55.085655212
+native-echo-pair,wide,speakers pin 20,q=16-24,current=-58.076858521,candidate=-57.990001678,delta=0.086856842,cold=-53.179435730
+native-echo-pair,wide,speakers pin 20,q=32-48,current=-57.077068329,candidate=-56.993213654,delta=0.083854675,cold=-52.595733643
+wide same 120->120 pin 60 cold: -27.5 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -61.2 -70.7
+wide same 120->120 pin 60 warm: -73.8 -73.5 -73.8 -73.6 -73.1 -73.3 -73.1 -75.0 -74.3
+native-echo-pair,wide,same 120->120 pin 60,q=0-1,current=-73.822059631,candidate=-73.824630737,delta=-0.002571106,cold=-27.507114410
+native-echo-pair,wide,same 120->120 pin 60,q=1-2,current=-73.526679993,candidate=-73.525672913,delta=0.001007080,cold=-27.562524796
+native-echo-pair,wide,same 120->120 pin 60,q=2-4,current=-73.753250122,candidate=-73.757904053,delta=-0.004653931,cold=-28.052536011
+native-echo-pair,wide,same 120->120 pin 60,q=4-6,current=-73.620918274,candidate=-73.593246460,delta=0.027671814,cold=-28.190364838
+native-echo-pair,wide,same 120->120 pin 60,q=6-8,current=-73.137680054,candidate=-73.139968872,delta=-0.002288818,cold=-27.186874390
+native-echo-pair,wide,same 120->120 pin 60,q=8-12,current=-73.313758850,candidate=-73.313682556,delta=0.000076294,cold=-28.104879379
+native-echo-pair,wide,same 120->120 pin 60,q=12-16,current=-73.051666260,candidate=-73.047592163,delta=0.004074097,cold=-33.116771698
+native-echo-pair,wide,same 120->120 pin 60,q=16-24,current=-75.004776001,candidate=-75.002883911,delta=0.001892090,cold=-61.197547913
+native-echo-pair,wide,same 120->120 pin 60,q=32-48,current=-74.251564026,candidate=-74.248733521,delta=0.002830505,cold=-70.722846985
+wide same 190->190 pin 60 cold: -28.7 -27.7 -28.7 -28.6 -27.8 -28.7 -33.6 -73.2 -78.5
+wide same 190->190 pin 60 warm: -87.8 -87.8 -87.9 -87.8 -87.6 -88.4 -88.3 -88.5 -88.9
+native-echo-pair,wide,same 190->190 pin 60,q=0-1,current=-87.802337646,candidate=-87.802131653,delta=0.000205994,cold=-28.739536285
+native-echo-pair,wide,same 190->190 pin 60,q=1-2,current=-87.781936646,candidate=-87.781707764,delta=0.000228882,cold=-27.694915771
+native-echo-pair,wide,same 190->190 pin 60,q=2-4,current=-87.913208008,candidate=-87.913352966,delta=-0.000144958,cold=-28.739471436
+native-echo-pair,wide,same 190->190 pin 60,q=4-6,current=-87.826324463,candidate=-87.825775146,delta=0.000549316,cold=-28.551599503
+native-echo-pair,wide,same 190->190 pin 60,q=6-8,current=-87.566421509,candidate=-87.566383362,delta=0.000038147,cold=-27.812555313
+native-echo-pair,wide,same 190->190 pin 60,q=8-12,current=-88.351371765,candidate=-88.351455688,delta=-0.000083923,cold=-28.651527405
+native-echo-pair,wide,same 190->190 pin 60,q=12-16,current=-88.334426880,candidate=-88.334472656,delta=-0.000045776,cold=-33.640651703
+native-echo-pair,wide,same 190->190 pin 60,q=16-24,current=-88.451927185,candidate=-88.452026367,delta=-0.000099182,cold=-73.223220825
+native-echo-pair,wide,same 190->190 pin 60,q=32-48,current=-88.944198608,candidate=-88.944198608,delta=0.000000000,cold=-78.530685425
+wide new 150->120 pin 60 cold: -27.6 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -60.9 -70.8
+wide new 150->120 pin 60 warm: -80.0 -80.1 -80.2 -80.1 -79.8 -80.0 -79.5 -79.4 -78.4
+native-echo-pair,wide,new 150->120 pin 60,q=0-1,current=-80.006958008,candidate=-79.993278503,delta=0.013679504,cold=-27.643688202
+native-echo-pair,wide,new 150->120 pin 60,q=1-2,current=-80.078239441,candidate=-79.795104980,delta=0.283134460,cold=-27.562534332
+native-echo-pair,wide,new 150->120 pin 60,q=2-4,current=-80.214004517,candidate=-80.155899048,delta=0.058105469,cold=-28.052537918
+native-echo-pair,wide,new 150->120 pin 60,q=4-6,current=-80.145423889,candidate=-80.075820923,delta=0.069602966,cold=-28.190393448
+native-echo-pair,wide,new 150->120 pin 60,q=6-8,current=-79.796890259,candidate=-79.759597778,delta=0.037292480,cold=-27.186868668
+native-echo-pair,wide,new 150->120 pin 60,q=8-12,current=-79.983718872,candidate=-79.986282349,delta=-0.002563477,cold=-28.104887009
+native-echo-pair,wide,new 150->120 pin 60,q=12-16,current=-79.521949768,candidate=-79.523010254,delta=-0.001060486,cold=-33.118064880
+native-echo-pair,wide,new 150->120 pin 60,q=16-24,current=-79.407493591,candidate=-79.390769958,delta=0.016723633,cold=-60.884231567
+native-echo-pair,wide,new 150->120 pin 60,q=32-48,current=-78.351181030,candidate=-78.345932007,delta=0.005249023,cold=-70.777046204
+wide speakers pin 60 cold: -58.3 -58.8 -59.0 -58.8 -58.3 -58.8 -55.1 -53.2 -52.6
+wide speakers pin 60 warm: -59.0 -58.7 -58.9 -58.7 -58.6 -58.7 -58.2 -58.0 -56.9
+native-echo-pair,wide,speakers pin 60,q=0-1,current=-59.042922974,candidate=-58.947746277,delta=0.095176697,cold=-58.310310364
+native-echo-pair,wide,speakers pin 60,q=1-2,current=-58.661315918,candidate=-57.402709961,delta=1.258605957,cold=-58.801391602
+native-echo-pair,wide,speakers pin 60,q=2-4,current=-58.935707092,candidate=-58.785854340,delta=0.149852753,cold=-58.972515106
+native-echo-pair,wide,speakers pin 60,q=4-6,current=-58.677757263,candidate=-58.549823761,delta=0.127933502,cold=-58.805484772
+native-echo-pair,wide,speakers pin 60,q=6-8,current=-58.607868195,candidate=-58.519615173,delta=0.088253021,cold=-58.314338684
+native-echo-pair,wide,speakers pin 60,q=8-12,current=-58.686252594,candidate=-58.585582733,delta=0.100669861,cold=-58.751354218
+native-echo-pair,wide,speakers pin 60,q=12-16,current=-58.204597473,candidate=-58.070415497,delta=0.134181976,cold=-55.102195740
+native-echo-pair,wide,speakers pin 60,q=16-24,current=-57.967193604,candidate=-57.862800598,delta=0.104393005,cold=-53.164867401
+native-echo-pair,wide,speakers pin 60,q=32-48,current=-56.934589386,candidate=-56.843723297,delta=0.090866089,cold=-52.576995850
+wide same 120->120 pin 310 cold: -27.6 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -61.2 -70.8
+wide same 120->120 pin 310 warm: -75.9 -75.8 -75.7 -75.5 -75.3 -75.2 -75.4 -75.6 -74.8
+native-echo-pair,wide,same 120->120 pin 310,q=0-1,current=-75.875923157,candidate=-75.875938416,delta=-0.000015259,cold=-27.594251633
+native-echo-pair,wide,same 120->120 pin 310,q=1-2,current=-75.796524048,candidate=-75.796363831,delta=0.000160217,cold=-27.562534332
+native-echo-pair,wide,same 120->120 pin 310,q=2-4,current=-75.691146851,candidate=-75.691101074,delta=0.000045776,cold=-28.052536011
+native-echo-pair,wide,same 120->120 pin 310,q=4-6,current=-75.474906921,candidate=-75.471549988,delta=0.003356934,cold=-28.190393448
+native-echo-pair,wide,same 120->120 pin 310,q=6-8,current=-75.283996582,candidate=-75.284179688,delta=-0.000183105,cold=-27.186868668
+native-echo-pair,wide,same 120->120 pin 310,q=8-12,current=-75.203262329,candidate=-75.200897217,delta=0.002365112,cold=-28.104887009
+native-echo-pair,wide,same 120->120 pin 310,q=12-16,current=-75.366950989,candidate=-75.366317749,delta=0.000633240,cold=-33.116855621
+native-echo-pair,wide,same 120->120 pin 310,q=16-24,current=-75.607406616,candidate=-75.607467651,delta=-0.000061035,cold=-61.241420746
+native-echo-pair,wide,same 120->120 pin 310,q=32-48,current=-74.775810242,candidate=-74.775741577,delta=0.000068665,cold=-70.759834290
+wide same 190->190 pin 310 cold: -28.9 -27.7 -28.7 -28.6 -27.8 -28.7 -33.6 -73.2 -78.5
+wide same 190->190 pin 310 warm: -92.7 -92.6 -92.6 -92.4 -92.3 -92.4 -92.6 -92.2 -92.4
+native-echo-pair,wide,same 190->190 pin 310,q=0-1,current=-92.659805298,candidate=-92.659896851,delta=-0.000091553,cold=-28.927209854
+native-echo-pair,wide,same 190->190 pin 310,q=1-2,current=-92.647186279,candidate=-92.646926880,delta=0.000259399,cold=-27.694908142
+native-echo-pair,wide,same 190->190 pin 310,q=2-4,current=-92.551841736,candidate=-92.551841736,delta=0.000000000,cold=-28.739469528
+native-echo-pair,wide,same 190->190 pin 310,q=4-6,current=-92.434173584,candidate=-92.434402466,delta=-0.000228882,cold=-28.551595688
+native-echo-pair,wide,same 190->190 pin 310,q=6-8,current=-92.336456299,candidate=-92.336227417,delta=0.000228882,cold=-27.812555313
+native-echo-pair,wide,same 190->190 pin 310,q=8-12,current=-92.359001160,candidate=-92.358886719,delta=0.000114441,cold=-28.651527405
+native-echo-pair,wide,same 190->190 pin 310,q=12-16,current=-92.574226379,candidate=-92.574340820,delta=-0.000114441,cold=-33.640651703
+native-echo-pair,wide,same 190->190 pin 310,q=16-24,current=-92.218627930,candidate=-92.218582153,delta=0.000045776,cold=-73.245544434
+native-echo-pair,wide,same 190->190 pin 310,q=32-48,current=-92.373107910,candidate=-92.373130798,delta=-0.000022888,cold=-78.508857727
+wide new 150->120 pin 310 cold: -27.6 -27.6 -28.1 -28.2 -27.2 -28.1 -33.1 -60.4 -71.0
+wide new 150->120 pin 310 warm: -79.9 -79.8 -79.3 -79.5 -79.5 -79.4 -79.4 -78.9 -77.8
+native-echo-pair,wide,new 150->120 pin 310,q=0-1,current=-79.931083679,candidate=-79.938316345,delta=-0.007232666,cold=-27.636787415
+native-echo-pair,wide,new 150->120 pin 310,q=1-2,current=-79.768981934,candidate=-79.662025452,delta=0.106956482,cold=-27.562541962
+native-echo-pair,wide,new 150->120 pin 310,q=2-4,current=-79.322303772,candidate=-79.277687073,delta=0.044616699,cold=-28.052541733
+native-echo-pair,wide,new 150->120 pin 310,q=4-6,current=-79.544754028,candidate=-79.502174377,delta=0.042579651,cold=-28.190393448
+native-echo-pair,wide,new 150->120 pin 310,q=6-8,current=-79.461791992,candidate=-79.443344116,delta=0.018447876,cold=-27.186868668
+native-echo-pair,wide,new 150->120 pin 310,q=8-12,current=-79.398284912,candidate=-79.373023987,delta=0.025260925,cold=-28.104887009
+native-echo-pair,wide,new 150->120 pin 310,q=12-16,current=-79.431312561,candidate=-79.406707764,delta=0.024604797,cold=-33.117805481
+native-echo-pair,wide,new 150->120 pin 310,q=16-24,current=-78.856346130,candidate=-78.853500366,delta=0.002845764,cold=-60.352283478
+native-echo-pair,wide,new 150->120 pin 310,q=32-48,current=-77.846900940,candidate=-77.842544556,delta=0.004356384,cold=-71.015945435
+wide speakers pin 310 cold: -56.8 -55.9 -56.0 -56.0 -56.1 -56.0 -54.8 -53.1 -52.5
+wide speakers pin 310 warm: -58.8 -59.4 -59.3 -59.3 -59.1 -59.0 -59.0 -58.4 -57.4
+native-echo-pair,wide,speakers pin 310,q=0-1,current=-58.834976196,candidate=-58.760993958,delta=0.073982239,cold=-56.807991028
+native-echo-pair,wide,speakers pin 310,q=1-2,current=-59.375183105,candidate=-58.760742188,delta=0.614440918,cold=-55.911827087
+native-echo-pair,wide,speakers pin 310,q=2-4,current=-59.328350067,candidate=-45.829864502,delta=13.498485565,cold=-56.025482178
+native-echo-pair,wide,speakers pin 310,q=4-6,current=-59.255149841,candidate=-59.043544769,delta=0.211605072,cold=-56.030227661
+native-echo-pair,wide,speakers pin 310,q=6-8,current=-59.102115631,candidate=-58.938755035,delta=0.163360596,cold=-56.062221527
+native-echo-pair,wide,speakers pin 310,q=8-12,current=-58.998046875,candidate=-58.861480713,delta=0.136566162,cold=-56.002899170
+native-echo-pair,wide,speakers pin 310,q=12-16,current=-58.968067169,candidate=-58.805297852,delta=0.162769318,cold=-54.757976532
+native-echo-pair,wide,speakers pin 310,q=16-24,current=-58.418785095,candidate=-58.291110992,delta=0.127674103,cold=-53.134731293
+native-echo-pair,wide,speakers pin 310,q=32-48,current=-57.411632538,candidate=-57.294597626,delta=0.117034912,cold=-52.532249451
+wide steady pin 310 cold: -27.2 -28.5 -28.1 -28.2 -27.2 -28.1 -33.1 -54.6 -70.0
+wide steady pin 310 warm: -31.8 -36.6 -35.8 -71.7 -71.7 -71.9 -71.7 -75.8 -80.8
+native-echo-pair,wide,steady pin 310,q=0-1,current=-31.763652802,candidate=-31.761356354,delta=0.002296448,cold=-27.162435532
+native-echo-pair,wide,steady pin 310,q=1-2,current=-36.599391937,candidate=-36.555320740,delta=0.044071198,cold=-28.471122742
+native-echo-pair,wide,steady pin 310,q=2-4,current=-35.794204712,candidate=-34.853130341,delta=0.941074371,cold=-28.052537918
+native-echo-pair,wide,steady pin 310,q=4-6,current=-71.743583679,candidate=-71.740493774,delta=0.003089905,cold=-28.190393448
+native-echo-pair,wide,steady pin 310,q=6-8,current=-71.714263916,candidate=-71.700675964,delta=0.013587952,cold=-27.186868668
+native-echo-pair,wide,steady pin 310,q=8-12,current=-71.916130066,candidate=-71.910415649,delta=0.005714417,cold=-28.104887009
+native-echo-pair,wide,steady pin 310,q=12-16,current=-71.678581238,candidate=-71.676452637,delta=0.002128601,cold=-33.109348297
+native-echo-pair,wide,steady pin 310,q=16-24,current=-75.750228882,candidate=-75.748527527,delta=0.001701355,cold=-54.615280151
+native-echo-pair,wide,steady pin 310,q=32-48,current=-80.801101685,candidate=-80.786140442,delta=0.014961243,cold=-69.979644775
+native paired echo gate profile=1: failures=12,worst=13.498485565 dB
+
+thread 'voice::apm::tests::native_paired_echo_gate' (45650639) panicked at crates/gwar-client/src/voice/apm.rs:2711:9:
+assertion `left == right` failed: native configuration makes a quiet-echo room/window >1 dB louder
+  left: 12
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    voice::apm::tests::native_paired_echo_gate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 398 filtered out; finished in 252.09s
+
+error: test failed, to rerun pass `-p gwar-client --lib`

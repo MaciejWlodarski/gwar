@@ -1,0 +1,81 @@
+{
+  "arm": "main",
+  "sha": "6c1c45c9d677b63f6b61ba25a91fcd997a014ca1",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+  "binary_sha256": "c09245733f7d8cf1bb3695bd56e5e05dd0f1ea8042874e38019df545eef784be",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T21:07:59.044401+00:00",
+    "load": [
+      2.76220703125,
+      2.52685546875,
+      2.689453125
+    ],
+    "uptime": "22:07  up  9:31, 2 users, load averages: 2.76 2.53 2.69",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": false,
+  "invalid_reasons": [
+    "overlap with another cargo/test or #213 timing",
+    "overlap at end"
+  ],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T21:07:59.137453+00:00",
+    "load": [
+      2.76220703125,
+      2.52685546875,
+      2.689453125
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 43494,
+  "test_nice": 10,
+  "exit_code": -15,
+  "after": {
+    "at": "2026-11-04T21:10:06.055496+00:00",
+    "load": [
+      3.3212890625,
+      2.66259765625,
+      2.705078125
+    ],
+    "uptime": "22:10  up  9:33, 2 users, load averages: 3.32 2.66 2.71",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": [
+        {
+          "pid": 45531,
+          "parent": 45526,
+          "nice": 19,
+          "command": "/opt/homebrew/bin/cargo"
+        }
+      ]
+    }
+  },
+  "peak_load_1m": 3.349609375,
+  "pair_count": 3
+}

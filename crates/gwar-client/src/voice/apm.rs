@@ -98,6 +98,23 @@ impl Stage {
         stage
     }
 
+    #[cfg(test)]
+    fn native_gain_change(&mut self) {
+        self.apm.notify_echo_gain_change();
+    }
+
+    #[cfg(test)]
+    fn stereo_config(config: Config) -> Self {
+        let mut stage = Self::new(2);
+        stage.apm.apply_config(config);
+        stage.on = true;
+        let silence = [0f32; FRAME];
+        let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
+        let _ = stage.apm.process_render_f32(&[&silence, &silence], &mut [&mut left, &mut right]);
+        let _ = stage.apm.process_capture_f32(&[&silence], &mut [&mut near]);
+        stage
+    }
+
     /// Whether `on` changed; one turned on starts from scratch.
     fn set(&mut self, on: bool, config: impl FnOnce() -> Config) -> bool {
         if on == self.on {
@@ -116,7 +133,21 @@ fn canceller(stereo: bool) -> Config {
     let canceller = EchoCanceller {
         transparent_mode: TransparentModeType::Hmm,
         detect_stereo_content: !stereo,
+        zero_nearend_reverb_decay: stereo,
         ..Default::default()
+    };
+    #[cfg(test)]
+    let canceller = {
+        let profile = AEC_NATIVE_PROFILE.load(Ordering::Relaxed);
+        EchoCanceller {
+            multichannel_suppressor_like_mono: stereo && MEASURE_MONO_SUPPRESSOR.load(Ordering::Relaxed),
+            measurement_two_channel_start: stereo && AEC_NATIVE_CHANNELS.load(Ordering::Relaxed),
+            measurement_native_profile: if stereo && profile != SHIPPED_AEC_PROFILE { profile } else { 0 },
+            measurement_left_reference: stereo && AEC_LEGACY_REFERENCE.load(Ordering::Relaxed),
+            // The shipped arm keeps the production field above, so tests see a revert of it.
+            zero_nearend_reverb_decay: canceller.zero_nearend_reverb_decay && profile == SHIPPED_AEC_PROFILE,
+            ..canceller
+        }
     };
     Config { echo_canceller: Some(canceller), ..base() }
 }
@@ -159,7 +190,16 @@ struct Warming {
 impl Warming {
     fn new(sound: &Arc<AtomicUsize>, history: u32) -> Self {
         sound.store(0, Ordering::Relaxed);
-        Self { stage: Box::new(Stage::stereo()), sound: sound.clone(), found_echo: false, history }
+        let stage = Box::new(Stage::stereo());
+        #[cfg(test)]
+        let stage = if AEC_WARM_ONLY_TWO.load(Ordering::Relaxed) {
+            let mut config = canceller(true);
+            config.echo_canceller.as_mut().unwrap().measurement_two_channel_start = true;
+            Box::new(Stage::stereo_config(config))
+        } else {
+            stage
+        };
+        Self { stage, sound: sound.clone(), found_echo: false, history }
     }
 
     /// Everything waiting in the ring. A frame from a later stretch starts it all over, here on the
@@ -492,6 +532,10 @@ impl Processing {
     /// more than a new one does. So one that found no echo is left behind: headphones, and anyone
     /// the far side never talked alone to, go the way of [`Processing::pin_stereo`] without this.
     pub(crate) fn warm_stereo(&mut self) {
+        #[cfg(test)]
+        if AEC_PIPELINE_COLD.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(worker) = &self.stereo {
             worker.tell(WARM);
             self.warming = true;
@@ -647,6 +691,13 @@ impl Processing {
                 *sample = *sample * phase.cos().powi(2) + learned * phase.sin().powi(2);
             }
         }
+        #[cfg(test)]
+        {
+            let mode = AEC_NONLINEAR_AT_TAKEOVER.load(Ordering::Relaxed);
+            if mode != 0 && (self.warmed || !AEC_WARM_ONLY_TWO.load(Ordering::Relaxed)) {
+                stage.apm.measurement_restart_nonlinear(mode);
+            }
+        }
         std::mem::swap(&mut self.echo, &mut *stage);
         self.channels = Channels::Stereo(stage);
     }
@@ -746,6 +797,117 @@ impl Processing {
             self.scratch.copy_from_slice(frame);
             let _ = self.gain.apm.process_capture_f32(&[&self.scratch], &mut [frame]);
         }
+    }
+}
+
+#[cfg(test)]
+const SHIPPED_AEC_PROFILE: u8 = u8::MAX;
+#[cfg(test)]
+static AEC_NATIVE_PROFILE: AtomicU8 = AtomicU8::new(SHIPPED_AEC_PROFILE);
+#[cfg(test)]
+static AEC_LEGACY_REFERENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_PIPELINE_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_WARM_ONLY_TWO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_NATIVE_CHANNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_NONLINEAR_AT_TAKEOVER: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_ECHO_COMPARE_PROFILE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_ECHO_REGRESSIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static AEC_ECHO_WORST_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+static AEC_APPROVED_ECHO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes every test that changes the measurement controls above. They are process-wide, so
+/// ignored measurement tests must also run single-threaded: a test that only reads them through
+/// [`canceller`] would otherwise see another test's choice.
+#[cfg(test)]
+static MEASUREMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static MEASUREMENT_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Holds [`MEASUREMENT_LOCK`] (re-entrant on one thread) and puts every control back to the shipped
+/// defaults when the outermost scope ends, also on panic.
+#[cfg(test)]
+pub(super) struct MeasurementScope {
+    lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+pub(super) fn measurement_scope() -> MeasurementScope {
+    let outermost = MEASUREMENT_DEPTH.with(|depth| {
+        depth.set(depth.get() + 1);
+        depth.get() == 1
+    });
+    let lock = outermost.then(|| MEASUREMENT_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    if outermost {
+        reset_measurement_controls();
+    }
+    MeasurementScope { lock }
+}
+
+#[cfg(test)]
+impl Drop for MeasurementScope {
+    fn drop(&mut self) {
+        MEASUREMENT_DEPTH.with(|depth| depth.set(depth.get() - 1));
+        if self.lock.is_some() {
+            reset_measurement_controls();
+        }
+    }
+}
+
+#[cfg(test)]
+fn reset_measurement_controls() {
+    AEC_NATIVE_PROFILE.store(SHIPPED_AEC_PROFILE, Ordering::Relaxed);
+    AEC_LEGACY_REFERENCE.store(false, Ordering::Relaxed);
+    AEC_PIPELINE_COLD.store(false, Ordering::Relaxed);
+    AEC_WARM_ONLY_TWO.store(false, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
+    AEC_NONLINEAR_AT_TAKEOVER.store(0, Ordering::Relaxed);
+    AEC_ECHO_COMPARE_PROFILE.store(0, Ordering::Relaxed);
+    AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);
+    AEC_ECHO_WORST_BITS.store(0, Ordering::Relaxed);
+    AEC_APPROVED_ECHO.store(false, Ordering::Relaxed);
+    AEC_TRACE.store(false, Ordering::Relaxed);
+    MEASURE_MONO_SUPPRESSOR.store(false, Ordering::Relaxed);
+}
+
+/// Isolated timing control. The production path never reads these test-only choices.
+#[cfg(test)]
+pub(super) fn with_native_pipeline_option(id: u8, run: impl FnOnce()) {
+    let _scope = measurement_scope();
+    let (profile, legacy, cold) = match id {
+        0 => (0, false, false),
+        1 => (7, true, false),
+        2 => (7, false, false),
+        3 => (7, false, true),
+        4 => (1, false, false),
+        5 => (1, false, true),
+        _ => panic!("unknown native pipeline option {id}"),
+    };
+    let old_profile = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
+    let old_legacy = AEC_LEGACY_REFERENCE.swap(legacy, Ordering::Relaxed);
+    let old_cold = AEC_PIPELINE_COLD.swap(cold, Ordering::Relaxed);
+    let old_channels = AEC_NATIVE_CHANNELS.swap(!legacy, Ordering::Relaxed);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    AEC_NATIVE_PROFILE.store(old_profile, Ordering::Relaxed);
+    AEC_LEGACY_REFERENCE.store(old_legacy, Ordering::Relaxed);
+    AEC_PIPELINE_COLD.store(old_cold, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(old_channels, Ordering::Relaxed);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -1659,8 +1821,15 @@ mod tests {
         let around = take_over - 4 * FRAME..take_over + 4 * FRAME;
         let step = |signal: &[f32]| signal.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
         assert!(step(&out[around.clone()]) <= step(&alone[RATE..take_over]), "a click at the switch");
-        let change = db(&out[around.clone()]) - db(&alone[around]);
-        assert!(change.abs() < 3.0, "voice jumped {change:.1} dB at the switch");
+        // P7 intentionally preserves more near voice than the mono stage. Its level
+        // is not required to match mono: cancelling the warm candidate must instead
+        // produce the exact ordinary cold path, with the click bound above unchanged.
+        let cold = through(&mut session(LEARNING_FRAMES), &far, &near, Some(pin));
+        assert_eq!(out.len(), cold.len());
+        assert!(
+            out.iter().zip(&cold).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the cancelled handover differs from ordinary cold P7"
+        );
     }
 
     /// A session past the take-over on speakers, with the sample it got to.
@@ -2340,8 +2509,9 @@ mod tests {
     /// session that never pinned, `cold` the canceller that starts learning at the pin and `warm`
     /// the one that has been listening. `worst` is the room furthest above `stay`, in dB.
     #[test]
-    #[ignore = "a comparison, run in release"]
+    #[ignore = "a comparison, run in release, single-threaded"]
     fn the_warmed_switch_against_cold_and_staying_mono() {
+        let _scope = measurement_scope();
         let second = RATE;
         let windows: Vec<(usize, usize)> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
         for before in [6, 20] {
@@ -2359,7 +2529,7 @@ mod tests {
                         let far = voice(total, far_pitch, -20.0);
                         let echo = room(&far, delay);
                         // The near voice joins 4 s in: far alone first, or nothing finds the room.
-                        let near: Vec<f32> = voice(total, near_pitch, -24.0)
+                        let near: Vec<f32> = talker(total, near_pitch, 3.1, 3.3, -24.0)
                             .iter()
                             .enumerate()
                             .map(|(index, sample)| if index < 4 * second { 0.0 } else { *sample })
@@ -2386,8 +2556,33 @@ mod tests {
                             [cold(&same, &talk), warm(&same, &talk)],
                             [cold(&shared, &heard), warm(&shared, &heard)],
                         ];
+                        let profile = AEC_ECHO_COMPARE_PROFILE.load(Ordering::Relaxed);
+                        let extra = if profile > 0 {
+                            let old = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
+                            let extra = warm(&same, &echo);
+                            AEC_NATIVE_PROFILE.store(old, Ordering::Relaxed);
+                            Some(extra)
+                        } else {
+                            None
+                        };
                         for (index, window) in windows.iter().enumerate() {
                             let r = span(*window);
+                            if let Some(extra) = &extra {
+                                record_native_echo_pair(
+                                    &format!(
+                                        "mono,pin={before},far={far_pitch},delay={delay},near={near_pitch},s={}-{}",
+                                        window.0, window.1
+                                    ),
+                                    db(&arms[0][1][r.clone()]),
+                                    db(&extra[r.clone()]),
+                                    db(&arms[0][0][r.clone()]),
+                                    [
+                                        echo_energy(&arms[0][1][r.clone()]),
+                                        echo_energy(&extra[r.clone()]),
+                                        echo_energy(&arms[0][0][r.clone()]),
+                                    ],
+                                );
+                            }
                             let kept = |out: &[f32]| fidelity(&out[r.clone()], &near[r.clone()]).1;
                             let rows: [(f32, [f32; 2]); 3] = [
                                 (db(&stay_echo[r.clone()]), [db(&arms[0][0][r.clone()]), db(&arms[0][1][r.clone()])]),
@@ -2424,22 +2619,89 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "native-profile comparison on the complete #220 echo tables; release, alone, single-threaded"]
+    fn native_profile_echo_tables() {
+        let _scope = measurement_scope();
+        let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "0".into()).parse().unwrap();
+        assert!(profile <= 2);
+        AEC_NATIVE_PROFILE.store(profile, Ordering::Relaxed);
+        eprintln!("native echo tables, profile={profile}");
+        the_warmed_switch_against_cold_and_staying_mono();
+        the_wide_leak_cold_and_warm();
+    }
+
+    fn echo_energy(samples: &[f32]) -> f64 {
+        samples.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / RATE as f64
+    }
+
+    fn record_native_echo_pair(label: &str, current: f32, candidate: f32, cold: f32, energy: [f64; 3]) {
+        if AEC_APPROVED_ECHO.load(Ordering::Relaxed) {
+            shipped::check_approved_echo(label, current, candidate);
+        }
+        let delta = candidate - current;
+        if delta > 1.0 {
+            AEC_ECHO_REGRESSIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        AEC_ECHO_WORST_BITS.fetch_max(delta.max(0.0).to_bits(), Ordering::Relaxed);
+        eprintln!(
+            "native-echo-pair,{label},current={current:.9},candidate={candidate:.9},delta={delta:.9},cold={cold:.9},energy-current={:.15e},energy-candidate={:.15e},energy-cold={:.15e}",
+            energy[0], energy[1], energy[2]
+        );
+    }
+
+    #[test]
+    #[ignore = "strict paired per-room +1 dB gate on full #220 echo tables; release, alone, single-threaded"]
+    fn native_paired_echo_gate() {
+        let _scope = measurement_scope();
+        let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "1".into()).parse().unwrap();
+        assert!([1, 2, 7, 8, 9, 10, 11].contains(&profile));
+        AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
+        AEC_ECHO_COMPARE_PROFILE.store(profile, Ordering::Relaxed);
+        AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);
+        AEC_ECHO_WORST_BITS.store(0, Ordering::Relaxed);
+        the_warmed_switch_against_cold_and_staying_mono();
+        the_wide_leak_cold_and_warm();
+        AEC_ECHO_COMPARE_PROFILE.store(0, Ordering::Relaxed);
+        let failures = AEC_ECHO_REGRESSIONS.load(Ordering::Relaxed);
+        let worst = f32::from_bits(AEC_ECHO_WORST_BITS.load(Ordering::Relaxed));
+        eprintln!("native paired echo gate profile={profile}: failures={failures},worst={worst:.9} dB");
+        assert_eq!(failures, 0, "native configuration makes a quiet-echo room/window >1 dB louder");
+    }
+
     /// Wide sound from the first share sound, in dBFS, in `WIDE_WINDOWS` after it. `same` is the
     /// voice's own pitch, `new` a pitch the canceller never heard. `steady` trains on [`voice`] past
     /// the 140 s where it stops moving, so on one held note: the one case found that still leaks.
     /// `speakers` is mid and side music-like sound where both speakers reach the microphone.
     #[test]
-    #[ignore = "a comparison, run in release"]
+    #[ignore = "a comparison, run in release, single-threaded"]
     fn the_wide_leak_cold_and_warm() {
+        let _scope = measurement_scope();
         let second = RATE;
         let windows = [(0, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12), (12, 16), (16, 24), (32, 48)];
-        let show = |name: String, pin: usize, cold: &[f32], warm: &[f32]| {
+        let show = |name: String, pin: usize, cold: &[f32], warm: &[f32], far: &[[f32; 2]], echo: &[f32]| {
             for (arm, out) in [("cold", cold), ("warm", warm)] {
                 let levels: Vec<String> = windows
                     .iter()
                     .map(|(from, to)| format!("{:.1}", db(&out[pin + from * second / 4..pin + to * second / 4])))
                     .collect();
                 eprintln!("wide {name} {arm}: {}", levels.join(" "));
+            }
+            let profile = AEC_ECHO_COMPARE_PROFILE.load(Ordering::Relaxed);
+            if profile > 0 {
+                let old = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
+                let extra = warm_through(&mut warm_session(), far, echo, Some(pin));
+                AEC_NATIVE_PROFILE.store(old, Ordering::Relaxed);
+                for (a, b) in windows {
+                    let r = pin + a * second / 4..pin + b * second / 4;
+                    record_native_echo_pair(
+                        &format!("wide,{name},q={a}-{b}"),
+                        db(&warm[r.clone()]),
+                        db(&extra[r.clone()]),
+                        db(&cold[r.clone()]),
+                        [echo_energy(&warm[r.clone()]), echo_energy(&extra[r.clone()]), echo_energy(&cold[r])],
+                    );
+                }
             }
         };
         for pin_at in [6, 20, 60, 310] {
@@ -2451,7 +2713,7 @@ mod tests {
                 let echo = room(&left, 60);
                 let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
                 let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
-                show(format!("{name} {before}->{after} pin {pin_at}"), pin, &cold, &warm);
+                show(format!("{name} {before}->{after} pin {pin_at}"), pin, &cold, &warm, &far, &echo);
             }
             let talk = long_voice(pin + 12 * second, 150.0, -18.0);
             let mid = long_voice(pin + 12 * second, 120.0, -20.0);
@@ -2464,7 +2726,7 @@ mod tests {
             let echo: Vec<f32> = room(&left, 60).iter().zip(room(&right, 75)).map(|(l, r)| l + 0.7 * r).collect();
             let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
             let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
-            show(format!("speakers pin {pin_at}"), pin, &cold, &warm);
+            show(format!("speakers pin {pin_at}"), pin, &cold, &warm, &far, &echo);
         }
         let pin = 310 * second;
         let mut far = pairs(&voice(pin, 150.0, -18.0));
@@ -2473,7 +2735,7 @@ mod tests {
         let echo = room(&left, 60);
         let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
         let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
-        show("steady pin 310".into(), pin, &cold, &warm);
+        show("steady pin 310".into(), pin, &cold, &warm, &far, &echo);
     }
 
     /// How much of a near voice speaking in turns gets through, from the first share sound: the
@@ -2494,7 +2756,7 @@ mod tests {
                     let (left, right) = (long_voice(total, 120.0, -14.0), long_voice(total, 190.0, -14.0));
                     let far: Vec<[f32; 2]> =
                         (0..total).map(|i| if i < pin { [talk[i]; 2] } else { [left[i], right[i]] }).collect();
-                    let said: Vec<f32> = long_voice(total, 200.0, -24.0)
+                    let said: Vec<f32> = talker(total, 213.0, 3.1, 3.3, -24.0)
                         .iter()
                         .enumerate()
                         .map(|(index, sample)| if (index / (2 * RATE)).is_multiple_of(2) { 0.0 } else { *sample })
@@ -2810,5 +3072,209 @@ mod tests {
         eprintln!("a stereo canceller: {} kB, built in {:?}", bytes / 1024, started.elapsed());
         drop(built);
         eprintln!("the ring: {} kB", WARMING_RING * std::mem::size_of::<Heard>() / 1024);
+    }
+
+    #[test]
+    fn unreported_headphones_do_not_replace_the_canceller_in_charge() {
+        let far = pairs(&long_voice(20 * RATE, 150.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let mut p = warmed_on_speakers(&far, &echo, 8);
+        warm_through(&mut p, &far[8 * RATE..12 * RATE], &echo[8 * RATE..12 * RATE], Some(0));
+        assert!(p.is_stereo());
+        let history = p.history;
+        warm_through(&mut p, &far[12 * RATE..], &vec![0.0001; 8 * RATE], None);
+        assert_eq!(p.history, history, "an acoustic absence must not enqueue a replacement");
+        assert!(!p.replacing);
+    }
+
+    mod shipped;
+
+    /// Measurement-only observer. Four render frames are classified on a separate
+    /// thread. Equal/panned channels remain mono; negative correlation is wide.
+    struct ContentChoice {
+        input: Option<std::sync::mpsc::SyncSender<[[f32; FRAME]; 2]>>,
+        output: std::sync::mpsc::Receiver<bool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ContentChoice {
+        fn new() -> Self {
+            let (input, frames) = std::sync::mpsc::sync_channel::<[[f32; FRAME]; 2]>(1);
+            let (answer, output) = std::sync::mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let (mut left, mut right, mut dot, mut frames_heard) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+                let mut wide = false;
+                while let Ok(frame) = frames.recv() {
+                    for (&l, &r) in frame[0].iter().zip(&frame[1]) {
+                        let (l, r) = (f64::from(l), f64::from(r));
+                        left += l * l;
+                        right += r * r;
+                        dot += l * r;
+                    }
+                    frames_heard += 1;
+                    if frames_heard == 4 {
+                        wide |= left.min(right) > f64::from(PLAYING) && dot < 0.95 * (left * right).sqrt();
+                        (left, right, dot, frames_heard) = (0.0, 0.0, 0.0, 0);
+                    }
+                    if answer.send(wide).is_err() {
+                        return;
+                    }
+                }
+            });
+            Self { input: Some(input), output, worker: Some(worker) }
+        }
+        fn wide(&self, frame: &[[f32; 2]]) -> bool {
+            self.input
+                .as_ref()
+                .unwrap()
+                .send(std::array::from_fn(|side| std::array::from_fn(|i| frame[i][side])))
+                .unwrap();
+            self.output.recv().unwrap()
+        }
+    }
+    impl Drop for ContentChoice {
+        fn drop(&mut self) {
+            drop(self.input.take());
+            let _ = self.worker.take().unwrap().join();
+        }
+    }
+
+    /// Compares the production Processing path, including warming qualification,
+    /// the cold fallback, handover and capture delay. Mono never pins. The near
+    /// voice is independent, and echo is measured 250 ms into its silent turns.
+    /// The new route detector is disabled to isolate #220's channel/tuning choice.
+    /// No gain, denoiser, gate, device or real-time scheduler is involved.
+    #[test]
+    #[ignore = "a channel/tuning comparison; release, alone, single-threaded"]
+    fn independent_talker_channel_tradeoffs() {
+        let _scope = measurement_scope();
+        let pin = 6 * RATE;
+        let total = pin + 32 * RATE;
+        let windows = [(0, 3), (3, 8), (8, 16), (16, 32)];
+        let lead = long_voice(total, 150.0, -20.0);
+        let a = long_voice(total, 120.0, -14.0);
+        let b = talker(total, 187.0, 2.17, 4.31, -14.0);
+        let names = ["stereo", "mono downmix", "stereo mono-like suppressor", "content correlation"];
+        for shape in ["mono content", "panned", "wide independent", "wide antiphase"] {
+            let far: Vec<[f32; 2]> = (0..total)
+                .map(|i| {
+                    if i < pin {
+                        return [lead[i]; 2];
+                    }
+                    match shape {
+                        "mono content" => [a[i]; 2],
+                        "panned" => [a[i], 0.0],
+                        "wide independent" => [a[i], b[i]],
+                        _ => [a[i], -a[i]],
+                    }
+                })
+                .collect();
+            let left = left_channel(&far);
+            let right: Vec<f32> = far.iter().map(|pair| pair[1]).collect();
+            for acoustic in ["headphones", "left speaker", "both speakers"] {
+                let mut kept = [[0.0f32; 4]; 4];
+                let mut residual = [[0.0f32; 4]; 4];
+                let mut count = 0.0;
+                for delay in [20, 60, 150] {
+                    let l = room(&left, delay);
+                    let r = room(&right, delay + 15);
+                    let echo: Vec<f32> = (0..total)
+                        .map(|i| match acoustic {
+                            "headphones" => 0.0,
+                            "left speaker" => l[i],
+                            _ => l[i] + 0.7 * r[i],
+                        })
+                        .collect();
+                    for (pitch, vibrato, syllables) in [(213.0, 3.1, 3.3), (176.0, 2.3, 4.1), (251.0, 3.7, 2.9)] {
+                        count += 1.0;
+                        let said: Vec<f32> = talker(total, pitch, vibrato, syllables, -24.0)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, s)| if (i / RATE).is_multiple_of(2) { 0.0 } else { s })
+                            .collect();
+                        let mic: Vec<f32> = echo.iter().zip(&said).map(|(e, s)| e + s).collect();
+                        for mode in 0..4 {
+                            MEASURE_MONO_SUPPRESSOR.store(mode == 2, Ordering::Relaxed);
+                            let mut p = if mode == 1 { session(LEARNING_FRAMES) } else { warm_session() };
+                            let mut out = Vec::with_capacity(total);
+                            let content = (mode == 3).then(ContentChoice::new);
+                            for at in (0..total).step_by(FRAME) {
+                                let pin_now = if let Some(content) = &content {
+                                    at >= pin && content.wide(&far[at..at + FRAME])
+                                } else {
+                                    mode != 1 && at == pin
+                                };
+                                if pin_now {
+                                    p.caught_up();
+                                    p.pin_stereo();
+                                    p.collected();
+                                }
+                                out.extend(tick(&mut p, &far[at..at + FRAME], &mic[at..at + FRAME]));
+                                if mode != 1 {
+                                    p.ready_for_the_next_frame();
+                                }
+                            }
+                            let mut case_kept = [0.0f32; 4];
+                            let mut case_echo = [0.0f32; 4];
+                            for (w, (from, to)) in windows.iter().enumerate() {
+                                let mut speaking = 0;
+                                let mut through = 0;
+                                let mut quiet = Vec::new();
+                                for at in (pin + from * RATE..pin + to * RATE).step_by(FRAME) {
+                                    if db(&said[at..at + FRAME]) > -40.0 {
+                                        speaking += 1;
+                                        through +=
+                                            usize::from(db(&out[at..at + FRAME]) > db(&said[at..at + FRAME]) - 10.0);
+                                    } else if (at / RATE).is_multiple_of(2) && at % RATE >= RATE / 4 {
+                                        quiet.extend_from_slice(&out[at..at + FRAME]);
+                                    }
+                                }
+                                case_kept[w] = through as f32 / speaking as f32;
+                                case_echo[w] = db(&quiet);
+                                kept[mode][w] += case_kept[w];
+                                residual[mode][w] += case_echo[w];
+                            }
+                            eprintln!(
+                                "channel-case,{shape},{acoustic},{delay},{pitch},{mode},{case_kept:?},{case_echo:?}"
+                            );
+                        }
+                    }
+                }
+                for mode in 0..4 {
+                    eprintln!(
+                        "channels {shape} / {acoustic} / {} / {count} cases: kept {:?}; quiet dBFS {:?}",
+                        names[mode],
+                        kept[mode].map(|v| (1000.0 * v / count).round() / 1000.0),
+                        residual[mode].map(|v| (10.0 * v / count).round() / 10.0)
+                    );
+                }
+            }
+        }
+        MEASURE_MONO_SUPPRESSOR.store(false, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "deep-filter")]
+    mod tones;
+
+    mod reference_options;
+
+    /// A talker that shares nothing with [`long_voice`]: its own vibrato and syllable rates and its
+    /// own harmonic phases, so no part of it is a delayed copy of the far voice that a canceller
+    /// could learn as echo, as one [`voice`] is of another, locked to the same rates.
+    fn talker(len: usize, pitch: f64, vibrato: f64, syllables: f64, dbfs: f32) -> Vec<f32> {
+        let mut phase = 0f64;
+        let mut out: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f64 / RATE as f64;
+                let f0 = pitch * (1.0 + 0.12 * (std::f64::consts::TAU * vibrato * t + 1.0).sin());
+                phase = (phase + std::f64::consts::TAU * f0 / RATE as f64) % std::f64::consts::TAU;
+                let harmonics: f64 =
+                    (1..).map(f64::from).take_while(|h| h * f0 < 5_000.0).map(|h| (h * phase + h * h).sin() / h).sum();
+                (harmonics * (std::f64::consts::PI * ((syllables * t + 0.37) % 1.0)).sin().powi(2)) as f32
+            })
+            .collect();
+        let gain = 10f32.powf(dbfs / 20.0) / (out.iter().map(|x| x * x).sum::<f32>() / len as f32).sqrt();
+        out.iter_mut().for_each(|x| *x *= gain);
+        out
     }
 }

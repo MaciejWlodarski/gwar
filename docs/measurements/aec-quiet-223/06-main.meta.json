@@ -1,0 +1,73 @@
+{
+  "arm": "main",
+  "sha": "6c1c45c9d677b63f6b61ba25a91fcd997a014ca1",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+  "binary_sha256": "c09245733f7d8cf1bb3695bd56e5e05dd0f1ea8042874e38019df545eef784be",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T20:35:42.220972+00:00",
+    "load": [
+      2.2158203125,
+      2.7255859375,
+      3.47705078125
+    ],
+    "uptime": "21:35  up  8:59, 2 users, load averages: 2.22 2.73 3.48",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": false,
+  "invalid_reasons": [
+    "overlap with another cargo/test or #213 timing"
+  ],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T20:35:42.298638+00:00",
+    "load": [
+      2.2158203125,
+      2.7255859375,
+      3.47705078125
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 13081,
+  "test_nice": 10,
+  "exit_code": -15,
+  "after": {
+    "at": "2026-11-04T20:36:02.730953+00:00",
+    "load": [
+      2.080078125,
+      2.66162109375,
+      3.43603515625
+    ],
+    "uptime": "21:36  up  8:59, 2 users, load averages: 2.08 2.66 3.44",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "peak_load_1m": 2.2158203125,
+  "pair_count": 0
+}
