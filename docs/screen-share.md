@@ -316,7 +316,12 @@ decode stays for browser compatibility.
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
   The share and other viewers continue. There is no transcoding or native
   compatibility layer in A2. The decode watchdog isolates one failing viewer
-  after a two-second corroboration window. Only failure reports from every active
+  after a two-second corroboration window. A report counts only when the
+  viewer's slot has carried a whole stream for the four-second watchdog window:
+  a keyframe released in full and nothing of the slot dropped at the SFU since
+  (evictions, rejected or failed keyframes, a pause or resume). A decoder starved
+  by the SFU's own drops is not a decoder that cannot decode, and taking it for
+  one once isolated a viewer for the rest of a watch. Only failure reports from every active
   H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
   a lower H.264 target, then VP9 when all peers offered it. Reports are limited
   per viewer/share to one every ten seconds; the share has a ten-second hold-down.
@@ -2068,6 +2073,30 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   share that sent nothing yet has no rate, and its viewer starts at 2.5 Mbps as before: its cap is an admission
   ceiling, not the encoder's rate. A share added next to one already flowing
   joins at the measured estimate and grows by probing.
+
+  A **young share** (sending for less than 2 s) is averaged over its own life,
+  at least 1 s, instead of the whole 2 s window: a viewer joining one second in
+  would otherwise start from half of what it sends. A browser's encoder also
+  ramps for seconds (1–2 Mb/s in its first second and several times that five
+  seconds later are common), so a share counts as **ramping** for its first
+  10 s, and a viewer that joined it while nothing else flows on its transport
+  **follows it up**: each time the share grows by 1.2×, the viewer starts over
+  from the share's start estimate, as if it had joined a moment later. While
+  the share is young, growth is its start estimate's; after that, its largest
+  recent frame other than a keyframe, since keyframes (which the viewer's own
+  requests add) say nothing about a ramp. It does so only while its link
+  carries the last start (its estimate is at least 75% of it), so a slow link is
+  overrun once, as by any optimistic start, and not again; a pause or a second
+  flowing slot ends it. Before November 2026 such a viewer kept its early start
+  and grew only by probing, so its frames were evicted below the share's rate
+  and every keyframe the SFU asked for failed in turn, for seconds. Simulated on
+  a 20 ms ±5 ms link, a 4 Mb/s share's first viewer lost 7–22 keyframes over
+  3–11 s; now 1–2 in its first 2 s and none after. A share ramping from 1.3 to
+  4 Mb/s from its second second cost 433 evicted packets on a clean link and
+  1049–1975 (up to 18 failed keyframes) on the jittery one; now 59 (one
+  keyframe, once) and 8–1034 (up to 9). What jitter still costs is the
+  estimator's own back-off below the share's rate, which a steady 4 Mb/s share
+  meets too (111 and 548 packets evicted on two of five seeds).
 
   The start moves only ceilings: the SFU still forwards no more than the share
   sends, probes stay within the extras reserve, and nothing a client sends

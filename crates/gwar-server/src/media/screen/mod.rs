@@ -108,6 +108,20 @@ const ALLOCATION_TICK: Duration = Duration::from_millis(100);
 /// started. The continuous-fit resume may come first. A viewer's own Try again waits as long
 /// after its last start or retry.
 const RETRY_FIRST: Duration = Duration::from_secs(15);
+/// A viewer that joined a share in its first seconds started from what was known of it then:
+/// a share younger than its average window is measured over less than it will send, and a
+/// browser's encoder ramps up for seconds (`egress::ENCODER_RAMP`). Each time the share grows by
+/// this factor, the viewer starts over from the share's start estimate, as it would have had it
+/// joined a moment later. Growth is its start estimate's while it is young, and after that its
+/// largest recent frame other than a keyframe: keyframes, which the viewer's own requests add,
+/// say nothing about a ramp.
+/// Otherwise its frames are evicted below the share's rate and every keyframe the SFU asks for
+/// fails in turn, for as long as probing takes to catch up: seconds.
+const CATCH_UP_STEP: f64 = 1.2;
+/// A viewer's link that holds its estimate below this share of the last start has not carried
+/// it: it is not started higher until it does, so a slow link is overrun once, as by any
+/// optimistic start.
+const CATCH_UP_HELD: f64 = 0.75;
 /// After `n` retries that failed since media last kept flowing, the next one comes
 /// `RETRY_BACKOFF[n]` after the pause (the last entry from then on): two quick ones for a dip
 /// that passes, then 2.5, 5, 10 and 20 minutes for a link that stays slow.
@@ -176,6 +190,12 @@ pub struct ScreenOrigin {
     /// What a viewer joining it starts from, refreshed from its measured rate every allocation
     /// tick (`egress::start_estimate`); zero until the first tick.
     start_bps: AtomicU64,
+    /// It sent for less than `egress::ENCODER_RAMP`, or nothing yet: its rate may still grow.
+    ramping: AtomicBool,
+    /// It sent for less than `egress::AVERAGE_WINDOW`, or nothing yet: its average is filling.
+    young: AtomicBool,
+    /// Its largest recent frame other than a keyframe, bytes (`ShareRate::largest_delta`).
+    delta_bytes: AtomicU64,
 }
 
 impl ScreenOrigin {
@@ -199,6 +219,9 @@ impl ScreenOrigin {
             audio_negotiated: AtomicBool::new(false),
             recovery: Default::default(),
             start_bps: AtomicU64::new(0),
+            ramping: AtomicBool::new(true),
+            young: AtomicBool::new(true),
+            delta_bytes: AtomicU64::new(0),
         })
     }
 
@@ -207,8 +230,21 @@ impl ScreenOrigin {
         self.start_bps.load(Ordering::Relaxed).max(INITIAL_ESTIMATE)
     }
 
-    fn measured(&self, rate: ShareRate) {
+    fn measured(&self, rate: ShareRate, young: bool, ramping: bool) {
         self.start_bps.store(egress::start_estimate(rate, self.cap_bps), Ordering::Relaxed);
+        self.young.store(young, Ordering::Relaxed);
+        self.ramping.store(ramping, Ordering::Relaxed);
+        self.delta_bytes.store(rate.largest_delta as u64, Ordering::Relaxed);
+    }
+
+    /// A viewer joining now may start from less than the share will send in a few seconds.
+    fn ramping(&self) -> bool {
+        self.ramping.load(Ordering::Relaxed)
+    }
+
+    /// Its average is still filling its window.
+    fn young(&self) -> bool {
+        self.young.load(Ordering::Relaxed)
     }
     /// Whether the transport has sound; a publisher's stop leaves the m-line in place.
     fn audio_negotiated(&self, negotiated: bool) {
@@ -669,6 +705,10 @@ struct Slot {
     last_av1: Option<(Instant, av1_stream::Requirements)>,
     decode_cap: Option<(u32, u32)>,
     failed_at: Option<Instant>,
+    /// Since when the viewer has had the slot's media whole: a keyframe released in full, and
+    /// nothing of the slot dropped at the SFU since. Only then does a decode stall say anything
+    /// about the viewer's decoder.
+    intact_since: Option<Instant>,
     /// The state its last info-level line logged for this assignment: paused or not.
     logged: Option<bool>,
 }
@@ -697,6 +737,7 @@ impl Slot {
             last_av1: None,
             decode_cap: None,
             failed_at: None,
+            intact_since: None,
             logged: None,
         }
     }
@@ -709,6 +750,7 @@ impl Slot {
     }
 
     fn dropped(&mut self, now: Instant) {
+        self.intact_since = None;
         self.segment.wait();
         self.initial_in_flight = None;
         if self.initial_delivered.is_none() {
@@ -727,6 +769,17 @@ struct Attempt {
     start: u64,
     /// It counts towards `retries` (a Try again does not).
     counted: bool,
+}
+
+/// A viewer's start following its ramping share (`CATCH_UP_STEP`), as of the last start.
+#[derive(Clone, Copy)]
+struct CatchUp {
+    slot: usize,
+    /// The share's start estimate and largest delta frame then.
+    start: u64,
+    delta: u64,
+    /// The viewer's estimate it started from.
+    estimate: u64,
 }
 
 struct Watcher {
@@ -781,6 +834,8 @@ struct Watcher {
     step: u64,
     /// The retry in progress, until its next bandwidth pause tells whether the link carried it.
     attempt: Option<Attempt>,
+    /// A join to a ramping share (`CATCH_UP_STEP`), as of its last start.
+    catch_up: Option<CatchUp>,
     /// The start of the last retry, which was inconclusive: the next automatic one comes
     /// `RETRY_FIRST` after it started, at least `RETRY_STEP` above it and with room for its
     /// share's keyframe.
@@ -1088,6 +1143,7 @@ impl Sfu {
                         w.slots[index].last_h264 = None;
                         w.slots[index].last_av1 = None;
                         w.slots[index].failed_at = None;
+                        w.slots[index].intact_since = None;
                         wipe(&mut w.rtc, w.slots[index].mid);
                     }
                 }
@@ -1670,7 +1726,7 @@ impl Sfu {
             .iter_mut()
             .map(|(share, p)| {
                 let rate = p.rate.rate(now);
-                p.origin.measured(rate);
+                p.origin.measured(rate, p.rate.young(now), p.rate.ramping(now));
                 (share.clone(), rate)
             })
             .collect();
@@ -2197,6 +2253,12 @@ impl Sfu {
         if now.saturating_duration_since(at) > Duration::from_secs(2) {
             return;
         }
+        // Frames the SFU evicted, or a keyframe that never went out whole, stop a decoder as
+        // surely as a codec it cannot decode: only a whole stream for the watchdog's window counts.
+        if !slot.intact_since.is_some_and(|at| now.saturating_duration_since(at) >= DECODE_WINDOW) {
+            debug!(session, run, slot = index, generation, share, "screen decode failure ignored: media was dropped");
+            return;
+        }
         if self
             .decode_reports
             .get(&(session, share.to_owned()))
@@ -2658,6 +2720,7 @@ fn allocate(
         w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired.unwrap_or(0)));
         w.desired = desired;
     }
+    catch_up(w, rates, now);
     // Finish a ready priority handoff or resume before considering a fresh start.
     if let Some((slot, change)) = w.egress.allocate(now, &lanes, budget) {
         if change == Change::Resume && w.restarted.is_some() {
@@ -3037,6 +3100,7 @@ fn apply(w: &mut Watcher, slot: usize, change: Change) {
             }
             let s = &mut w.slots[slot];
             s.segment.wait();
+            s.intact_since = None;
             s.initial_in_flight = None;
             s.asked = None;
             s.originals.clear();
@@ -3045,6 +3109,7 @@ fn apply(w: &mut Watcher, slot: usize, change: Change) {
         Change::Resume => {
             w.egress.resume(slot);
             w.slots[slot].segment.wait();
+            w.slots[slot].intact_since = None;
         }
     }
 }
@@ -3090,11 +3155,54 @@ fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now
     // to a share already flowing, the estimate is measured and grows by probing instead.
     if !w.egress.others_active(index) {
         start_optimistic(w, index, &HashMap::new(), now);
+        w.catch_up = w.slots[index].grant.as_ref().filter(|g| g.origin.ramping()).map(|g| CatchUp {
+            slot: index,
+            start: g.origin.start_estimate(),
+            delta: g.origin.delta_bytes.load(Ordering::Relaxed),
+            estimate: w.egress.estimate(),
+        });
     }
+}
+
+/// A join's start follows its share up while the share ramps (see `CATCH_UP_STEP`), as long as
+/// the viewer's link carries the last start (`CATCH_UP_HELD`), until the slot pauses or another
+/// slot flows. Each step is the start the share would get now.
+fn catch_up(w: &mut Watcher, rates: &HashMap<String, ShareRate>, now: Instant) {
+    let Some(last) = w.catch_up else { return };
+    let Some(origin) = w.slots[last.slot].grant.as_ref().filter(|g| g.alive() && g.origin.ramping()).map(|g| &g.origin)
+    else {
+        w.catch_up = None;
+        return;
+    };
+    if w.egress.paused(last.slot).is_some() || w.egress.others_active(last.slot) {
+        w.catch_up = None;
+        return;
+    }
+    let (start, delta) = (origin.start_estimate(), origin.delta_bytes.load(Ordering::Relaxed));
+    let grew = |now: u64, then: u64| now as f64 >= CATCH_UP_STEP * then as f64 && now > then;
+    let ramped = if origin.young() { grew(start, last.start) } else { grew(delta, last.delta) };
+    if !ramped || (w.egress.estimate() as f64) < CATCH_UP_HELD * last.estimate as f64 {
+        return;
+    }
+    let target = start_target(w, last.slot);
+    if target > w.egress.estimate() {
+        debug!(
+            session = w.session,
+            slot = last.slot,
+            from = w.egress.estimate(),
+            to = target,
+            "screen watch start catches up with its share"
+        );
+        start_at(w, target, rates, now);
+    }
+    w.catch_up = Some(CatchUp { start, delta, estimate: w.egress.estimate(), ..last });
 }
 
 /// Empties a slot: nothing of its old media is sent after this, repairs and probes included.
 fn empty(w: &mut Watcher, index: usize, now: Instant) {
+    if w.catch_up.is_some_and(|c| c.slot == index) {
+        w.catch_up = None;
+    }
     let slot = &mut w.slots[index];
     slot.grant = None;
     slot.logged = None;
@@ -3109,6 +3217,7 @@ fn empty(w: &mut Watcher, index: usize, now: Instant) {
     slot.last_av1 = None;
     slot.decode_cap = None;
     slot.failed_at = None;
+    slot.intact_since = None;
     slot.originals.clear();
     w.egress.unassign(index);
     if let Some(audio) = w.audio.get_mut(index) {
@@ -3366,6 +3475,7 @@ fn release(w: &mut Watcher, now: Instant) {
             slot.initial_in_flight = None;
             slot.initial_delivered = Some(slot.asked.unwrap_or(now));
             slot.initial_failed = None;
+            slot.intact_since.get_or_insert(now);
         }
         let mut direct = w.rtc.direct_api();
         let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { continue };
@@ -3670,6 +3780,7 @@ fn watcher(
         healthy_since: None,
         step: 0,
         attempt: None,
+        catch_up: None,
         untested: None,
         failed: None,
         struck: None,
@@ -4144,12 +4255,16 @@ pub(crate) mod tests {
     fn a_watch_with_nothing_else_flowing_starts_from_its_share_or_the_sessions_higher_estimate() {
         let measured = |cap| {
             let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, cap);
-            origin.measured(ShareRate {
-                average: 8_000_000.0,
-                last_keyframe: 200_000,
-                largest_keyframe: 200_000,
-                largest_delta: 17_000,
-            });
+            origin.measured(
+                ShareRate {
+                    average: 8_000_000.0,
+                    last_keyframe: 200_000,
+                    largest_keyframe: 200_000,
+                    largest_delta: 17_000,
+                },
+                false,
+                false,
+            );
             origin
         };
         let mut pair = Pair::new();
@@ -4763,6 +4878,7 @@ pub(crate) mod tests {
             pair.w.decode_watchdog = true;
             assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), session.into(), now);
             pair.w.slots[0].keyframe_at = Some(now);
+            pair.w.slots[0].intact_since = Some(now);
             pair.w.slots[0].last_h264 = Some((now + Duration::from_secs(5), need));
             watchers.insert(session, pair.w);
         }
@@ -5305,6 +5421,21 @@ pub(crate) mod tests {
         sfu.decode_failed(session, 1, 0, generation, "h264", now);
     }
 
+    /// A viewer whose slot lost media at the SFU since its keyframe had nothing whole to decode:
+    /// its decode watchdog firing then says nothing about its decoder. Taken for one, it was
+    /// isolated as unable to decode the share and saw no picture for the rest of the watch.
+    #[tokio::test]
+    async fn media_the_sfu_dropped_is_never_taken_for_a_decoder_that_fails() {
+        let (mut sfu, origin, now, _) = recovery_fixture(&[7]).await;
+        sfu.watchers.get_mut(&7).unwrap().slots[0].dropped(now + Duration::from_secs(2));
+        let at = now + Duration::from_secs(5);
+        report(&mut sfu, 7, at);
+        assert!(sfu.watchers[&7].slots[0].failed_at.is_none(), "the report is not taken");
+        sfu.recoveries(at + CORROBORATE_FOR);
+        assert!(sfu.watchers[&7].slots[0].grant.as_ref().is_some_and(|g| g.alive()), "the viewer keeps its slot");
+        assert!(!origin.recovery.lock().unwrap().pending);
+    }
+
     #[tokio::test]
     async fn one_reporter_is_isolated_without_changing_healthy_viewers_or_native_watches() {
         for native in [false, true] {
@@ -5346,6 +5477,7 @@ pub(crate) mod tests {
         let at = at + recovery::HOLD_DOWN;
         for w in sfu.watchers.values_mut() {
             w.slots[0].keyframe_at = Some(at - DECODE_WINDOW);
+            w.slots[0].intact_since = Some(at - DECODE_WINDOW);
             w.slots[0].last_h264 = Some((at, need));
         }
         report(&mut sfu, 7, at);
@@ -5413,6 +5545,7 @@ pub(crate) mod tests {
         let failed = trial + DECODE_WINDOW;
         for w in sfu.watchers.values_mut() {
             w.slots[0].keyframe_at = Some(trial);
+            w.slots[0].intact_since = Some(trial);
             w.slots[0].last_h264 = Some((failed, need));
         }
         for session in [7, 8] {
