@@ -523,9 +523,10 @@ describe("verified H.264 decode capability and progress", () => {
     // crates/gwar-server/src/media/screen/decode_reports.json holds this watchdog's report
     // times for a viewer whose decoder never decodes, for each poll period and delay of its
     // first sample after the keyframe notification. The SFU replays every pair of them against
-    // its corroboration window. Regenerate with UPDATE_DECODE_REPORTS=1 after changing the
-    // watchdog's timing.
-    const { DecodeWatchdog } = await import("./screen");
+    // its corroboration window, and checks the header's constants against the ones it derives
+    // the window from. Regenerate with UPDATE_DECODE_REPORTS=1 after changing the watchdog's
+    // timing.
+    const { DecodeWatchdog, DECODE_STALL_MS, DECODE_REPORT_EVERY_MS, DECODE_POLL_GAP_MS } = await import("./screen");
     const { readFileSync, writeFileSync } = await import("node:fs");
     const path = new URL("../../../../crates/gwar-server/src/media/screen/decode_reports.json", import.meta.url);
     const lines: string[] = [];
@@ -537,7 +538,8 @@ describe("verified H.264 decode capability and progress", () => {
         lines.push(JSON.stringify({ period, delay, reports }));
       }
     }
-    const json = `[\n${lines.join(",\n")}\n]\n`;
+    const header = JSON.stringify({ stall: DECODE_STALL_MS, every: DECODE_REPORT_EVERY_MS, gap: DECODE_POLL_GAP_MS }).slice(0, -1);
+    const json = `${header},"schedules":[\n${lines.join(",\n")}\n]}\n`;
     if (process.env.UPDATE_DECODE_REPORTS) writeFileSync(path, json);
     expect(readFileSync(path, "utf8")).toBe(json);
   });

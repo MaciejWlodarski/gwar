@@ -95,13 +95,16 @@ const CLIENT_POLL_GAP_MS: u64 = 1_500;
 /// Differences between viewers, or between one viewer's reports, in transit.
 const REPORT_TRANSIT_MS: u64 = 500;
 /// Allow independent watchdog reports to meet before isolating a failed watch: one report
-/// period, one poll gap and the transit allowance (7 s). Once a report is taken, every other
-/// viewer stalled on the same stream has one inside it, whatever the phase of its polls, as long
-/// as its first stats sample came within `CLIENT_REPORT_EVERY_MS` of the keyframe notification:
-/// a report taken at the earliest `DECODE_WINDOW` after the notification leaves room for a first
-/// report `DECODE_WINDOW + CLIENT_POLL_GAP_MS` after such a sample. Viewers' stalls start at
-/// their own first samples, which can be seconds apart: 2 s isolated one of two failing viewers
-/// whose retries came 2.84 s apart.
+/// period, one poll gap and the transit allowance (7 s), counted from the failure or from
+/// `DECODE_WINDOW` after a fellow browser viewer's slot first went out whole in its generation,
+/// whichever is later (`recoveries`). From then on that fellow's reports are taken; it reports
+/// at least once in any report period and poll gap, and its first report comes at most
+/// `DECODE_WINDOW + CLIENT_POLL_GAP_MS` after its first stats sample. So a fellow that stalled
+/// too has a report taken inside the window, whatever the phase of its polls and however long
+/// its keyframe took to go out at its pacing, as long as its first sample came within
+/// `CLIENT_REPORT_EVERY_MS` of its keyframe notification and its slot went out whole before the
+/// window ended. Viewers' stalls start at their own first samples, which can be seconds apart:
+/// 2 s isolated one of two failing viewers whose retries came 2.84 s apart.
 const CORROBORATE_FOR: Duration =
     Duration::from_millis(CLIENT_REPORT_EVERY_MS + CLIENT_POLL_GAP_MS + REPORT_TRANSIT_MS);
 /// At most one taken report per viewer and share this often. It bounds what a client that
@@ -735,6 +738,9 @@ struct Slot {
     /// nothing of the slot dropped at the SFU since. Only then does a decode stall say anything
     /// about the viewer's decoder. Every wait for a keyframe clears it (`wait_keyframe`).
     intact_since: Option<Instant>,
+    /// When the slot's first keyframe of this generation went out whole. A fellow viewer's
+    /// failure report waits for this viewer's own report from then on (`recoveries`).
+    whole_at: Option<Instant>,
     /// The keyframe being released from its first packet on, with nothing dropped since.
     whole_key: Option<u32>,
     /// The highest output number at the last wait for a keyframe: packets at or below it were
@@ -769,6 +775,7 @@ impl Slot {
             decode_cap: None,
             failed_at: None,
             intact_since: None,
+            whole_at: None,
             whole_key: None,
             fence: None,
             logged: None,
@@ -795,6 +802,7 @@ impl Slot {
         if packet.marker && self.whole_key == Some(frame) {
             self.whole_key = None;
             self.intact_since.get_or_insert(now);
+            self.whole_at.get_or_insert(now);
         }
     }
 
@@ -1195,6 +1203,7 @@ impl Sfu {
                         w.slots[index].originals.clear();
                         w.slots[index].generation = w.slots[index].generation.wrapping_add(1);
                         w.slots[index].keyframe_at = None;
+                        w.slots[index].whole_at = None;
                         w.slots[index].last_h264 = None;
                         w.slots[index].last_av1 = None;
                         w.slots[index].failed_at = None;
@@ -2412,13 +2421,25 @@ impl Sfu {
             if origin.recovery.lock().expect("recovery lock").pending {
                 continue;
             }
+            // A fellow browser viewer that has not reported has its reports taken only once its own
+            // slot has been whole for `DECODE_WINDOW`: the window runs from then at the earliest.
+            let fellows = self
+                .slots_of(&share)
+                .into_iter()
+                .filter_map(|(s, i)| {
+                    let (w, slot) = (&self.watchers[&s], &self.watchers[&s].slots[i]);
+                    let reporting = w.decode_watchdog && slot.failed_at.is_none();
+                    let whole = slot.whole_at.filter(|_| reporting && slot.grant.as_ref().is_some_and(|g| g.alive()));
+                    whole.map(|at| at + DECODE_WINDOW)
+                })
+                .max();
             let failed: Vec<_> = self
                 .slots_of(&share)
                 .into_iter()
                 .filter(|(s, i)| {
-                    self.watchers[s].slots[*i]
-                        .failed_at
-                        .is_some_and(|at| now.saturating_duration_since(at) >= CORROBORATE_FOR)
+                    self.watchers[s].slots[*i].failed_at.is_some_and(|at| {
+                        now.saturating_duration_since(fellows.map_or(at, |f| f.max(at))) >= CORROBORATE_FOR
+                    })
                 })
                 .collect();
             if !failed.is_empty() && !self.try_recover(&share, now) {
@@ -3265,6 +3286,7 @@ fn empty(w: &mut Watcher, index: usize, now: Instant) {
     slot.initial_failed = None;
     slot.keyframe_pending = None;
     slot.keyframe_at = None;
+    slot.whole_at = None;
     slot.last_h264 = None;
     slot.last_av1 = None;
     slot.decode_cap = None;
@@ -4930,6 +4952,7 @@ pub(crate) mod tests {
             assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), session.into(), now);
             pair.w.slots[0].keyframe_at = Some(now);
             pair.w.slots[0].intact_since = Some(now);
+            pair.w.slots[0].whole_at = Some(now);
             pair.w.slots[0].last_h264 = Some((now + Duration::from_secs(5), need));
             watchers.insert(session, pair.w);
         }
@@ -5697,10 +5720,17 @@ pub(crate) mod tests {
 
     /// Report times, in ms after the keyframe notification, of the browser's real decode
     /// watchdog for a decoder that never decodes: `(poll period, first-sample delay, reports)`.
-    /// `screen.test.ts` regenerates `decode_reports.json` and fails while it is stale.
+    /// `screen.test.ts` regenerates `decode_reports.json` from the watchdog and its constants,
+    /// and fails while it is stale; the constants must match the ones the SFU derives from.
     fn watchdog_reports() -> Vec<(u64, u64, Vec<u64>)> {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("decode_reports.json")).unwrap();
-        rows.iter()
+        let file: serde_json::Value = serde_json::from_str(include_str!("decode_reports.json")).unwrap();
+        assert_eq!(file["stall"].as_u64(), Some(DECODE_WINDOW.as_millis() as u64));
+        assert_eq!(file["every"].as_u64(), Some(CLIENT_REPORT_EVERY_MS));
+        assert_eq!(file["gap"].as_u64(), Some(CLIENT_POLL_GAP_MS));
+        file["schedules"]
+            .as_array()
+            .unwrap()
+            .iter()
             .map(|r| {
                 let times = r["reports"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap()).collect();
                 (r["period"].as_u64().unwrap(), r["delay"].as_u64().unwrap(), times)
@@ -5708,9 +5738,11 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Replays viewers 7's and 8's report times (ms after `start`, when both slots were armed
-    /// and whole) against the server's corroboration window. It ticks the window at every
-    /// report, before the report, and wherever a report's window ends. `switched`: the slots
+    /// Replays viewers 7's and 8's report times (ms after `start`, when both slots' keyframe was
+    /// queued and both watchdogs armed) against the server's corroboration window. Viewer 7's
+    /// keyframe goes out whole `whole[0]` ms after `start` and viewer 8's `whole[1]` ms after,
+    /// at their own pacing; until then their reports are not taken. It ticks the window at
+    /// every event, before it, and wherever a report's window could end. `switched`: the slots
     /// follow a codec switch whose reports were taken just before: viewer 7's at `start`, viewer
     /// 8's a whole corroboration window earlier, the widest the switch allows, so their
     /// throttles end apart. Ok once the fallback is planned with both viewers still watching.
@@ -5720,8 +5752,14 @@ pub(crate) mod tests {
         need: h264_stream::Requirements,
         start: Instant,
         viewers: [&[u64]; 2],
+        whole: [u64; 2],
         switched: bool,
     ) -> Result<(), String> {
+        enum Event {
+            Tick,
+            Whole(SessionId),
+            Report(SessionId),
+        }
         *origin.recovery.lock().unwrap() = Default::default();
         sfu.decode_reports.clear();
         sfu.outbox.clear();
@@ -5731,27 +5769,36 @@ pub(crate) mod tests {
             slot.failed_at = None;
             slot.decode_cap = None;
             slot.keyframe_at = Some(start);
-            slot.intact_since = Some(start);
+            slot.intact_since = None;
+            slot.whole_at = None;
             slot.last_h264 = Some((start, need));
             if switched {
                 let taken = if *session == 7 { start } else { start - CORROBORATE_FOR };
                 sfu.decode_reports.insert((*session, "h264".into()), taken);
             }
         }
-        let window = CORROBORATE_FOR.as_millis() as u64;
+        let (window, held) = (CORROBORATE_FOR.as_millis() as u64, DECODE_WINDOW.as_millis() as u64);
         let mut events = Vec::new();
-        for (session, times) in [7, 8].into_iter().zip(viewers) {
+        for ((session, times), whole) in [7, 8].into_iter().zip(viewers).zip(whole) {
+            events.extend([(whole, 1, Event::Whole(session)), (whole + held + window, 0, Event::Tick)]);
             for &at in times {
-                events.extend([(at, Some(session)), (at + window, None)]);
+                events.extend([(at, 2, Event::Report(session)), (at + window, 0, Event::Tick)]);
             }
         }
-        events.sort_by_key(|&(at, session)| (at, session.is_some()));
-        for (ms, session) in events {
+        events.sort_by_key(|&(at, order, _)| (at, order));
+        for (ms, _, event) in events {
             let at = start + Duration::from_millis(ms);
             sfu.recoveries(at);
-            if let Some(session) = session {
-                sfu.watchers.get_mut(&session).unwrap().slots[0].last_h264 = Some((at, need));
-                report(sfu, session, at);
+            match event {
+                Event::Tick => {}
+                Event::Whole(session) => {
+                    let slot = &mut sfu.watchers.get_mut(&session).unwrap().slots[0];
+                    (slot.intact_since, slot.whole_at) = (Some(at), Some(at));
+                }
+                Event::Report(session) => {
+                    sfu.watchers.get_mut(&session).unwrap().slots[0].last_h264 = Some((at, need));
+                    report(sfu, session, at);
+                }
             }
             if let Some(isolated) = [7, 8].into_iter().find(|s| sfu.watchers[s].slots[0].grant.is_none()) {
                 return Err(format!("viewer {isolated} isolated at {ms} ms"));
@@ -5775,17 +5822,35 @@ pub(crate) mod tests {
         let of = |period, delay| reports.iter().find(|r| r.0 == period && r.1 == delay).unwrap().2.clone();
         let (a, b) = (of(1270, 1600), of(1000, 0));
         assert_eq!((&a[..3], &b[..3]), (&[6680, 11_760, 16_840][..], &[4000, 9000, 14_000][..]));
+        let start = now + Duration::from_secs(10);
         for switched in [true, false] {
-            replay_reports(&mut sfu, &origin, need, now + Duration::from_secs(10), [&a, &b], switched).unwrap();
-            replay_reports(&mut sfu, &origin, need, now + Duration::from_secs(10), [&b, &a], switched).unwrap();
+            replay_reports(&mut sfu, &origin, need, start, [&a, &b], [0, 0], switched).unwrap();
+            replay_reports(&mut sfu, &origin, need, start, [&b, &a], [0, 0], switched).unwrap();
+            assert!(sfu.watchers.values().all(|w| w.slots[0].decode_cap.is_some()), "both get the fallback");
+        }
+    }
+
+    /// Review repro: viewer A's keyframe goes out whole 1.1 s after it was queued, at A's pacing,
+    /// and A's first stats sample comes at 1 s. A's report at 5,000 ms is not taken (whole for
+    /// 3.9 s only) and its next comes at 11,470 ms, after polls 1 s apart and one 1.49 s gap.
+    /// Viewer B, whole at once, is taken at 4,000 ms. Counted from B's report, the window ended at
+    /// 11,000 ms: B was isolated before A corroborated, and A's fallback no longer reached it.
+    #[tokio::test]
+    async fn a_viewer_whose_keyframe_goes_out_whole_later_still_corroborates() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
+        let (a, b) = ([5000, 11_470], [4000, 9000, 14_000]);
+        let start = now + Duration::from_secs(10);
+        for switched in [true, false] {
+            replay_reports(&mut sfu, &origin, need, start, [&a, &b], [1100, 0], switched).unwrap();
             assert!(sfu.watchers.values().all(|w| w.slots[0].decode_cap.is_some()), "both get the fallback");
         }
     }
 
     /// Every pair of poll periods (1, 1.27 and 1.5 s) and first-sample delays (0 to 3 s, every
-    /// 50 ms) of the real watchdog, on a fresh share and right after a codec switch, and with one
-    /// viewer's reports 0.5 s later in transit: both viewers corroborate, and the fallback keeps
-    /// both.
+    /// 50 ms) of the real watchdog, on a fresh share and right after a codec switch, with one
+    /// viewer's reports 0.5 s later in transit, and with either viewer's keyframe going out whole
+    /// up to 1.5 s after it was queued, or one of them 6 s after: both viewers corroborate, and
+    /// the fallback keeps both.
     #[tokio::test]
     async fn every_pair_of_poll_phases_corroborates() {
         let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
@@ -5796,12 +5861,16 @@ pub(crate) mod tests {
             for b in &reports {
                 for transit in [0, 500] {
                     let late: Vec<u64> = a.2.iter().map(|at| at + transit).collect();
-                    for switched in [true, false] {
-                        if let Err(e) = replay_reports(&mut sfu, &origin, need, start, [&late, &b.2], switched) {
-                            panic!(
-                                "A every {} ms from {} ms (+{transit} ms) vs B every {} ms from {} ms, switched {switched}: {e}",
-                                a.0, a.1, b.0, b.1
-                            );
+                    for whole in [[0, 0], [1500, 0], [0, 1500], [1500, 1500], [6000, 0]] {
+                        for switched in [true, false] {
+                            if let Err(e) =
+                                replay_reports(&mut sfu, &origin, need, start, [&late, &b.2], whole, switched)
+                            {
+                                panic!(
+                                    "A every {} ms from {} ms (+{transit} ms) vs B every {} ms from {} ms, whole after {whole:?} ms, switched {switched}: {e}",
+                                    a.0, a.1, b.0, b.1
+                                );
+                            }
                         }
                     }
                 }

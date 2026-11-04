@@ -359,6 +359,24 @@ decode stays for browser compatibility.
     4 s + 1.5 s after its first sample. A two-second window isolated one of two
     failing viewers whose retries came 2.84 s apart, and the fallback kept only
     the other.
+
+    The notification goes out when the keyframe is queued, but each viewer's
+    slot only becomes whole when the keyframe is released to it in full, and the
+    server ignores a viewer's reports until 4 s after that. A viewer whose slot
+    went whole later than the reporter's can have its first counted report
+    arrive after the reporter's window: with polls every 1000 ms, the reporter
+    taken at 4 s, and a fellow whose reports come at 5 s and 11.47 s and whose
+    slot went whole after 1 s, the 5 s report is ignored and the reporter was
+    isolated at 11 s. So the window counts from the report taken, or from 4 s
+    after the latest first whole keyframe of a fellow viewer still reporting,
+    whichever is later. Every report a fellow sends from 4 s after it went whole
+    is taken, it sends one at least every 6.5 s, and its first comes at most
+    5.5 s after its first sample, so whatever the release skew, it corroborates
+    inside the window if its first sample came within 5 s of the notification
+    and its slot went whole before the window ends. The window uses each slot's
+    first whole keyframe of the generation, not its latest, so a fellow that
+    keeps losing keyframes cannot hold isolation off; a fellow that never went
+    whole is not waited for.
   - **Report throttle** (`REPORT_THROTTLE`) = 5 s - 1.5 s - 0.5 s = 3 s: at most
     one taken report per viewer and share this often. It bounds what a client
     that reports too often can cost, a recovery check and a keyframe request. It
@@ -375,7 +393,10 @@ decode stays for browser compatibility.
   - when every viewer fails, the share falls back with the last report taken,
     within 10.5 s, or when the hold-down from a previous replacement ends;
   - a lone failing viewer beside healthy ones is isolated 7 s after its report
-    is taken, at the next 100 ms housekeeping tick: within about 17.6 s.
+    is taken, or 7 s after 4 s past the latest first whole keyframe of a healthy
+    viewer, whichever is later, at the next 100 ms housekeeping tick: within
+    about 17.6 s, unless a healthy viewer's slot went whole more than 6.5 s after
+    the failing viewer's, in which case 11.1 s after that.
 
   Compared with main, a decoder that goes more than 4 s without a frame while
   packets arrive is reported on each such stall, at most once per 5 s; main
