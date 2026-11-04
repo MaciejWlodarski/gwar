@@ -322,20 +322,27 @@ decode stays for browser compatibility.
   dropped since. Every wait for a keyframe ends that (an eviction, a deadline or
   pacing drop, an ingress overrun, a codec switch, a recovery, a pause or
   resume), and the window starts again only with the next keyframe released
-  whole. A decoder starved by the SFU's own drops is not a decoder that cannot
+  whole that started after the wait. A keyframe already queued before the wait
+  does not count when it drains afterwards: the wait records the slot's highest
+  output sequence number, and only a keyframe above it can make the slot whole.
+  A decoder starved by the SFU's own drops is not a decoder that cannot
   decode, and taking it for one once isolated a viewer for the rest of a watch.
   Only failure reports from every active
   H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
   a lower H.264 target, then VP9 when all peers offered it. Reports are limited
   per viewer/share to one every ten seconds; the share has a ten-second hold-down.
-  The browser permits two reports per generation, with four-second detection and
-  a retry deadline ten seconds from the same observed stall. A report within ten
-  seconds of lost packets does not count towards the two, since the SFU's drops
-  reach the viewer as lost packets and the server ignores the reports they
-  starved: a decoder that never decodes is still reported twice once the stream
-  is whole, ten seconds apart. Only the server tells its own drops from the
-  network's, so a link that keeps losing packets keeps reporting every ten
-  seconds. Anchoring both to
+  The browser permits two counted reports per generation, with four-second
+  detection and a retry deadline ten seconds from the same observed stall. The
+  SFU's drops reach the viewer as lost packets, or as a poll with no new packets
+  while the slot waits for a keyframe, and the server ignores the reports they
+  starved. Every such sign starts the count over, even one that comes after a
+  report already went out, and a report counts only when it comes more than ten
+  seconds after the last sign. So a decoder that never decodes is reported again
+  five to sixteen seconds after the last sign, whatever order reports and drops
+  come in, and the server takes that report once the stream has been whole for
+  its window. Only the server tells its own drops from the network's, so while
+  signs keep coming the browser keeps reporting every ten seconds: one request
+  per stalled slot, which the server answers in constant time. Anchoring both to
   that stall avoids accumulating polling delays across the first report and retry,
   which could otherwise exceed the corroboration window during replacement.
   Watch slots survive replacement, old-publisher packets drop, and the replacement

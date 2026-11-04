@@ -481,6 +481,44 @@ describe("verified H.264 decode capability and progress", () => {
     for (let n = 0; n <= 45; n++) if (lossy.observe(n * 1000, n * 100, 0, n)) more.push(n);
     expect(more).toEqual([4, 10, 20, 30, 40]);
   });
+  it("reports again after a drop that came after a report, whenever it came", async () => {
+    const { DecodeWatchdog } = await import("./screen");
+    // The SFU drops right after the clean report at 10 s went out, so the server ignores it;
+    // the viewer only sees the loss at 11 s. Its two reports were spent, and it must report again.
+    const raced = new DecodeWatchdog();
+    const after = [];
+    for (let n = 0; n <= 60; n++) if (raced.observe(n * 1000, n * 100, 0, n >= 11 ? 40 : 0)) after.push(n);
+    expect(after).toEqual([4, 10, 20, 30, 40]);
+    // Review repro: loss at 2 s, reports at 4, 10, 20 and 30 s, then new loss at 33 s.
+    const late = new DecodeWatchdog();
+    const reports = [];
+    for (let n = 0; n <= 80; n++) if (late.observe(n * 1000, n * 100, 0, (n >= 2 ? 10 : 0) + (n >= 33 ? 10 : 0))) reports.push(n);
+    expect(reports).toEqual([4, 10, 20, 30, 40, 50, 60]);
+  });
+
+  it("reports a decoder that never decodes 5 to 16 s after the last sign of a drop, for any drop schedule", async () => {
+    const { DecodeWatchdog } = await import("./screen");
+    // The server takes a report 4 s after the slot is whole again; the last sign of a drop the
+    // viewer sees (lost packets, or a poll without new packets while the slot waits for its
+    // keyframe) comes no earlier than 1 s before that. A report between 5 and 16 s after it is
+    // taken: isolation or fallback within 16 s of the stream being whole, plus the server's 2 s.
+    let seed = 7;
+    const random = () => (seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31) / 2 ** 31;
+    for (let schedule = 0; schedule < 500; schedule++) {
+      const signs = new Set<number>();
+      for (let k = Math.floor(random() * 6); k > 0; k--) signs.add(Math.floor(random() * 60));
+      const pauses = new Set([...signs].filter(() => random() < 0.3));
+      const watchdog = new DecodeWatchdog();
+      const reports: number[] = [];
+      let packets = 0, lost = 0;
+      for (let n = 0; n <= 120; n++) {
+        if (pauses.has(n)) { /* no new packets this poll */ } else { packets += 100; if (signs.has(n)) lost += 10; }
+        if (watchdog.observe(n * 1000, packets, 0, lost)) reports.push(n);
+      }
+      const last = signs.size ? Math.max(...signs) : 0;
+      expect(reports.some(r => r > last + 5 && r <= last + 16), `signs ${[...signs]} pauses ${[...pauses]}: ${reports}`).toBe(true);
+    }
+  });
   it("reports persistent zero decode under traffic, with bounded retries and no network-gap false failure", async () => {
     const { DecodeWatchdog } = await import("./screen");
     const watchdog = new DecodeWatchdog();

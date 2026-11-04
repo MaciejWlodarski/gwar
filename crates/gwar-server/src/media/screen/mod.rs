@@ -711,6 +711,9 @@ struct Slot {
     intact_since: Option<Instant>,
     /// The keyframe being released from its first packet on, with nothing dropped since.
     whole_key: Option<u32>,
+    /// The highest output number at the last wait for a keyframe: packets at or below it were
+    /// queued before the wait, and none of them makes the slot whole again.
+    fence: Option<u64>,
     /// The state its last info-level line logged for this assignment: paused or not.
     logged: Option<bool>,
 }
@@ -741,6 +744,7 @@ impl Slot {
             failed_at: None,
             intact_since: None,
             whole_key: None,
+            fence: None,
             logged: None,
         }
     }
@@ -751,13 +755,15 @@ impl Slot {
         self.segment.wait();
         self.intact_since = None;
         self.whole_key = None;
+        self.fence = self.segment.highest_out();
     }
 
     /// A packet went out to the viewer. A keyframe released from its first packet to its last,
-    /// with no drop in between, makes the slot's media whole from now on.
+    /// with no drop in between, makes the slot's media whole from now on; only one that started
+    /// after the last wait for a keyframe, since a keyframe queued before it can still drain.
     fn released(&mut self, packet: &Queued, now: Instant) {
         let Some(frame) = packet.key_frame() else { return };
-        if packet.keyframe {
+        if packet.keyframe && self.fence.is_none_or(|fence| packet.out > fence) {
             self.whole_key = Some(frame);
         }
         if packet.marker && self.whole_key == Some(frame) {
@@ -5497,6 +5503,54 @@ pub(crate) mod tests {
             sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((at, need));
             report(&mut sfu, 7, at);
             assert_eq!(origin.recovery.lock().unwrap().pending, taken, "{after} s after the keyframe");
+        }
+    }
+
+    /// A whole keyframe already queued when the slot starts waiting still drains after the
+    /// wait, but it was cut off by the drop like everything else: only the replacement, which
+    /// starts after the wait, makes the slot whole, and the watchdog's window runs from it.
+    #[tokio::test]
+    async fn a_keyframe_queued_before_a_wait_does_not_make_the_slot_whole() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7]).await;
+        let keyframe = |source: u64, timestamp: u32, at: Instant| {
+            (0..3u64).map(move |n| Forward {
+                h264: None,
+                av1: None,
+                dd: None,
+                source: source + n,
+                timestamp,
+                marker: n == 2,
+                keyframe: n == 0,
+                codec: VideoCodec::Vp9,
+                arrival: at,
+                wallclock: at,
+                payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
+            })
+        };
+        let queued = now + Duration::from_secs(1);
+        let w = sfu.watchers.get_mut(&7).unwrap();
+        w.slots[0].intact_since = None;
+        for forward in keyframe(10_000, 90_000, queued) {
+            assert!(enqueue(w, 0, &origin, &forward, queued));
+        }
+        let mut p = sfu.publishers.remove("h264").unwrap();
+        sfu.overrun(&mut p, Verdict::Overrun);
+        sfu.publishers.insert("h264".into(), p);
+        let w = sfu.watchers.get_mut(&7).unwrap();
+        release(w, queued);
+        assert_eq!(w.slots[0].intact_since, None, "the keyframe queued before the overrun");
+
+        let replaced = now + Duration::from_secs(3);
+        for forward in keyframe(20_000, 180_000, replaced) {
+            assert!(enqueue(w, 0, &origin, &forward, replaced));
+        }
+        release(w, replaced);
+        assert_eq!(w.slots[0].intact_since, Some(replaced), "the replacement");
+        for (after, taken) in [(Duration::from_millis(3_900), false), (DECODE_WINDOW, true)] {
+            let at = replaced + after;
+            sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((at, need));
+            report(&mut sfu, 7, at);
+            assert_eq!(origin.recovery.lock().unwrap().pending, taken, "{after:?} after the replacement");
         }
     }
 

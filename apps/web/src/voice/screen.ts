@@ -555,38 +555,48 @@ export async function probeH264(): Promise<H264Capability[]> {
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
 }
 
-/** At most two reports per server-fenced generation; network gaps restart the four-second clock. */
-/** A report this soon after lost packets may have been one the server ignored. */
-const LOSS_SHADOW_MS = 10_000;
+/** At most two counted reports per server-fenced generation; network gaps restart the four-second clock. */
+/** A report this soon after a sign of the SFU's drops may have been one the server ignored. */
+const DROP_SHADOW_MS = 10_000;
 
 export class DecodeWatchdog {
   private since: number | null = null;
   private frames: number | null = null;
   private packets: number | null = null;
   private lost: number | null = null;
-  private lostAt: number | null = null;
+  /** The last sign that the SFU may have dropped some of the stream. */
+  private droppedAt: number | null = null;
   private last: number | null = null;
-  /** Reports sent, and those that count towards the two a generation gets. */
+  /** Reports sent, and those since `droppedAt` that count towards the two. */
   private sent = 0;
-  private reports = 0;
+  private counted = 0;
   private retryAt: number | null = null;
   /**
-   * Two reports per generation. The server ignores a report unless the SFU forwarded the slot
-   * whole for the watchdog's window, since its own drops starve a decoder like a codec it
-   * cannot decode; those drops reach here as lost packets. So a report within
-   * `LOSS_SHADOW_MS` of a loss does not count: a decoder that never decodes is still reported
-   * twice once the stream is whole, however many reports the SFU's drops cost.
+   * Reports a decoder that receives packets and decodes nothing for 4 s, 10 s apart, until two
+   * reports have counted. The server takes a report only once the SFU has forwarded the slot
+   * whole for the watchdog's window: its own drops starve a decoder like a codec it cannot
+   * decode. Those drops reach here as lost packets, or as a pause while the slot waits for a
+   * keyframe, possibly only after a report went out. Each such sign starts the count over, and
+   * a report counts only when it comes more than `DROP_SHADOW_MS` after the last one. So a
+   * decoder that never decodes is reported again 5 to 16 s after the last sign, however its
+   * reports and the SFU's drops interleave; a clean stream gets two reports. While signs keep
+   * coming (a link losing packets all along) it reports every 10 s: one request per stalled
+   * slot, which the server answers in constant time.
    */
   observe(now: number, packets: number, frames: number, lost = 0): boolean {
-    if (this.frames === null || frames > this.frames || packets <= (this.packets ?? packets) || (this.last !== null && now - this.last > 1500)) this.since = now;
+    const decoded = this.frames === null || frames > this.frames;
+    const paused = this.packets !== null && packets <= this.packets;
+    if (decoded || paused || (this.last !== null && now - this.last > 1500)) this.since = now;
+    if (paused || (this.lost !== null && lost > this.lost)) {
+      this.droppedAt = now;
+      this.counted = 0;
+    }
     this.frames = frames;
     const flowing = this.packets !== null && packets > this.packets;
-    this.packets = packets; this.last = now;
-    if (this.lost !== null && lost > this.lost) this.lostAt = now;
-    this.lost = lost;
-    if (this.reports >= 2) return false;
+    this.packets = packets; this.lost = lost; this.last = now;
+    if (this.counted >= 2) return false;
     if (flowing && this.since !== null && now - this.since >= 4000 && (this.retryAt === null || now >= this.retryAt)) {
-      if (this.lostAt === null || now - this.lostAt > LOSS_SHADOW_MS) this.reports++;
+      if (this.droppedAt === null || now - this.droppedAt > DROP_SHADOW_MS) this.counted++;
       // Anchor the retry to the observed stall, not the rounded first callback.
       // Polling can round both 4 s and another 6 s up by a tick, separating
       // replacement retries beyond the server's 2 s corroboration window.
