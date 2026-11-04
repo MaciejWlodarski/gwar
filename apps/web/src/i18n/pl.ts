@@ -748,7 +748,8 @@ export const pl: Record<Key, string> = {
   "chat.joiningShort": "Dołączanie",
   "chat.notSent": "Nie wysłano",
   "chat.locked": "Ten kanał jest chroniony hasłem",
-  "chat.retry": "Ponów",
+  "chat.retry": "Wyślij ponownie",
+  "chat.missingAttachments": "Dodaj plik ponownie, aby go wysłać.",
   "chat.dismiss": "Odrzuć",
   "chat.reconnecting": "Utracono połączenie. Łączenie ponownie…",
 
@@ -856,6 +857,8 @@ export const pl: Record<Key, string> = {
   "err.req.partial": "Udało się tylko częściowo",
   "connect.invited": "Dostajesz zaproszenie na ten serwer. Połącz się, żeby dołączyć.",
   "connect.inviteForget": "Zignoruj zaproszenie",
+  "file.attachment": "Załącznik",
+  "file.missing": "Brak pliku",
   "file.attach": "Dołącz pliki",
   "file.attachInput": "Dołącz pliki",
   "file.pending": "Pliki do wysłania",

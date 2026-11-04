@@ -11,6 +11,15 @@ const m = (id: number, uid: string, at: number): ChatItem => ({
 });
 
 describe("buildRows", () => {
+  it("keeps a failed send between earlier and later messages even when its failure arrives late", () => {
+    const rows = buildRows([m(1, "a", base), m(2, "a", base + 2000)], [{ key: "failed:1", at: base + 1000 }]);
+    expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "m1", "failed:1", "m2"]);
+    expect(rows.at(-1)).toMatchObject({ type: "msg", first: true });
+  });
+  it("puts a day separator before a failed first message and preserves server order", () => {
+    const rows = buildRows([m(2, "a", base + 2000), m(1, "a", base + 1000)], [{ key: "failed:1", at: base }]);
+    expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "failed:1", "m2", "m1"]);
+  });
   it("groups consecutive messages by author within 5 minutes", () => {
     const rows = buildRows([m(1, "a", base), m(2, "a", base + 60_000), m(3, "a", base + 7 * 60_000), m(4, "b", base + 7 * 60_000 + 1000)]);
     expect(rows.filter((r) => r.type === "msg").map((r) => r.type === "msg" && r.first)).toEqual([true, false, true, true]);

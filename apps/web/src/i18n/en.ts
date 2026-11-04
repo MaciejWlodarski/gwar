@@ -745,7 +745,8 @@ export const en = {
   "chat.joiningShort": "Joining",
   "chat.notSent": "Not sent",
   "chat.locked": "That channel is password protected",
-  "chat.retry": "Retry",
+  "chat.retry": "Send again",
+  "chat.missingAttachments": "Attach the file again to send it.",
   "chat.dismiss": "Dismiss",
   "chat.reconnecting": "Connection lost. Reconnecting…",
 
@@ -853,6 +854,8 @@ export const en = {
   "err.req.partial": "Only part of that went through",
   "connect.invited": "You were invited to this server. Connect to join.",
   "connect.inviteForget": "Ignore invite",
+  "file.attachment": "Attachment",
+  "file.missing": "Missing",
   "file.attach": "Attach files",
   "file.attachInput": "Attach files",
   "file.pending": "Files to send",

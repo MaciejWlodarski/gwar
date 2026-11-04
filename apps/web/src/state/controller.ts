@@ -34,6 +34,7 @@ import type { BanNotice } from "../proto/BanNotice";
 import type { ChannelCreate } from "../proto/ChannelCreate";
 import type { ChannelUpdate } from "../proto/ChannelUpdate";
 import type { ChatTarget } from "../proto/ChatTarget";
+import { encodeBase64Url } from "../net/base64url";
 import { tNow, type Key } from "../i18n";
 import { absoluteUrl, httpOriginFromWsUrl, isPlaintextRemote, parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
 import { memberName } from "../lib/member-name";
@@ -144,6 +145,8 @@ export interface SendOptions {
   mentions?: string[];
   /** Ids of finished uploads (channel messages only). */
   attachments?: string[];
+  /** The composer releases its draft once the in-memory attempt owns its content. */
+  onRetained?: () => void;
 }
 
 function platform(): "web" | "desktop" {
@@ -220,6 +223,10 @@ class Controller {
   private connectionParams: ConnectParams | null = null;
   private runtimeAbort: AbortController | null = null;
   private sealed: SealedConversations | null = null;
+  private readonly sendRun = newId();
+  private sendAttempts = new Map<number, AbortController>();
+  /** A connection replacement or resync always requires an explicit fresh send. */
+  get sendSession(): string { return `${this.sendRun}:${this.connections}:${useSession.getState().epoch}`; }
   private sealedReady: Promise<void> = Promise.resolve();
   private rosterListeners = new Set<() => void>();
   private revocationTimer: ReturnType<typeof setInterval> | null = null;
@@ -1092,6 +1099,8 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    for (const attempt of this.sendAttempts.values()) attempt.abort();
+    this.sendAttempts.clear();
     this.resetNativeUplink();
     // The details describe this connection; after it ends they would show stale or empty numbers.
     useUplink.setState({ details: false });
@@ -2132,18 +2141,8 @@ class Controller {
     const state = useSession.getState();
     const stored = storedKey(state, key);
     if (sealedThread(stored, state.kind, state.channels, state.server?.server_chat)) {
-      try {
-        if (!this.sealed) throw new Error(tNow("chat.securing"));
-        const conn = this.conn;
-        const attachments = (options.attachments ?? []).map(id => {
-          const upload = this.uploaded.get(id);
-          if (!upload || upload.conn !== conn || !upload.att.sealed) throw new Error("unknown upload");
-          return upload.att;
-        });
-        await this.sealed.send(stored as SealedKey, text, options.mentions ?? [], undefined, attachments);
-        for (const id of options.attachments ?? []) this.uploaded.delete(id);
-        return true;
-      } catch (error) { useUi.getState().toast("error", describeRequestError(error)); return false; }
+      return this.deliverSealed({ thread: stored!, text, mentions: options.mentions, attachments: options.attachments,
+        sealed: { message_id: encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))), created_at: Date.now() } }, undefined, options.onRetained);
     }
     const target = this.resolveTarget(key);
     const thread = storedKey(state, key);
@@ -2151,8 +2150,10 @@ class Controller {
       useUi.getState().toast("error", tNow("chat.peerOffline"));
       return false;
     }
+    options.onRetained?.();
     return this.deliver({
       thread,
+      at: Date.now(),
       target,
       text,
       mentions: options.mentions?.length ? options.mentions : undefined,
@@ -2161,8 +2162,47 @@ class Controller {
     });
   }
 
-  /** Signs and sends one message on the connection it started on; a failure while that session lasts goes to the outbox. */
-  private async deliver(m: Omit<FailedSend, "id" | "error" | "serverKey">): Promise<boolean> {
+  /** Own the text and file keys before awaiting delivery. Resync keeps the originating
+   * session, so sending in its successor always needs an explicit fresh send. */
+  private async deliverSealed(m: Omit<Extract<FailedSend, { sealed: object }>, "id" | "error" | "serverKey">, retryId?: number, onRetained?: () => void, attempt = new AbortController()): Promise<boolean> {
+    const conn = this.conn, sealed = this.sealed;
+    const session = this.sendSession, authorUid = useSession.getState().me?.uid, serverKey = conn?.serverKey ?? null;
+    const ownsView = () => this.conn === conn && (conn?.serverKey ?? null) === serverKey && useSession.getState().me?.uid === authorUid;
+    const delivered = () => !!sealed?.delivered(m.thread as SealedKey, m.sealed.message_id, { serverKey, authorUid });
+    let id = retryId;
+    try {
+      const bound = this.bind();
+      if (retryId !== undefined && (!useOutbox.getState().failed.some(f => f.id === retryId)
+        || (this.sendAttempts.has(retryId) && this.sendAttempts.get(retryId) !== attempt))) return false;
+      const attachmentMetadata = m.attachmentMetadata ?? (m.attachments ?? []).flatMap(uploadId => {
+        const upload = this.uploaded.get(uploadId);
+        return upload?.conn === conn && upload.att.sealed ? [structuredClone(upload.att)] : [];
+      });
+      id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata,
+        sending: retryId === undefined, error: tNow("chat.notSent") }).id;
+      this.sendAttempts.set(id, attempt);
+      const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id!) === attempt && ownsView() && session === this.sendSession
+        && (useOutbox.getState().failed.some(f => f.id === id && f.sealed?.message_id === m.sealed.message_id) || delivered());
+      for (const att of attachmentMetadata) this.uploaded.delete(att.id);
+      onRetained?.();
+      if ((m.attachments ?? []).some(uploadId => !attachmentMetadata.some(a => a.id === uploadId && a.sealed))) throw new Error(tNow("chat.missingAttachments"));
+      const state = useSession.getState();
+      if (!sealed || !sealedThread(m.thread, state.kind, state.channels, state.server?.server_chat)) throw new Error(tNow("chat.securing"));
+      await sealed.send(m.thread as SealedKey, m.text, m.mentions ?? [], undefined, attachmentMetadata, m.sealed, currentAttempt);
+      bound.check();
+      if (!delivered()) throw new Error(tNow("chat.notSent"));
+      useOutbox.getState().remove(id);
+      return true;
+    } catch (error) {
+      if (!ownsView() || id === undefined) return false;
+      if (delivered()) { useOutbox.getState().remove(id); return true; }
+      // Dismissal or an authenticated arrival may already have removed this attempt.
+      if (useOutbox.getState().failed.some(f => f.id === id)) useOutbox.getState().update(id, { sending: false, error: describeRequestError(error) });
+      return false;
+    } finally { if (id !== undefined && this.sendAttempts.get(id) === attempt) this.sendAttempts.delete(id); }
+  }
+
+  private async deliver(m: Omit<Extract<FailedSend, { target: ChatTarget }>, "id" | "error" | "serverKey">): Promise<boolean> {
     let bound: ReturnType<Controller["bind"]> | undefined;
     try {
       bound = this.bind();
@@ -2192,21 +2232,44 @@ class Controller {
     }
   }
 
-  async retrySend(id: number): Promise<void> {
-    const item = useOutbox.getState().remove(id);
-    if (!item) return;
-    // Only the server the draft was written for may receive it.
-    if (item.serverKey !== (this.conn?.serverKey ?? null)) { useUi.getState().toast("error", tNow("err.req.lost")); return; }
+  async retrySend(id: number, fresh = false): Promise<void> {
+    const item = useOutbox.getState().failed.find(f => f.id === id);
+    if (!item || item.sending || this.sendAttempts.has(id)) return;
+    if (item.serverKey !== (this.conn?.serverKey ?? null)) { if (!item.sealed) useOutbox.getState().remove(id); useUi.getState().toast("error", tNow("err.req.lost")); return; }
+    if (item.sealed) {
+      if (item.authorUid && item.authorUid !== useSession.getState().me?.uid) return;
+      if (item.session !== this.sendSession && !fresh) return;
+      const attempt = new AbortController(); this.sendAttempts.set(id, attempt);
+      try {
+        const bound = this.bind(), sealed = this.sealed;
+        if (!sealed) return;
+        const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id) === attempt && bound.current()
+          && (useOutbox.getState().failed.some(f => f.id === id) || sealed.delivered(item.thread as SealedKey, item.sealed!.message_id));
+        // Recover a delivery whose acknowledgement was lost, including uploads the server
+        // already attached; a fresh send then keeps the same logical ID and creation time.
+        if (fresh && await sealed.recover(item.thread as SealedKey, item.sealed.message_id, currentAttempt)) {
+          bound.check(); useOutbox.getState().remove(id); return;
+        }
+        bound.check();
+        if (!currentAttempt() || !useOutbox.getState().failed.some(f => f.id === id)) return;
+        await this.deliverSealed(item, id, undefined, attempt);
+      } catch { /* Keep the existing card for another explicit attempt. */ }
+      finally { if (this.sendAttempts.get(id) === attempt) this.sendAttempts.delete(id); }
+      return;
+    }
+    useOutbox.getState().remove(id);
     let target = item.target;
     if (item.dmUid) {
-      const peer = Object.values(useSession.getState().clients).find((c) => c.uid === item.dmUid);
-      if (!peer) {
-        useOutbox.getState().add({ ...item, error: tNow("chat.peerOffline") });
-        return;
-      }
+      const peer = Object.values(useSession.getState().clients).find(c => c.uid === item.dmUid);
+      if (!peer) { useOutbox.getState().add({ ...item, error: tNow("chat.peerOffline") }); return; }
       target = { client: peer.id };
     }
-    await this.deliver({ thread: item.thread, target, text: item.text, mentions: item.mentions, attachments: item.attachments, dmUid: item.dmUid });
+    await this.deliver({ thread: item.thread, at: item.at, target, text: item.text, mentions: item.mentions, attachments: item.attachments, dmUid: item.dmUid });
+  }
+
+  dismissSend(id: number): void {
+    this.sendAttempts.get(id)?.abort();
+    useOutbox.getState().remove(id);
   }
 
   /** Changes the text of one of my channel messages; shows a toast and returns false on failure. */

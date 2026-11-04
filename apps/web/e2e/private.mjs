@@ -15,7 +15,34 @@ import { chromium } from "playwright";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const directory = await mkdtemp(path.join(tmpdir(), "gwar-private-browser-"));
 const children = [];
+const pages = [];
+const timings = [];
 let browser;
+async function failureDiagnostics(error) {
+  console.error(JSON.stringify({ type: "PRIVATE_FAILURE", error: String(error), timings }));
+  for (const page of pages) {
+    const state = await page.evaluate(() => {
+      const mls = window.mls;
+      if (!mls) return { connected: false, trace: window.__privateTrace };
+      let groups;
+      try {
+        groups = mls.runtime.inventory().map(g => ({
+          conversation: g.conversation, group: g.group, incarnation: g.incarnation,
+          live: g.live, private: g.private, status: mls.runtime.status(g.conversation),
+          record: { status: g.record.status, checkpoint: g.record.checkpoint, server_pending: g.record.server_pending, access: g.record.access, welcome_ids: g.record.welcome_ids },
+          members: g.members,
+        }));
+      } catch (error) { groups = { diagnosticError: String(error) }; }
+      return {
+        uid: mls.uid, connected: mls.link.isOnline, errors: mls.errors.slice(-40),
+        owner: mls.runtime.ownerView(), managersCurrent: mls.runtime.serverManagersCurrent(),
+        managersSettled: mls.runtime.managersSettled(), trace: window.__privateTrace,
+        groups,
+      };
+    }).catch(error => ({ diagnosticError: String(error) }));
+    console.error(JSON.stringify({ type: "PRIVATE_DEVICE", device: page.deviceName, browserErrors: page.errors, ...state }));
+  }
+}
 async function port() {
   const server = net.createServer(); await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
@@ -42,28 +69,51 @@ try {
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service)]);
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(service.output)?.[1];
   assert.ok(token, "the server prints its first admin token");
-  browser = await chromium.launch({ headless: true });
+  browser = await chromium.launch({ headless: true, args: ["--disable-audio-output"] });
   const context = await browser.newContext();
   await context.route("**/*", route => { const host = new URL(route.request().url()).hostname; return ["127.0.0.1", "localhost"].includes(host) ? route.continue() : route.abort(); });
-  const pages = [];
   const until = async (what, check, timeout = 30_000) => {
-    for (const started = Date.now(); Date.now() - started < timeout;) {
-      if (await check()) return;
-      for (const page of pages) await page.evaluate(() => window.mls.runtime.sync().catch(() => {}));
+    const timing = { what, started: Date.now(), elapsedMs: 0, checks: 0, status: "waiting" };
+    timings.push(timing);
+    for (; Date.now() - timing.started < timeout;) {
+      timing.checks++;
+      timing.elapsedMs = Date.now() - timing.started;
+      if (await check()) { timing.status = "passed"; return; }
+      for (const page of pages) await page.evaluate(async () => {
+        const started = Date.now();
+        let error;
+        try { await window.mls.runtime.sync(); } catch (e) { error = String(e); }
+        const syncs = window.__privateTrace.syncs;
+        syncs.push({ started, elapsedMs: Date.now() - started, error });
+        if (syncs.length > 100) syncs.shift();
+      });
       await new Promise(resolve => setTimeout(resolve, 250));
     }
-    for (const page of pages) console.error(await page.evaluate(() => window.mls.errors));
-    for (const page of pages) console.error(await page.evaluate(() => JSON.stringify(window.mls.runtime.inventory().map(g => ({ conversation: g.conversation, status: g.record.status, members: g.members?.length })))).catch(String));
+    timing.status = "timed-out";
+    timing.elapsedMs = Date.now() - timing.started;
     throw new Error(`timed out: ${what}`);
   };
   // The owner (account 11), a member (21) and an outsider (31), one device each.
   for (const [account, device] of [[11, 1], [21, 2], [31, 3]]) {
     const page = await context.newPage(); pages.push(page);
-    page.on("pageerror", e => console.error("browser:", e));
+    page.deviceName = { account, device };
+    page.errors = [];
+    page.on("pageerror", e => { page.errors.push(String(e)); if (page.errors.length > 40) page.errors.shift(); });
     await page.goto(`${web}/e2e/mls.html`);
     await page.evaluate(async ({ account, device, ws }) => {
       const { connect } = await import("/e2e/mls-fixture.ts");
+      window.__privateTrace = { connectedAt: null, requests: [], syncs: [] };
       window.mls = await connect(account, device, ws);
+      window.__privateTrace.connectedAt = Date.now();
+      const request = window.mls.link.request.bind(window.mls.link);
+      window.mls.link.request = async (op, ...args) => {
+        const row = { op, started: Date.now(), status: "pending" };
+        const requests = window.__privateTrace.requests;
+        requests.push(row); if (requests.length > 100) requests.shift();
+        try { const reply = await request(op, ...args); row.status = "ok"; return reply; }
+        catch (error) { row.status = "error"; row.error = String(error); throw error; }
+        finally { row.elapsedMs = Date.now() - row.started; }
+      };
     }, { account, device, ws });
   }
   const [owner, member, outsider] = pages;
@@ -113,6 +163,7 @@ try {
   console.log("PASS edits apply to the current list: the member is removed, the newer addition stays");
   await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
 } catch (error) {
+  await failureDiagnostics(error);
   for (const child of children) console.error(`--- ${child.spawnargs.join(" ")}\n${child.output}`);
   throw error;
 } finally {
