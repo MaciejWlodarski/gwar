@@ -556,26 +556,44 @@ export async function probeH264(): Promise<H264Capability[]> {
 }
 
 /** At most two reports per server-fenced generation; network gaps restart the four-second clock. */
+/** A report this soon after lost packets may have been one the server ignored. */
+const LOSS_SHADOW_MS = 10_000;
+
 export class DecodeWatchdog {
   private since: number | null = null;
   private frames: number | null = null;
   private packets: number | null = null;
+  private lost: number | null = null;
+  private lostAt: number | null = null;
   private last: number | null = null;
+  /** Reports sent, and those that count towards the two a generation gets. */
+  private sent = 0;
   private reports = 0;
   private retryAt: number | null = null;
-  observe(now: number, packets: number, frames: number): boolean {
-    if (this.reports >= 2) return false;
+  /**
+   * Two reports per generation. The server ignores a report unless the SFU forwarded the slot
+   * whole for the watchdog's window, since its own drops starve a decoder like a codec it
+   * cannot decode; those drops reach here as lost packets. So a report within
+   * `LOSS_SHADOW_MS` of a loss does not count: a decoder that never decodes is still reported
+   * twice once the stream is whole, however many reports the SFU's drops cost.
+   */
+  observe(now: number, packets: number, frames: number, lost = 0): boolean {
     if (this.frames === null || frames > this.frames || packets <= (this.packets ?? packets) || (this.last !== null && now - this.last > 1500)) this.since = now;
     this.frames = frames;
     const flowing = this.packets !== null && packets > this.packets;
     this.packets = packets; this.last = now;
+    if (this.lost !== null && lost > this.lost) this.lostAt = now;
+    this.lost = lost;
+    if (this.reports >= 2) return false;
     if (flowing && this.since !== null && now - this.since >= 4000 && (this.retryAt === null || now >= this.retryAt)) {
-      this.reports++;
+      if (this.lostAt === null || now - this.lostAt > LOSS_SHADOW_MS) this.reports++;
       // Anchor the retry to the observed stall, not the rounded first callback.
       // Polling can round both 4 s and another 6 s up by a tick, separating
       // replacement retries beyond the server's 2 s corroboration window.
       // 10 s also outlasts its viewer/share throttle from the previous generation.
-      this.retryAt = this.since + 10_000;
+      // Later reports keep that 10 s from their own time.
+      this.retryAt = (this.sent === 0 ? this.since : now) + 10_000;
+      this.sent++;
       return true;
     }
     return false;
@@ -1657,7 +1675,7 @@ export class ScreenWatchTransport {
         if (s.type !== "inbound-rtp" || s.kind !== "video" || !/video\/(h264|av1)$/i.test(String(report.get(s.codecId)?.mimeType))) return;
         const slot = this.transceivers.findIndex(t => t.mid === s.mid);
         const state = this.watchdogs.get(slot);
-        if (state?.watchdog.observe(performance.now(), Number(s.packetsReceived ?? 0), Number(s.framesDecoded ?? 0))) this.params.decodeFailed?.(slot, state.share, state.generation);
+        if (state?.watchdog.observe(performance.now(), Number(s.packetsReceived ?? 0), Number(s.framesDecoded ?? 0), Number(s.packetsLost ?? 0))) this.params.decodeFailed?.(slot, state.share, state.generation);
       });
     } catch { /* Missing stats cannot prove that a decoder failed. */ }
     finally { this.polling = false; }

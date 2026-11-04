@@ -465,6 +465,22 @@ describe("verified H.264 decode capability and progress", () => {
     expect(retries.every(now => now >= 10_000)).toBe(true);
     expect(Math.max(...retries) - Math.min(...retries)).toBeLessThan(2000);
   });
+  it("reports again once the stream is whole after the SFU's drops cost its two reports", async () => {
+    const { DecodeWatchdog } = await import("./screen");
+    // A decoder that cannot decode, on a share whose start the SFU evicted until 9 s: the
+    // server ignores the reports at 4 s and 10 s (its own drops starved the decoder), and must
+    // still hear two once the stream has been whole for its window.
+    const watchdog = new DecodeWatchdog();
+    const reports = [];
+    for (let n = 0; n <= 60; n++) if (watchdog.observe(n * 1000, n * 100, 0, Math.min(n, 9) * 30)) reports.push(n);
+    expect(reports).toEqual([4, 10, 20, 30]);
+    // A link that keeps losing packets keeps the reports coming, 10 s apart: only the server
+    // can tell its own drops from the network's.
+    const lossy = new DecodeWatchdog();
+    const more = [];
+    for (let n = 0; n <= 45; n++) if (lossy.observe(n * 1000, n * 100, 0, n)) more.push(n);
+    expect(more).toEqual([4, 10, 20, 30, 40]);
+  });
   it("reports persistent zero decode under traffic, with bounded retries and no network-gap false failure", async () => {
     const { DecodeWatchdog } = await import("./screen");
     const watchdog = new DecodeWatchdog();

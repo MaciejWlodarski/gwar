@@ -138,6 +138,13 @@ impl Queued {
         self
     }
 
+    /// Part of a keyframe, as `Egress::admit` marks it.
+    #[cfg(test)]
+    pub fn keyed(mut self) -> Self {
+        self.key = true;
+        self
+    }
+
     pub fn key_frame(&self) -> Option<u32> {
         self.key.then_some(self.frame)
     }
