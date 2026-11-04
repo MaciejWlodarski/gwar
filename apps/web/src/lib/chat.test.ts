@@ -86,6 +86,16 @@ describe("threadRows", () => {
     const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "m2" }]);
     expect(keys(rows)).toEqual(["day", "m1", "failed:1", "m3"]);
   });
+  it("walks back past hidden messages from a deleted anchor", () => {
+    const raw = [signed(1, base, base + 59_000), signed(2, base + 500, base + 60_000), signed(4, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, i => i.key !== "m2", [{ key: "failed:1", at: base + 1000, after: "m3" }]);
+    expect(keys(rows)).toEqual(["day", "m1", "failed:1", "m4"]);
+  });
+  it("falls back to time order when a deleted anchor is older than everything loaded", () => {
+    const raw = [signed(5, base, base + 59_000), signed(6, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "m3" }]);
+    expect(keys(rows)).toEqual(["day", "failed:1", "m5", "m6"]);
+  });
 });
 
 describe("unreadLabel", () => {
