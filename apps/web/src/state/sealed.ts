@@ -430,7 +430,14 @@ export class SealedConversations {
           if (!original && error instanceof RequestError && (error.code === "conflict" || (error.code === "bad_request" && attachments.length > 0))
             && await this.recoverDelivery(thread, retry.message_id, checkSession)) return;
           if (!(error instanceof RequestError) || !["stale", "pending"].includes(error.code) || attempt === 2) throw error;
-          await this.runtime.sync(); check();
+          try { await this.runtime.sync(); }
+          catch (syncError) {
+            // A pass reports the first DM that failed in it, which may be another conversation's: a
+            // failure of this one (or of the whole pass) leaves it securing, so only then is it ours.
+            check();
+            if (this.runtime.status(conversation) !== "ready") throw syncError;
+          }
+          check();
           if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"), { cause: error });
         }
       }

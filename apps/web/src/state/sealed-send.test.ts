@@ -193,3 +193,23 @@ it("preserves the original ID if recovery is unavailable after a resync", async 
   expect(useOutbox.getState().failed[0]!.sealed).toEqual(item.sealed);
   expect(request.mock.calls.filter(([op]) => op === "chat.sealed.send")).toHaveLength(1);
 });
+
+it("sends after a resync whose only failure is another conversation's", async () => {
+  const { RequestError } = await import("../net/connection");
+  // The resync reports an unrelated DM's failure; this conversation stays ready.
+  runtime.sync = vi.fn(async () => { throw new Error("another DM's log is unavailable"); });
+  request.mockRejectedValueOnce(new RequestError("stale", "synchronize")).mockImplementation(async () => acknowledgement());
+  expect(await controller.sendChat("server", "not blocked by another DM")).toBe(true);
+  expect(runtime.sync).toHaveBeenCalledTimes(1);
+  expect(useOutbox.getState().failed).toEqual([]);
+});
+
+it("still fails when the resync leaves this conversation securing", async () => {
+  const { RequestError } = await import("../net/connection");
+  const failure = new Error("this conversation's log is unavailable");
+  runtime.sync = vi.fn(async () => { runtime.status = () => "securing"; throw failure; });
+  request.mockRejectedValueOnce(new RequestError("stale", "synchronize")).mockImplementation(async () => acknowledgement());
+  expect(await controller.sendChat("server", "blocked by its own failure")).toBe(false);
+  expect(request.mock.calls.filter(([op]) => op === "chat.sealed.send")).toHaveLength(1);
+  expect(useOutbox.getState().failed).toHaveLength(1);
+});
