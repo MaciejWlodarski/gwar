@@ -565,17 +565,6 @@ export class DecodeWatchdog {
   private next: number | null = null;
   private reported: number | null = null;
   /**
-   * `armedAt`: when the server's keyframe notification for this generation arrived. Every
-   * viewer of a replacement gets it at about the same time, so a stall that starts with it runs
-   * its deadlines from there, not from each viewer's first poll. A first poll more than 1.5 s
-   * later is a gap, as anywhere else, and starts the stall at that poll.
-   */
-  constructor(armedAt?: number) {
-    if (armedAt === undefined) return;
-    this.last = armedAt;
-    this.next = armedAt + 4000;
-  }
-  /**
    * Reports a decoder that receives packets and decodes nothing for 4 s, then every 10 s for as
    * long as that lasts: until it decodes, packets stop, or the slot's generation changes (the
    * server isolated the viewer or fell back). There is no budget. The server takes a report only
@@ -583,15 +572,16 @@ export class DecodeWatchdog {
    * starve a decoder like a codec it cannot decode, and the viewer cannot see those drops: lost
    * packets can be balanced by duplicates. So the watchdog keeps reporting, and the first report
    * past the server's window is taken. Deadlines run from the stall, 4 s and then every 10 s,
-   * each sent on the first poll at or after it: viewers that stalled together on a replacement
-   * keyframe report within one poll gap (at most 1.5 s) of each other, plus the difference in when the
-   * notification reached them, inside the server's 2 s corroboration window.
-   * A new stall never brings the next report closer than 10 s to the last one. A report the
-   * server ignores costs it a constant-time check.
+   * each sent on the first poll at or after it, so a stalled decoder reports at least once in
+   * any 10 s plus one poll gap (at most 1.5 s, a longer one restarts the stall). The server's
+   * corroboration window (`CORROBORATE_FOR` in the SFU) is sized from these two numbers, so
+   * viewers that stalled together corroborate whatever their polls' phases: keep them in step.
+   * The stall starts at this watchdog's own first sample, since frames decoded before it are
+   * unknown. A new stall never brings the next report closer than 10 s to the last one. A report
+   * the server ignores costs it a constant-time check.
    */
   observe(now: number, packets: number, frames: number): boolean {
-    // The first sample is only a baseline once armed; unarmed, it starts the stall.
-    const decoded = this.frames === null ? this.next === null : frames > this.frames;
+    const decoded = this.frames === null || frames > this.frames;
     const paused = this.packets !== null && packets <= this.packets;
     if (decoded || paused || (this.last !== null && now - this.last > 1500)) {
       this.next = Math.max(now + 4000, (this.reported ?? -Infinity) + REPORT_EVERY_MS);
@@ -1667,7 +1657,7 @@ export class ScreenWatchTransport {
     if (slot < 0 || slot >= this.transceivers.length || this.closed) return;
     const current = this.watchdogs.get(slot);
     if (current?.share === share && current.generation === generation) return;
-    this.watchdogs.set(slot, { share, generation, watchdog: new DecodeWatchdog(performance.now()) });
+    this.watchdogs.set(slot, { share, generation, watchdog: new DecodeWatchdog() });
   }
 
   clearSlot(slot: number): void { this.watchdogs.delete(slot); }

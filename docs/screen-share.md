@@ -316,7 +316,7 @@ decode stays for browser compatibility.
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
   The share and other viewers continue. There is no transcoding or native
   compatibility layer in A2. The decode watchdog isolates one failing viewer
-  after a two-second corroboration window. A report counts only when the
+  after a twelve-second corroboration window (see below). A report counts only when the
   viewer's slot has carried a whole stream for the four-second watchdog window:
   a keyframe released from its first packet to its last with nothing of the slot
   dropped since. Every wait for a keyframe ends that (an eviction, a deadline or
@@ -339,19 +339,23 @@ decode stays for browser compatibility.
   packets can be balanced by duplicates), so it does not try: the server ignores
   a report from a slot not yet whole for its window in constant time, and takes
   the first one after. A decoder that never decodes therefore has a report taken
-  at most 4 s + 10 s + one stats poll (1 s) after the slot becomes whole, plus
-  the report's transit; the viewer is isolated two seconds later, or the share
-  falls back at once. If the viewer's previous report was taken less than ten
+  at most 4 s + 10 s + one poll gap (at most 1.5 s) after the slot becomes
+  whole, plus the report's transit; the share falls back at once when every
+  viewer has failed, and otherwise the viewer is isolated twelve seconds later. If the viewer's previous report was taken less than ten
   seconds before, the server's throttle can hold it back one more step. Deadlines
-  run from the stall, not from each rounded poll, and a stall that starts with a
-  generation runs from the server's keyframe notification, which every viewer of
-  a replacement gets at about the same time. Each report goes out on the first
-  poll at or after its deadline, so viewers that stalled together report within
-  one poll gap (at most 1.5 s; a longer gap restarts the stall) plus the
-  difference in when the notification reached them. That keeps their retries
-  inside the server's two-second corroboration window; timed from each viewer's
-  own first poll, the first poll's phase added up to another poll gap and could
-  push them past it.
+  run from the stall, not from each rounded poll, so a viewer's reports do not
+  drift. The stall starts at the viewer's own first stats sample, because frames
+  decoded before it are unknown; viewers' first samples can be seconds apart.
+  The server therefore waits one report period plus one poll gap, plus 0.5 s
+  for transit differences, before isolating a reporter whose fellow viewers have
+  not corroborated: 10 s + 1.5 s + 0.5 s = 12 s. A stalled viewer reports at
+  least once in any such span, as long as its first sample came within 10.5 s
+  of the keyframe notification, whatever the phase of its polls. A two-second
+  window isolated one of two failing viewers whose retries came 2.84 s apart,
+  and the fallback kept only the other. A lone failing viewer beside healthy
+  ones is isolated at most 4 s + 10 s + one poll gap + 12 s, about 27.5 s,
+  after its slot becomes whole (plus transit); when every viewer fails, the
+  fallback comes with the last report taken, within about 15.5 s.
   Watch slots survive replacement, old-publisher packets drop, and the replacement
   keyframe opens the retained slots. Restore H.264 after reporters leave or two
   minutes, then hold for a minute before another downgrade. A3/B11a own native

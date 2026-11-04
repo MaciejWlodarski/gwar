@@ -448,8 +448,8 @@ describe("verified H.264 decode capability and progress", () => {
     const { DecodeWatchdog } = await import("./screen");
     // Both first reports follow replacement before the server's 10 s viewer/share
     // throttle expires, so both are ignored and the retries must corroborate each other.
-    // Rounding the 4 s observation AND another 10 s from its callback could put
-    // those retries over the server's 2 s isolation window apart.
+    // Rounding the 4 s observation AND another 10 s from its callback would add up a
+    // poll per report; anchored to the stall, they stay within a poll of each other.
     const polls = [
       // Observed milliseconds after the replacement keyframe in a failing
       // macOS Chromium/WebKit fixed-canvas gate (e8fb01e3), extended at the same period.
@@ -457,40 +457,13 @@ describe("verified H.264 decode capability and progress", () => {
       [824, 1823, 2824, 3823, 4823, 5824, 6823, 7824, 8823, 9823, 10825, 11823, 12826, 13824, 14826, 15825, 16826],
     ];
     const reports = polls.map(times => {
-      const watchdog = new DecodeWatchdog(0);
+      const watchdog = new DecodeWatchdog();
       return times.filter((now, index) => watchdog.observe(now, index * 100, 0));
     });
     expect(reports.every(times => times.length === 2 && times[0]! < 10_000)).toBe(true);
     const retries = reports.map(times => times[1]!);
     expect(retries.every(now => now >= 10_000)).toBe(true);
     expect(Math.max(...retries) - Math.min(...retries)).toBeLessThan(2000);
-  });
-  it("times replacement retries from the shared keyframe notification, not from each viewer's polls", async () => {
-    const { DecodeWatchdog } = await import("./screen");
-    // Both viewers get the replacement's keyframe notification at 0 and decode nothing; their
-    // first reports are throttled, so the retries must land within the server's 2 s
-    // corroboration window, or it isolates the earlier reporter before the other confirms.
-    const retries = (polls: (n: number) => number) => {
-      const watchdog = new DecodeWatchdog(0);
-      const reports: number[] = [];
-      for (let n = 0; polls(n) <= 30_000; n++) if (watchdog.observe(polls(n), n * 100, 0)) reports.push(polls(n));
-      return reports;
-    };
-    // Review repro: viewer A polls at 900 + 1270n ms, viewer B at 1000n ms. Every gap is under
-    // the 1.5 s that restarts a stall. Timed from each viewer's own first poll, A retried at
-    // 16,140 ms and B at 14,000 ms.
-    const a = retries(n => 900 + 1270 * n), b = retries(n => 1000 * n);
-    expect(a.slice(0, 2)).toEqual([4710, 14_870]);
-    expect(b.slice(0, 2)).toEqual([4000, 14_000]);
-    // Any poll period up to the 1.5 s gap and any phase: the retries stay within one poll gap.
-    for (const pa of [1000, 1270, 1500]) for (const pb of [1000, 1270, 1500]) {
-      for (let fa = 0; fa <= pa; fa += 50) for (let fb = 0; fb <= pb; fb += 50) {
-        const ra = retries(n => fa + pa * n), rb = retries(n => fb + pb * n);
-        expect(Math.abs(ra[0]! - rb[0]!)).toBeLessThanOrEqual(1500);
-        expect(Math.abs(ra[1]! - rb[1]!), `${pa}+${fa} vs ${pb}+${fb}`).toBeLessThanOrEqual(1500);
-        expect(ra[1]! - ra[0]!).toBeGreaterThanOrEqual(10_000 - pa);
-      }
-    }
   });
 
   /** The server's view of one slot: whole from `whole` on, it takes a report 4 s into that. */
@@ -545,6 +518,28 @@ describe("verified H.264 decode capability and progress", () => {
     }
   });
 
+  it("matches the report schedules the server's corroboration test replays", async () => {
+    // crates/gwar-server/src/media/screen/decode_reports.json holds this watchdog's report
+    // times for a viewer whose decoder never decodes, for each poll period and delay of its
+    // first sample after the keyframe notification. The SFU replays every pair of them against
+    // its corroboration window. Regenerate with UPDATE_DECODE_REPORTS=1 after changing the
+    // watchdog's timing.
+    const { DecodeWatchdog } = await import("./screen");
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const path = new URL("../../../../crates/gwar-server/src/media/screen/decode_reports.json", import.meta.url);
+    const lines: string[] = [];
+    for (const period of [1000, 1270, 1500]) {
+      for (let delay = 0; delay <= 3000; delay += 50) {
+        const watchdog = new DecodeWatchdog();
+        const reports: number[] = [];
+        for (let n = 0; delay + n * period <= 40_000; n++) if (watchdog.observe(delay + n * period, n * 100, 0)) reports.push(delay + n * period);
+        lines.push(JSON.stringify({ period, delay, reports }));
+      }
+    }
+    const json = `[\n${lines.join(",\n")}\n]\n`;
+    if (process.env.UPDATE_DECODE_REPORTS) writeFileSync(path, json);
+    expect(readFileSync(path, "utf8")).toBe(json);
+  });
   it("reports a stalled decoder every 10 s and a decoding one never", async () => {
     const { DecodeWatchdog } = await import("./screen");
     const stalled = new DecodeWatchdog();
@@ -2961,6 +2956,28 @@ describe("AV1", () => {
       await vi.advanceTimersByTimeAsync(1000);
     }
     expect(decodeFailed).toHaveBeenCalledWith(0, "A", 1);
+    transport.close();
+  });
+
+  it("never reports a decoder that decoded just before its first sample", async () => {
+    // Review repro: the keyframe notification arrives at 0, frames decode at 900 and 4800 ms,
+    // and stats are sampled every second from 1000 ms with packets arriving. The decoder never
+    // went 4 s without a frame. Taking the first sample for a stall that began at the
+    // notification reported it at 4000 ms, and the server, with the slot whole, would have
+    // isolated a healthy viewer.
+    const decodeFailed = vi.fn();
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed });
+    await transport.start();
+    const pc = Peer.all[0]!;
+    (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
+    pc.stats = new Map([["codec", { type: "codec", mimeType: "video/H264" }]]);
+    transport.keyframe(0, "A", 1);
+    for (let at = 1000; at <= 8000; at += 1000) {
+      const framesDecoded = [900, 4800].filter(decoded => decoded <= at).length;
+      pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded });
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(decodeFailed).not.toHaveBeenCalled();
     transport.close();
   });
 });

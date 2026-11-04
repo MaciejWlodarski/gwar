@@ -83,8 +83,21 @@ const INITIAL_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 /// keyframes while initial probes ramp. Bounded so an estimate cannot strand a slot.
 const KEYFRAME_BOOTSTRAP: Duration = Duration::from_secs(5);
 const DECODE_WINDOW: Duration = Duration::from_secs(4);
-/// Allow independent watchdog reports to meet before isolating a failed watch.
-const CORROBORATE_FOR: Duration = Duration::from_secs(2);
+/// The browser's decode watchdog (`DecodeWatchdog`, apps/web/src/voice/screen.ts) reports a
+/// decoder that keeps failing every 10 s, each report on the first stats poll at or after its
+/// deadline, and a poll gap over 1.5 s restarts its stall.
+const CLIENT_REPORT_EVERY_MS: u64 = 10_000;
+const CLIENT_POLL_GAP_MS: u64 = 1_500;
+/// Differences between viewers in when the keyframe notification and their reports travel.
+const REPORT_TRANSIT_MS: u64 = 500;
+/// Allow independent watchdog reports to meet before isolating a failed watch. A stalled viewer
+/// reports at least once in any span of one report period and one poll gap, whatever the phase
+/// of its polls and however late its first sample after the keyframe notification (up to 10.5 s,
+/// against a report taken 4 s after it at the earliest). Viewers' stalls start at their own
+/// first samples, which can be seconds apart, so no shorter window holds: 2 s isolated one of
+/// two failing viewers whose retries came 2.84 s apart.
+const CORROBORATE_FOR: Duration =
+    Duration::from_millis(CLIENT_REPORT_EVERY_MS + CLIENT_POLL_GAP_MS + REPORT_TRANSIT_MS);
 /// A publish transport that has not connected by then fails.
 pub const PUBLISH_CONNECT: Duration = Duration::from_secs(30);
 /// Members and guests must connect their watch transport before this deadline.
@@ -5669,6 +5682,116 @@ pub(crate) mod tests {
         );
     }
 
+    /// Report times, in ms after the keyframe notification, of the browser's real decode
+    /// watchdog for a decoder that never decodes: `(poll period, first-sample delay, reports)`.
+    /// `screen.test.ts` regenerates `decode_reports.json` and fails while it is stale.
+    fn watchdog_reports() -> Vec<(u64, u64, Vec<u64>)> {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("decode_reports.json")).unwrap();
+        rows.iter()
+            .map(|r| {
+                let times = r["reports"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap()).collect();
+                (r["period"].as_u64().unwrap(), r["delay"].as_u64().unwrap(), times)
+            })
+            .collect()
+    }
+
+    /// Replays viewers 7's and 8's report times (ms after `start`, when both slots were armed
+    /// and whole) against the server's corroboration window. It ticks the window at every
+    /// report, before the report, and wherever a report's window ends. `throttled`: both
+    /// viewers' previous-generation reports were taken a second before `start`, so only retries
+    /// can corroborate. Ok once the fallback is planned with both viewers still watching.
+    fn replay_reports(
+        sfu: &mut Sfu,
+        origin: &ScreenOrigin,
+        need: h264_stream::Requirements,
+        start: Instant,
+        viewers: [&[u64]; 2],
+        throttled: bool,
+    ) -> Result<(), String> {
+        *origin.recovery.lock().unwrap() = Default::default();
+        sfu.decode_reports.clear();
+        sfu.outbox.clear();
+        for (session, w) in &mut sfu.watchers {
+            let slot = &mut w.slots[0];
+            assert!(slot.grant.is_some());
+            slot.failed_at = None;
+            slot.decode_cap = None;
+            slot.keyframe_at = Some(start);
+            slot.intact_since = Some(start);
+            slot.last_h264 = Some((start, need));
+            if throttled {
+                sfu.decode_reports.insert((*session, "h264".into()), start - Duration::from_secs(1));
+            }
+        }
+        let window = CORROBORATE_FOR.as_millis() as u64;
+        let mut events = Vec::new();
+        for (session, times) in [7, 8].into_iter().zip(viewers) {
+            for &at in times {
+                events.extend([(at, Some(session)), (at + window, None)]);
+            }
+        }
+        events.sort_by_key(|&(at, session)| (at, session.is_some()));
+        for (ms, session) in events {
+            let at = start + Duration::from_millis(ms);
+            sfu.recoveries(at);
+            if let Some(session) = session {
+                sfu.watchers.get_mut(&session).unwrap().slots[0].last_h264 = Some((at, need));
+                report(sfu, session, at);
+            }
+            if let Some(isolated) = [7, 8].into_iter().find(|s| sfu.watchers[s].slots[0].grant.is_none()) {
+                return Err(format!("viewer {isolated} isolated at {ms} ms"));
+            }
+            if origin.recovery.lock().unwrap().pending {
+                return Ok(());
+            }
+        }
+        Err("no fallback".into())
+    }
+
+    /// Review repro: after a replacement, viewer A samples its stats at 1600 + 1270n ms and viewer
+    /// B at 1000n ms; neither decoder decodes. A's stall starts at its own first sample, so its
+    /// retry came at 16,840 ms and B's at 14,000 ms. With their first reports throttled, a 2 s
+    /// window isolated B at 16,000 ms before A corroborated, and the fallback kept only A.
+    #[tokio::test]
+    async fn retries_from_late_and_early_polls_corroborate_and_the_fallback_keeps_both() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
+        let reports = watchdog_reports();
+        let of = |period, delay| reports.iter().find(|r| r.0 == period && r.1 == delay).unwrap().2.clone();
+        let (a, b) = (of(1270, 1600), of(1000, 0));
+        assert_eq!((&a[..2], &b[..2]), (&[6680, 16_840][..], &[4000, 14_000][..]));
+        for throttled in [true, false] {
+            replay_reports(&mut sfu, &origin, need, now + Duration::from_secs(10), [&a, &b], throttled).unwrap();
+            assert!(sfu.watchers.values().all(|w| w.slots[0].decode_cap.is_some()), "both get the fallback");
+        }
+    }
+
+    /// Every pair of poll periods (1, 1.27 and 1.5 s) and first-sample delays (0 to 3 s, every
+    /// 50 ms) of the real watchdog, with and without throttled first reports, and with one
+    /// viewer's reports 0.5 s later in transit: both viewers corroborate, and the fallback keeps
+    /// both.
+    #[tokio::test]
+    async fn every_pair_of_poll_phases_corroborates() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
+        let reports = watchdog_reports();
+        assert_eq!(reports.len(), 3 * 61);
+        let start = now + Duration::from_secs(10);
+        for a in &reports {
+            for b in &reports {
+                for transit in [0, 500] {
+                    let late: Vec<u64> = a.2.iter().map(|at| at + transit).collect();
+                    for throttled in [true, false] {
+                        if let Err(e) = replay_reports(&mut sfu, &origin, need, start, [&late, &b.2], throttled) {
+                            panic!(
+                                "A every {} ms from {} ms (+{transit} ms) vs B every {} ms from {} ms, throttled {throttled}: {e}",
+                                a.0, a.1, b.0, b.1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn deferred_recovery_and_failed_restore_keep_every_viewer_slot() {
         let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
@@ -5682,7 +5805,7 @@ pub(crate) mod tests {
             w.slots[0].intact_since = Some(first);
         }
         // Replacement's decoder can fail before the 10 s hold expires. That is
-        // deferred recovery, never incompatibility after the 2 s corroboration wait.
+        // deferred recovery, never incompatibility when the corroboration wait ends.
         sfu.decode_reports.clear();
         let early = first + DECODE_WINDOW;
         for w in sfu.watchers.values_mut() {
@@ -5691,12 +5814,14 @@ pub(crate) mod tests {
         for session in [7, 8] {
             report(&mut sfu, session, early);
         }
-        sfu.recoveries(early + CORROBORATE_FOR);
+        sfu.recoveries(first + recovery::HOLD_DOWN - Duration::from_millis(1));
         assert!(!origin.recovery.lock().unwrap().pending);
         assert!(sfu.watchers.values().all(|w| w.slots[0].grant.as_ref().unwrap().alive()));
-        let fallback = first + recovery::HOLD_DOWN;
+        // The corroboration wait outlasts the hold: when it ends, the deferred fallback applies.
+        let fallback = early + CORROBORATE_FOR;
         sfu.recoveries(fallback);
         assert!(origin.recovery.lock().unwrap().pending);
+        assert!(sfu.watchers.values().all(|w| w.slots[0].grant.as_ref().unwrap().alive()));
         origin.recovery.lock().unwrap().pending = false;
         let trial = fallback + Duration::from_secs(120);
         sfu.recoveries(trial);
