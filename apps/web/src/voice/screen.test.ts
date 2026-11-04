@@ -457,13 +457,40 @@ describe("verified H.264 decode capability and progress", () => {
       [824, 1823, 2824, 3823, 4823, 5824, 6823, 7824, 8823, 9823, 10825, 11823, 12826, 13824, 14826, 15825, 16826],
     ];
     const reports = polls.map(times => {
-      const watchdog = new DecodeWatchdog();
+      const watchdog = new DecodeWatchdog(0);
       return times.filter((now, index) => watchdog.observe(now, index * 100, 0));
     });
     expect(reports.every(times => times.length === 2 && times[0]! < 10_000)).toBe(true);
     const retries = reports.map(times => times[1]!);
     expect(retries.every(now => now >= 10_000)).toBe(true);
     expect(Math.max(...retries) - Math.min(...retries)).toBeLessThan(2000);
+  });
+  it("times replacement retries from the shared keyframe notification, not from each viewer's polls", async () => {
+    const { DecodeWatchdog } = await import("./screen");
+    // Both viewers get the replacement's keyframe notification at 0 and decode nothing; their
+    // first reports are throttled, so the retries must land within the server's 2 s
+    // corroboration window, or it isolates the earlier reporter before the other confirms.
+    const retries = (polls: (n: number) => number) => {
+      const watchdog = new DecodeWatchdog(0);
+      const reports: number[] = [];
+      for (let n = 0; polls(n) <= 30_000; n++) if (watchdog.observe(polls(n), n * 100, 0)) reports.push(polls(n));
+      return reports;
+    };
+    // Review repro: viewer A polls at 900 + 1270n ms, viewer B at 1000n ms. Every gap is under
+    // the 1.5 s that restarts a stall. Timed from each viewer's own first poll, A retried at
+    // 16,140 ms and B at 14,000 ms.
+    const a = retries(n => 900 + 1270 * n), b = retries(n => 1000 * n);
+    expect(a.slice(0, 2)).toEqual([4710, 14_870]);
+    expect(b.slice(0, 2)).toEqual([4000, 14_000]);
+    // Any poll period up to the 1.5 s gap and any phase: the retries stay within one poll gap.
+    for (const pa of [1000, 1270, 1500]) for (const pb of [1000, 1270, 1500]) {
+      for (let fa = 0; fa <= pa; fa += 50) for (let fb = 0; fb <= pb; fb += 50) {
+        const ra = retries(n => fa + pa * n), rb = retries(n => fb + pb * n);
+        expect(Math.abs(ra[0]! - rb[0]!)).toBeLessThanOrEqual(1500);
+        expect(Math.abs(ra[1]! - rb[1]!), `${pa}+${fa} vs ${pb}+${fb}`).toBeLessThanOrEqual(1500);
+        expect(ra[1]! - ra[0]!).toBeGreaterThanOrEqual(10_000 - pa);
+      }
+    }
   });
 
   /** The server's view of one slot: whole from `whole` on, it takes a report 4 s into that. */

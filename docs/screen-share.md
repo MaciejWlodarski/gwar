@@ -343,10 +343,15 @@ decode stays for browser compatibility.
   the report's transit; the viewer is isolated two seconds later, or the share
   falls back at once. If the viewer's previous report was taken less than ten
   seconds before, the server's throttle can hold it back one more step. Deadlines
-  run from the stall, not from each rounded poll: viewers that stalled together
-  on a replacement keyframe report within one poll of each other, inside the
-  server's two-second corroboration window, where rounded polls would otherwise
-  add up past it.
+  run from the stall, not from each rounded poll, and a stall that starts with a
+  generation runs from the server's keyframe notification, which every viewer of
+  a replacement gets at about the same time. Each report goes out on the first
+  poll at or after its deadline, so viewers that stalled together report within
+  one poll gap (at most 1.5 s; a longer gap restarts the stall) plus the
+  difference in when the notification reached them. That keeps their retries
+  inside the server's two-second corroboration window; timed from each viewer's
+  own first poll, the first poll's phase added up to another poll gap and could
+  push them past it.
   Watch slots survive replacement, old-publisher packets drop, and the replacement
   keyframe opens the retained slots. Restore H.264 after reporters leave or two
   minutes, then hold for a minute before another downgrade. A3/B11a own native
