@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatItem } from "../state/types";
-import { buildRows, messageTarget, unreadLabel, sealedThread, threadConversation, conversationThread } from "./chat";
+import { buildRows, threadRows, messageTarget, unreadLabel, sealedThread, threadConversation, conversationThread } from "./chat";
 
 const base = new Date(2026, 5, 10, 12, 0, 0).getTime();
 const m = (id: number, uid: string, at: number): ChatItem => ({
@@ -9,6 +9,13 @@ const m = (id: number, uid: string, at: number): ChatItem => ({
   at,
   msg: { id, target: "server", author: 1, author_uid: uid, author_name: uid, text: "x", sent_at: at },
 });
+
+/** A peer message signed by a clock that may differ from the arrival time. */
+const signed = (id: number, at: number, created: number): ChatItem => {
+  const item = m(id, "b", at) as Extract<ChatItem, { kind: "msg" }>;
+  return { ...item, msg: { ...item.msg, signature: { created_at: created } as NonNullable<typeof item.msg.signature> } };
+};
+const keys = (rows: ReturnType<typeof buildRows>) => rows.map(r => r.type === "day" ? "day" : r.key);
 
 describe("buildRows", () => {
   it("keeps a failed send between earlier and later messages even when its failure arrives late", () => {
@@ -22,10 +29,6 @@ describe("buildRows", () => {
   });
   it("never sorts a failed send above the messages that were visible when it was sent", () => {
     // A peer whose clock runs a minute ahead signed m2 before I pressed send at base + 1000.
-    const signed = (id: number, at: number, created: number): ChatItem => {
-      const item = m(id, "b", at) as Extract<ChatItem, { kind: "msg" }>;
-      return { ...item, msg: { ...item.msg, signature: { created_at: created } as NonNullable<typeof item.msg.signature> } };
-    };
     const items = [m(1, "a", base), signed(2, base + 500, base + 60_000), signed(3, base + 2000, base + 61_000)];
     const rows = buildRows(items, [{ key: "failed:1", at: base + 1000, after: "m2" }]);
     expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "m1", "m2", "failed:1", "m3"]);
@@ -33,6 +36,11 @@ describe("buildRows", () => {
   it("keeps time order for a failed send whose anchor is no longer loaded", () => {
     const rows = buildRows([m(1, "a", base), m(2, "a", base + 2000)], [{ key: "failed:1", at: base + 1000, after: "gone" }]);
     expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "m1", "failed:1", "m2"]);
+  });
+  it("keeps failed sends in send order when only the earlier one has a loaded anchor", () => {
+    const items = [m(1, "a", base), signed(2, base + 500, base + 60_000), signed(3, base + 2000, base + 61_000)];
+    const rows = buildRows(items, [{ key: "failed:2", at: base + 1500, after: "gone" }, { key: "failed:1", at: base + 1000, after: "m2" }]);
+    expect(keys(rows)).toEqual(["day", "m1", "m2", "failed:1", "failed:2", "m3"]);
   });
   it("groups consecutive messages by author within 5 minutes", () => {
     const rows = buildRows([m(1, "a", base), m(2, "a", base + 60_000), m(3, "a", base + 7 * 60_000), m(4, "b", base + 7 * 60_000 + 1000)]);
@@ -53,6 +61,25 @@ describe("buildRows", () => {
       m(2, "a", base + 2000),
     ]);
     expect(rows.at(-1)).toMatchObject({ type: "msg", first: true });
+  });
+});
+
+describe("threadRows", () => {
+  // Peer clocks run a minute ahead; I pressed send at base + 1000.
+  it("anchors below the nearest shown message when the newest one was hidden at send time", () => {
+    const raw = [m(1, "a", base), signed(2, base + 500, base + 60_000), signed(3, base + 600, base + 60_500), signed(4, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, i => i.key !== "m3", [{ key: "failed:1", at: base + 1000, after: "m3" }]);
+    expect(keys(rows)).toEqual(["day", "m1", "m2", "failed:1", "m4"]);
+  });
+  it("keeps the card below what was shown when its anchor is hidden later", () => {
+    const raw = [signed(1, base, base + 59_000), signed(2, base + 500, base + 60_000), signed(3, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, i => i.key !== "m2", [{ key: "failed:1", at: base + 1000, after: "m2" }]);
+    expect(keys(rows)).toEqual(["day", "m1", "failed:1", "m3"]);
+  });
+  it("falls back to time order when nothing at or above the anchor is shown", () => {
+    const raw = [signed(1, base, base + 59_000), signed(2, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, i => i.key !== "m1", [{ key: "failed:1", at: base + 1000, after: "m1" }]);
+    expect(keys(rows)).toEqual(["day", "failed:1", "m2"]);
   });
 });
 

@@ -57,16 +57,33 @@ function dayKey(at: number): string {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
+export type FailedPlace = { key: string; at: number; after?: string };
+
+/** Rows for a thread's raw items, of which only `visible` ones are shown, and its failed sends. A send's
+ *  anchor is a raw item; it resolves to the nearest shown item at or above it, so an anchor that is hidden
+ *  (at send time or later) still keeps the card below what was on screen. */
+export function threadRows(raw: ChatItem[], visible: (item: ChatItem) => boolean, failed: FailedPlace[]): Row[] {
+  const shown = raw.filter(visible);
+  const keys = new Set(shown.map(i => i.key));
+  const anchor = (after: string | undefined) => {
+    for (let i = after === undefined ? -1 : raw.findIndex(r => r.key === after); i >= 0; i--) {
+      if (keys.has(raw[i]!.key)) return raw[i]!.key;
+    }
+    return undefined;
+  };
+  return buildRows(shown, failed.map(f => ({ ...f, after: anchor(f.after) })));
+}
+
 /**
  * Turns a flat item list into render rows: day separators, and messages
  * flagged `first` when they start a new author block (different author, more
  * than 5 minutes after the previous message, a system line or a day break
  * in between).
  */
-export function buildRows(items: ChatItem[], failed: { key: string; at: number; after?: string }[] = []): Row[] {
+export function buildRows(items: ChatItem[], failed: FailedPlace[] = []): Row[] {
   const rows: Row[] = [];
   const loaded = new Set(items.map(i => i.key));
-  let waiting = failed.map(f => ({ ...f, kind: "failed" as const, after: f.after !== undefined && loaded.has(f.after) ? f.after : undefined }))
+  const waiting = failed.map(f => ({ ...f, kind: "failed" as const, after: f.after !== undefined && loaded.has(f.after) ? f.after : undefined }))
     .sort((a, b) => a.at - b.at);
   const ordered: (ChatItem | typeof waiting[number])[] = [];
   const time = (i: ChatItem) => {
@@ -76,8 +93,8 @@ export function buildRows(items: ChatItem[], failed: { key: string; at: number; 
   for (const item of items) {
     // Retain the server's message order; insert local failures before later messages, but never above
     // the message that was last shown when the send was admitted (a peer's clock may run ahead of ours).
-    const due = waiting.filter(f => f.after === undefined && f.at <= time(item));
-    if (due.length) { ordered.push(...due); waiting = waiting.filter(f => !due.includes(f)); }
+    // Only the earliest waiting send is placed, so failed sends keep their own order.
+    while (waiting[0] && waiting[0].after === undefined && waiting[0].at <= time(item)) ordered.push(waiting.shift()!);
     ordered.push(item);
     for (const f of waiting) if (f.after === item.key) f.after = undefined;
   }

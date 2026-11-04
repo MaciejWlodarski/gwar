@@ -292,7 +292,9 @@ interface FailedMessage {
   thread: string;
   /** The original send attempt's place in the conversation, retained through Retry. */
   at?: number;
-  /** Key of the thread's last item when the attempt was admitted; the card never sorts above it. */
+  /** Key of the thread's last item when the attempt was admitted; the card never sorts above it (or above
+   *  the nearest shown item before it). In memory only: after a resync the card may move once, while the
+   *  anchor's page reloads, if peer clocks are skewed. */
   after?: string;
   text: string;
   mentions?: string[];

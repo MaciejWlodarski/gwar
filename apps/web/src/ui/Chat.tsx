@@ -9,7 +9,7 @@ import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
 import { parseSpacer } from "../lib/spacer";
-import { buildRows, messageTarget, sealedThread, type Row } from "../lib/chat";
+import { messageTarget, sealedThread, threadRows, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
@@ -500,13 +500,13 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
     let timer: ReturnType<typeof setTimeout> | undefined;
     return () => { active = false; clearTimeout(timer); };
   }, [thread?.items, serverKey, key, mineUid, verifier, authTick]);
-  const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
+  const rows = useMemo(() => threadRows(thread?.items ?? [], (i) => {
     if (unshared(i)) return false;
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
     const entry = shown.verified.get(i.msg.id);
     const target = targetFor(i.msg);
     return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target, sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(withChannelLifecycle(entry.state, serverKey, target));
-  }), failed.map(f => ({ key: `failed:${f.id}`, at: f.at ?? f.sealed?.created_at ?? Number.MAX_SAFE_INTEGER, after: f.after }))), [thread?.items, shown, serverKey, key, signingUid, unshared, failed]);
+  }, failed.map(f => ({ key: `failed:${f.id}`, at: f.at ?? f.sealed?.created_at ?? Number.MAX_SAFE_INTEGER, after: f.after }))), [thread?.items, shown, serverKey, key, signingUid, unshared, failed]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
