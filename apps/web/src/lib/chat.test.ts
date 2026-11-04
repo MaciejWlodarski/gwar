@@ -20,6 +20,20 @@ describe("buildRows", () => {
     const rows = buildRows([m(2, "a", base + 2000), m(1, "a", base + 1000)], [{ key: "failed:1", at: base }]);
     expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "failed:1", "m2", "m1"]);
   });
+  it("never sorts a failed send above the messages that were visible when it was sent", () => {
+    // A peer whose clock runs a minute ahead signed m2 before I pressed send at base + 1000.
+    const signed = (id: number, at: number, created: number): ChatItem => {
+      const item = m(id, "b", at) as Extract<ChatItem, { kind: "msg" }>;
+      return { ...item, msg: { ...item.msg, signature: { created_at: created } as NonNullable<typeof item.msg.signature> } };
+    };
+    const items = [m(1, "a", base), signed(2, base + 500, base + 60_000), signed(3, base + 2000, base + 61_000)];
+    const rows = buildRows(items, [{ key: "failed:1", at: base + 1000, after: "m2" }]);
+    expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "m1", "m2", "failed:1", "m3"]);
+  });
+  it("keeps time order for a failed send whose anchor is no longer loaded", () => {
+    const rows = buildRows([m(1, "a", base), m(2, "a", base + 2000)], [{ key: "failed:1", at: base + 1000, after: "gone" }]);
+    expect(rows.map(r => r.type === "day" ? "day" : r.key)).toEqual(["day", "m1", "failed:1", "m2"]);
+  });
   it("groups consecutive messages by author within 5 minutes", () => {
     const rows = buildRows([m(1, "a", base), m(2, "a", base + 60_000), m(3, "a", base + 7 * 60_000), m(4, "b", base + 7 * 60_000 + 1000)]);
     expect(rows.filter((r) => r.type === "msg").map((r) => r.type === "msg" && r.first)).toEqual([true, false, true, true]);

@@ -292,6 +292,8 @@ interface FailedMessage {
   thread: string;
   /** The original send attempt's place in the conversation, retained through Retry. */
   at?: number;
+  /** Key of the thread's last item when the attempt was admitted; the card never sorts above it. */
+  after?: string;
   text: string;
   mentions?: string[];
   attachments?: string[];

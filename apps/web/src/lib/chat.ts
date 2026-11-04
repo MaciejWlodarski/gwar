@@ -63,21 +63,25 @@ function dayKey(at: number): string {
  * than 5 minutes after the previous message, a system line or a day break
  * in between).
  */
-export function buildRows(items: ChatItem[], failed: { key: string; at: number }[] = []): Row[] {
+export function buildRows(items: ChatItem[], failed: { key: string; at: number; after?: string }[] = []): Row[] {
   const rows: Row[] = [];
-  const waiting = failed.map(f => ({ ...f, kind: "failed" as const })).sort((a, b) => a.at - b.at);
+  const loaded = new Set(items.map(i => i.key));
+  let waiting = failed.map(f => ({ ...f, kind: "failed" as const, after: f.after !== undefined && loaded.has(f.after) ? f.after : undefined }))
+    .sort((a, b) => a.at - b.at);
   const ordered: (ChatItem | typeof waiting[number])[] = [];
   const time = (i: ChatItem) => {
     const signed = i.kind === "msg" ? i.msg.signature?.created_at : undefined;
     return signed != null && Number.isFinite(new Date(signed).getTime()) ? signed : i.at;
   };
-  let next = 0;
   for (const item of items) {
-    // Retain the server's message order; insert local failures before later messages.
-    while (next < waiting.length && waiting[next]!.at <= time(item)) ordered.push(waiting[next++]!);
+    // Retain the server's message order; insert local failures before later messages, but never above
+    // the message that was last shown when the send was admitted (a peer's clock may run ahead of ours).
+    const due = waiting.filter(f => f.after === undefined && f.at <= time(item));
+    if (due.length) { ordered.push(...due); waiting = waiting.filter(f => !due.includes(f)); }
     ordered.push(item);
+    for (const f of waiting) if (f.after === item.key) f.after = undefined;
   }
-  ordered.push(...waiting.slice(next));
+  ordered.push(...waiting);
   let prev: Row | null = null;
   let lastDay = "";
   for (const original of ordered) {

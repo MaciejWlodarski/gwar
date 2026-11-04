@@ -506,7 +506,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
     const entry = shown.verified.get(i.msg.id);
     const target = targetFor(i.msg);
     return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target, sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(withChannelLifecycle(entry.state, serverKey, target));
-  }), failed.map(f => ({ key: `failed:${f.id}`, at: f.at ?? f.sealed?.created_at ?? Number.MAX_SAFE_INTEGER }))), [thread?.items, shown, serverKey, key, signingUid, unshared, failed]);
+  }), failed.map(f => ({ key: `failed:${f.id}`, at: f.at ?? f.sealed?.created_at ?? Number.MAX_SAFE_INTEGER, after: f.after }))), [thread?.items, shown, serverKey, key, signingUid, unshared, failed]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
