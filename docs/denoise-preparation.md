@@ -90,25 +90,25 @@ context only once the model is in place (no effect). The owner accepted this row
 
 ### Result
 
-[Run 41843062558](https://github.com/MaciejWlodarski/gwar/actions/runs/41843062558),
+[Run 41851472952](https://github.com/MaciejWlodarski/gwar/actions/runs/41851472952),
 main `d04d51a9` against this source, three runners, six first joins per row (median,
 range):
 
 | Join to own suppression ready | Main | Candidate |
 | --- | ---: | ---: |
-| Warm Chromium | 2536 ms (2051–2971) | 43 ms (38–46) |
-| Warm Firefox | 2714 ms (2680–2757) | 76 ms (72–89) |
-| Warm WebKit | 2440 ms (2334–2519) | 317 ms (273–369) |
-| Cold Chromium | 2939 ms (2900–2981) | 2957 ms (2902–2974) |
-| Cold Firefox | 4436 ms (2788–4499) | 3093 ms (2781–3443) |
-| Cold WebKit | 2516 ms (2354–2692) | 2805 ms (2705–2871) |
-| Second join (all browsers) | 1675–2318 ms | 21–264 ms |
+| Warm Chromium | 2957 ms (2130–2966) | 44 ms (40–46) |
+| Warm Firefox | 2702 ms (2682–2757) | 86 ms (81–91) |
+| Warm WebKit | 2471 ms (2349–2529) | 316 ms (276–366) |
+| Cold Chromium | 2954 ms (2893–2965) | 2942 ms (2887–2946) |
+| Cold Firefox | 4432 ms (2798–4510) | 3463 ms (3289–3506) |
+| Cold WebKit | 2527 ms (2401–2804) | 2774 ms (2661–2812) |
+| Second join (all browsers) | 1600–2366 ms | 20–307 ms |
 
 Cold Chromium is held by the audio service starting about 1.9 s after the click in
-both variants; the medians differ by less than the spread. Idle preparation recorded
-no main-thread long tasks. The quality suite passed 18 of 18 runs per variant;
-the candidate's longest audio-thread task was 39 to 43 ms, main's control 706 to 744 ms.
-The quality suite's standalone first load (`loadMs`, page already running audio)
-was about 2.35 s in Chromium against main's 2.0 s, and 2.4 to 2.5 s in WebKit against
-main's 2.0 to 2.4 s: consistent with the same catch-up after main's audio-thread
-build, though those loads are not phase-marked.
+both variants. Idle preparation recorded no main-thread long tasks. The quality suite
+passed 18 of 18 runs per variant; the candidate's longest audio-thread task was 39 to
+45 ms, main's control 715 to 743 ms. The quality suite's standalone first load
+(`loadMs`, page already running audio) was 2.29 to 2.40 s in Chromium against main's
+1.99 to 2.11 s, and 2.43 to 2.48 s in WebKit against main's 2.00 to 2.34 s: consistent
+with the same catch-up after main's audio-thread build, though those loads are not
+phase-marked.
