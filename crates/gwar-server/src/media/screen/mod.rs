@@ -2423,22 +2423,27 @@ impl Sfu {
             }
             // A fellow browser viewer that has not reported has its reports taken only once its own
             // slot has been whole for `DECODE_WINDOW`: the window runs from then at the earliest.
-            let fellows = self
-                .slots_of(&share)
-                .into_iter()
+            // Only fellows whole before a report's own deadline count, so viewers joining or
+            // rewatching the share cannot postpone a lone failing viewer's isolation forever.
+            let slots = self.slots_of(&share);
+            let fellows: Vec<Instant> = slots
+                .iter()
                 .filter_map(|(s, i)| {
-                    let (w, slot) = (&self.watchers[&s], &self.watchers[&s].slots[i]);
+                    let (w, slot) = (&self.watchers[s], &self.watchers[s].slots[*i]);
                     let reporting = w.decode_watchdog && slot.failed_at.is_none();
-                    let whole = slot.whole_at.filter(|_| reporting && slot.grant.as_ref().is_some_and(|g| g.alive()));
-                    whole.map(|at| at + DECODE_WINDOW)
+                    slot.whole_at.filter(|_| reporting && slot.grant.as_ref().is_some_and(|g| g.alive()))
                 })
-                .max();
-            let failed: Vec<_> = self
-                .slots_of(&share)
+                .collect();
+            let failed: Vec<_> = slots
                 .into_iter()
                 .filter(|(s, i)| {
                     self.watchers[s].slots[*i].failed_at.is_some_and(|at| {
-                        now.saturating_duration_since(fellows.map_or(at, |f| f.max(at))) >= CORROBORATE_FOR
+                        let from = fellows
+                            .iter()
+                            .filter(|&&whole| whole <= at + CORROBORATE_FOR)
+                            .map(|&whole| whole + DECODE_WINDOW)
+                            .fold(at, Instant::max);
+                        now.saturating_duration_since(from) >= CORROBORATE_FOR
                     })
                 })
                 .collect();
@@ -5655,6 +5660,28 @@ pub(crate) mod tests {
             assert!(sfu.watchers[&8].slots[0].decode_cap.is_none());
             assert!(origin.alive());
         }
+    }
+
+    /// A fellow whose keyframe goes out whole again and again, as when it rewatches the share or
+    /// new viewers keep joining, moved the lone reporter's deadline each time, so a viewer whose
+    /// decoder fails could stay on a frozen picture with no signal for as long as that went on.
+    #[tokio::test]
+    async fn rewatching_fellows_cannot_postpone_a_lone_failure_forever() {
+        let (mut sfu, _origin, now, _) = recovery_fixture(&[7, 8]).await;
+        let at = now + Duration::from_secs(5);
+        report(&mut sfu, 7, at);
+        let secs = |s: u64| now + Duration::from_secs(s);
+        // Whole before the report's own deadline: it still gets its window to corroborate.
+        sfu.watchers.get_mut(&8).unwrap().slots[0].whole_at = Some(secs(11));
+        sfu.recoveries(secs(11));
+        assert!(sfu.watchers[&7].slots[0].grant.is_some(), "waits for the fellow");
+        // It rewatches and goes whole again after that deadline, without having reported: that
+        // no longer moves the window, and the lone reporter goes within the 18 s bound.
+        sfu.watchers.get_mut(&8).unwrap().slots[0].whole_at = Some(secs(21));
+        sfu.recoveries(secs(21));
+        assert!(secs(21) <= at + CORROBORATE_FOR + DECODE_WINDOW + CORROBORATE_FOR);
+        assert!(sfu.watchers[&7].slots[0].grant.is_none(), "isolated within the bound");
+        assert!(sfu.watchers[&8].slots[0].grant.as_ref().unwrap().alive());
     }
 
     #[tokio::test]
