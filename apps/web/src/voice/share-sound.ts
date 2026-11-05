@@ -182,25 +182,35 @@ export class ComputerSound {
 let receiving: Promise<boolean> | undefined;
 /**
  * Whether received sound can be kept from the webview's decoder, which is the only way the
- * desktop app may negotiate it. Asked once, and of the real worker: a refused or missing
- * worker leaves viewers with the picture alone and nothing that claims sound.
+ * desktop app may negotiate it. Asked of the real worker: a refused or missing worker leaves
+ * viewers with the picture alone and nothing that claims sound. An answer is kept for the page;
+ * a worker that did not answer in time is asked again next time, so one slow start cannot leave
+ * every later watch without sound.
  */
 export function shareSoundReceivable(create: () => Worker = createWorker, timeoutMs = 3_000): Promise<boolean> {
-  receiving ??= (async () => {
-    if (typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return false;
-    let worker: Worker | undefined;
-    try {
-      worker = create();
-      const reply = new Promise<boolean>(resolve => {
-        worker!.onmessage = (event: MessageEvent<ShareSoundProbe>) => resolve(event.data.transformEvents === true);
-        worker!.onerror = () => resolve(false);
-        setTimeout(() => resolve(false), timeoutMs);
-      });
-      worker.postMessage({});
-      return await reply;
-    } catch { return false; } finally { worker?.terminate(); }
-  })();
-  return receiving;
+  if (receiving) return receiving;
+  const asking = probeReceiving(create, timeoutMs).then(answer => {
+    if (answer === null && receiving === asking) receiving = undefined;
+    return answer === true;
+  });
+  receiving = asking;
+  return asking;
+}
+
+/** The worker's answer, or null when it gave none in time. */
+async function probeReceiving(create: () => Worker, timeoutMs: number): Promise<boolean | null> {
+  if (typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return false;
+  let worker: Worker | undefined;
+  try {
+    worker = create();
+    const reply = new Promise<boolean | null>(resolve => {
+      worker!.onmessage = (event: MessageEvent<ShareSoundProbe>) => resolve(event.data.transformEvents === true);
+      worker!.onerror = () => resolve(false);
+      setTimeout(() => resolve(null), timeoutMs);
+    });
+    worker.postMessage({});
+    return await reply;
+  } catch { return false; } finally { worker?.terminate(); }
 }
 
 /** One batch for `share_playback_frames`: owner, run, then slot, RTP time, length and Opus each. */
