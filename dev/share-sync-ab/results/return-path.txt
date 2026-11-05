@@ -1,5 +1,0 @@
-# Sound stopped and returned (normal net, SYNC_RETURN=1), 30 s, after the SoundTime fix; 'back' = bursts after the sound came back.
-browser  off       runs  8  first12 32/61  settled 225/230 med +31 (-28…+88) back 222/224
-browser  on        runs  8  first12 38/50  settled 216/220 med +32 (-30…+77) back 210/214
-desktop  off       runs  8  first12 31/65  settled 218/236 med +45 (-4…+150) back 215/233
-desktop  on        runs  8  first12 40/62  settled 228/234 med +27 (-30…+80) back 226/232

@@ -2302,83 +2302,54 @@ its picture by that number, so a whole-second error stays visible for 125 s. A n
 bursts, or a burst that lost a pulse, gives no row. An offset is positive when the sound lags. The
 target is −45 ms to +125 ms, ITU-R BT.1359's detectability range.
 
-Base `origin/main` at `1099a681`, with the estimator change of #221 applied, macOS 27.0 on an Apple
-M5, Chromium as the sharer and as both viewers. The desktop viewer is `native_bridge`: the real mixer
-and voice pipeline, with a virtual speaker, on a Chromium page. Every local run was silent, under a
-guard on the speakers.
+Base main `0a2f9054` (with #221 and #230), #213 at `7ec8e3e5`, macOS 27.0 on an Apple M5, Chromium
+as the sharer and as both viewers. The desktop viewer is `native_bridge`: the real mixer and voice
+pipeline, with a virtual speaker, on a Chromium page. Every local run was silent, under a guard on
+the speakers.
 
-"Main" is the sync-off column of the table this one replaces, measured on `31ab5683`: main's own
-playback, before the two delivery fixes. "Sync off" (`SYNC_OFF=1`) is the same playback on this build,
-so it has both fixes: main's `jitterBufferTarget = 0` goes through and no other value does, the mixer
-gets no hold, the late-frame filter is refused, which also means no `screen.stalled`, and held sound
-is released in the grant's own dispatch. A run fails unless it saw a filter refused and a hold
-released.
-
-**The sender reports were the larger part of the lip-sync problem.** A stream with nothing written
-reported RTP time zero against the real clock, and libwebrtc keeps twenty reports for its clock
-estimate. So at a watch's start, and when sound joined a picture-only share, the engine's own sync
-worked from false points for up to half a minute. With sound added mid-watch it held the sound back by
-up to 900 ms. `StreamTx` now sends no report until the first packet (`vendor/str0m/GWAR-PATCH.md`).
+"Sync off" (`SYNC_OFF=1`) is main's playback on this build: main's `jitterBufferTarget = 0` goes
+through and no other value does, the mixer gets no hold, the late-frame filter is refused, which also
+means no `screen.stalled`, and held sound is released in the grant's own dispatch. A run fails unless
+it saw a filter refused and a hold released.
 
 "Settled" is every second after the first 12 of a viewer's record. Each cell covers eight runs of the
-same 30 or 45 s in both orders of the two viewers. The sync-off column was run alternating with an
-earlier build of sync, and the sync-on column right after it on this one, because the last change
-touches only sync. A cell gives the bursts in range, then the median, p5 and p95 of all those bursts.
+same 30 or 45 s, sync on and off alternating run by run, in both orders of the two viewers. No run
+was void (load or sleep). A cell gives the bursts in range, then the median, p5 and p95 of the settled
+bursts.
 
-| Link in front of the viewers | Viewer | Main | Sync off, settled | Sync on, settled |
-| --- | --- | --- | --- | --- |
-| None | Desktop | 148/170 = 0.87 | 158/159 = 0.99; +81 (+44…+104) | 159/160 = 0.99; +60 (+20…+94) |
-| None | Browser | 157/173 = 0.91 | 160/160 = 1.00; +42 (+6…+77) | 161/161 = 1.00; +43 (+3…+75) |
-| 20 ms ± 5 ms, 45 s | Desktop | 253/287 = 0.88 | **276/280 = 0.99**; +74 (+38…+106) | **272/280 = 0.97**; +54 (+8…+88) |
-| 20 ms ± 5 ms, 45 s | Browser | 243/289 = 0.84 | 270/280 = 0.96; +31 (−21…+68) | 273/280 = 0.97; +39 (−18…+74) |
-| 20 ms ± 10 ms, 45 s | Desktop | 64/189 = 0.34 | 234/260 = 0.90; +72 (−81…+123) | 226/230 = 0.98; +57 (+15…+96) |
-| 20 ms ± 10 ms, 45 s | Browser | 61/179 = 0.34 | 246/266 = 0.92; +30 (−91…+68) | 255/265 = 0.96; +20 (−31…+58) |
-| 2 s stall at 14 s | Desktop | 41/125 = 0.33 | 20/75 = 0.27; +32 (−748…+238) | 107/119 = 0.90; +38 (−5…+286) |
-| 2 s stall at 14 s | Browser | 7/113 = 0.06 | 10/64 = 0.16; −169 (−490…+5496) | 117/149 = 0.79; +22 (−105…+162) |
-| 270 ms stall every 10 s, 45 s | Desktop | 14/200 = 0.07 | 38/204 = 0.19; +193 (−10…+287) | 170/212 = 0.80; +40 (−65…+229) |
-| 270 ms stall every 10 s, 45 s | Browser | 132/230 = 0.57 | 133/224 = 0.59; +89 (−79…+239) | 177/245 = 0.72; +54 (−101…+182) |
+| Link in front of the viewers | Viewer | Off, first 12 s | Off, settled | On, first 12 s | On, settled |
+| --- | --- | --- | --- | --- | --- |
+| None, 45 s | Desktop | 84/104 | 233/251; +78 (+39…+126) | **75/104** | 253/253; +56 (+21…+84) |
+| None, 45 s | Browser | 97/101 | 253/253; +17 (−24…+57) | **90/103** | **251/253**; +29 (−11…+60) |
+| 20 ms ± 5 ms, 45 s | Desktop | 79/99 | 201/237; +66 (−196…+116) | **66/100** | 253/254; +46 (−8…+85) |
+| 20 ms ± 5 ms, 45 s | Browser | 49/103 | 252/254; +29 (−17…+61) | 51/102 | **224/251**; +14 (−94…+54) |
+| 20 ms ± 10 ms, 45 s | Desktop | 65/100 | 182/225; +43 (−233…+100) | **44/100** | **115/193**; +13 (−250…+112) |
+| 20 ms ± 10 ms, 45 s | Browser | 34/104 | 148/199; +13 (−262…+62) | **12/101** | 184/214; +6 (−83…+46) |
+| 2 s stall at 14 s, 45 s | Desktop | 73/81 | 120/212; +77 (−636…+208) | **58/81** | 231/240; +29 (−29…+67) |
+| 2 s stall at 14 s, 45 s | Browser | 73/90 | 2/166; −167 (−461…−35) | **59/83** | 189/251; −18 (−104…+87) |
+| 270 ms stall every 10 s, 45 s | Desktop | 48/97 | 22/172; +200 (−37…+275) | 61/96 | 135/163; +34 (−30…+166) |
+| 270 ms stall every 10 s, 45 s | Browser | 43/100 | 178/236; +64 (−43…+178) | 62/100 | 158/206; +35 (−100…+152) |
+| Sound stopped 5 s and returned, 30 s | Desktop | 54/63 | 233/233; +40 (+13…+75) | **50/61** | 231/231; +32 (+4…+65) |
+| Sound stopped 5 s and returned, 30 s | Browser | 60/63 | 242/244; +17 (−16…+50) | **53/62** | 240/241; +17 (−16…+54) |
 
-**Where sync is worse than sync off.** Settled, one row: the desktop at ±5 ms, by 4 bursts of 280. Every
-other settled row is equal or better. Two more are below.
+After the sound came back, in range: desktop 231/231 off, 230/230 on; browser 235/236 off, 234/234
+on. Before `audio::SoundTime` the browser gave 8/84 with sync and 35/84 without.
 
-- **The first seconds of a watch.** A watch is silent until its picture is on screen, 249 ms after the
-  grant at the median, 513 at p90 and 594 at most in 80 watches, so sound no longer starts ahead of
-  the picture. Bursts in range in the first 12 s, sync off then on:
+**Where sync is worse than sync off** (bold above):
 
-  | Link | Desktop | Browser |
-  | --- | --- | --- |
-  | None | 46/73, 53/73 | 51/75, 56/74 |
-  | ±5 ms | **39/74, 22/72** | **33/74, 20/75** |
-  | ±10 ms | 17/63, 28/63 | 20/75, 38/75 |
-  | 2 s stall | 54/74, 52/72 | 49/76, 54/74 |
-  | 270 ms stalls | 31/73, 35/72 | 36/75, 37/72 |
+- **The first 12 s, on almost every row and both viewers**, by 4 to 22 bursts of about 100; only
+  the 270 ms stalls row and the browser at ±5 ms are equal or better. What acts in these seconds is
+  the start hold (sound silent until the picture is on screen) and the late-frame filter; the waits
+  start only after ten looks.
+- **Settled at ±10 ms on the desktop**, 115/193 against 182/225. Half of the runs in both arms have
+  half the bursts (16 to 18 of about 32) with sound up to 780 ms ahead, a picture that stood still or
+  lost its frames: two runs off, four on. The other runs are alike. Eight runs cannot tell those two
+  counts apart, and the cause is not known.
+- **Settled at ±5 ms on the browser**, 224/251 against 252/254, with p5 at −94 ms: sound ahead.
+- **Settled with no link on the browser**, 251/253 against 253/253.
 
-  ±5 ms is worse on both viewers. The two matrices before this one gave 56/75 and 33/74 without sync
-  and 22/75, 42/71 and 20/75 with it on the browser, so the row moves by more than the gap in the
-  other rows, but its direction is steady. Sync moves nothing in these seconds, so what is left of it
-  there is the sound hold and the filter, and neither was shown to cause this.
-- **Sound returning to a running share.** Below, the browser is worse than sync off.
-
-Sound joining or returning during a watch, normal link, in range from 8 s after sound is back, four
-runs per side:
-
-| Path | Viewer | Sync off | Sync on |
-| --- | --- | --- | --- |
-| Added to a picture-only share | Desktop | 83/85 | 82/82 |
-| Added to a picture-only share | Browser | 84/85 | 85/85 |
-| Stopped, back 5 s later | Desktop | 41/81 | 59/84 |
-| Stopped, back 5 s later | Browser | **35/84** | **8/84** |
-
-Before the sender report fix, adding sound took a browser viewer to 0/19 and 0/23 with sync, and sound
-1400 ms late, and to about 900 ms without it. Stopping and returning leaves the publisher's RTP time
-behind its clock by the length of the stop, so the engine's sync moves the picture 300–470 ms late for
-10–20 s on both viewers, and sound leads by that much, with or without sync. Those runs are bimodal
-(0 to 21 of 21 each), and earlier batches gave 39/134 with sync and 24/44 without. In a browser sync
-can do nothing about a late picture. Fixing the cause means rewriting audio RTP time at the SFU, which
-was not done.
-
-Settled, the target holds on 0.96 or more of bursts on every link without a stall, and on 0.72 to 0.90
-around stalls. Elsewhere:
+The analysis below was measured on the build before the rebase (main `1099a681` with #221), against
+main `31ab5683`; the table above replaces its numbers.
 
 - **A 2 s stall.** Counting from the first picture after it, in the five bursts from 3 to 8 s:
 

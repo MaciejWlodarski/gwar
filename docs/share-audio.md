@@ -368,7 +368,9 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   plays, which leaves the queue the cushion the next lump needs. A queue that stayed over
   its limit (the delay plus 80 ms) for half a second is a stall's backlog: the excess is
   dropped rather than played late. So after a stall, sound can trail by up to 640 ms for half
-  a second.
+  a second. A stream queues at most 48 packets, 960 ms: a full hold, the longest delay and the
+  margin take 640 ms, and the rest takes a lump, so the trim, not the newest packets, decides
+  what goes.
 
 ### Lip-sync
 
@@ -408,7 +410,9 @@ the waits are still there for the resume, and the next look corrects what the pa
 and deafening release both waits, since nothing heard is left to line up with, and sound coming back
 starts over like a new watch. A server without the query answers `bad_request` once and the viewer does not ask
 again; a question lost to a timeout is asked again at the next look, and muting releases the waits
-either way. A webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
+either way. After five looks in a row with no line between the clocks (unknown or unanswered) or no
+sound to place, the waits are a guess: the slot gives them back and settles again once it can
+measure. A still picture keeps its wait. A webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
 still hold sound.
 
 **A new watch starts together.** Its sound is silent until its first picture is on screen, so
@@ -440,17 +444,25 @@ quickest of the last few seconds, by the media's own clock. It only acts after a
 200 ms: frames that are late without that are a queue, which the receiver drains by itself. A
 picture frame over 500 ms late, or a
 sound frame over 200 ms late, goes; in the desktop app sound leaves for the mixer, which drops late
-frames itself. Keyframes are always kept. Nothing is shed for more than a second in a row: a link
-that stays that slow is the link now, and it sets the new measure. Without script transforms a
-viewer plays the backlog, as before.
+frames itself. Keyframes are always kept, and a run that opens with one is a resumed slot's first
+picture, held up by its own size, not a backlog. Nothing is shed for more than a second in a row: a
+link that stays that slow is the link now, and it sets the new measure. Without script transforms a
+viewer plays the backlog, as before. The filter never stops a frame on its own failure: if it
+throws, every later frame passes, and if the stream fails, what still flows is piped through
+unfiltered, so a slot can never freeze on it.
 
 The first frame of a backlog proves the link is back, so that is when the viewer sends
 `screen.stalled`, and again at the first frame in time, because frames were dropped since any
-keyframe in between. The SFU asks for a keyframe and puts the estimate back to what the watched
-shares need with room for a keyframe, never past what the link carried in the last 15 s. It does
-that at most once in 10 s on a viewer's word, and it undoes one more fall within the next second,
-because the burst's own feedback can land after the word of it. The estimator then proves or
-lowers it as usual.
+keyframe in between. The SFU asks for a keyframe and puts the estimate back towards what the watched
+shares need with room for a keyframe, never past what the link carried in the last 15 s, the
+server's budget, or 1.5 times the estimate it finds. It does that at most once in 10 s on a viewer's
+word, and not for a paused slot. The estimator then proves or lowers it as usual: a fall after the
+restore is the link's answer. The viewer's word says a backlog arrived, not what the link carries
+now, so the reach is bounded for a link that came back slower. In the simulator, a 2 s stall that
+left the link at a quarter cost voice 1.37 s more of 50 ms queue with an unbounded restore and a
+second one within a second, and 0.12 s more at 1.5 times. Dropping frames the SFU forwarded whole
+also restarts the slot's decode watchdog, so the keyframe wait is never reported as a decoder that
+cannot decode.
 
 The picture has just jumped, so one more move goes unseen: after the backlog lands, the first look
 that finds the two sides over 45 ms apart moves the picture the whole way, once, while sound is
