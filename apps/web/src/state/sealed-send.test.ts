@@ -6,7 +6,7 @@ import type { Link } from "../net/connection";
 import type { Attachment } from "../proto/Attachment";
 import type { Plaintext } from "../mls/types";
 import { initialState } from "./reducer";
-import { SealedConversations, type SealedRuntime } from "./sealed";
+import { INVALID_FILES, SealedConversations, type SealedRuntime } from "./sealed";
 import { useOutbox, useSession } from "./stores";
 import { controller } from "./controller";
 
@@ -169,7 +169,7 @@ it("recovers the original attachment delivery before an explicit fresh send", as
   request.mockImplementation(async op => {
     if (op === "chat.sealed.send") {
       if (sends++ === 0) { stored = plain; original = acknowledgement(); throw new Error("answer lost"); }
-      throw new (await import("../net/connection")).RequestError("bad_request", "upload already attached");
+      throw new (await import("../net/connection")).RequestError("bad_request", INVALID_FILES);
     }
     return { sealed: [original] };
   });
@@ -232,16 +232,33 @@ it("ends a retry the server holds but cannot show as 'may have been sent', with 
 
 it("marks the files of a send the server no longer takes as missing", async () => {
   const { RequestError } = await import("../net/connection");
-  const { tNow } = await import("../i18n");
   c.uploaded.set(attachment.id, { conn: link, att: attachment });
   request.mockRejectedValueOnce(new Error("answer lost"));
   await controller.sendChat("server", "files expired", { attachments: [attachment.id] });
   const failed = useOutbox.getState().failed[0]!;
   request.mockImplementation(async op => {
-    if (op === "chat.sealed.send") throw new RequestError("bad_request", "invalid files");
+    if (op === "chat.sealed.send") throw new RequestError("bad_request", INVALID_FILES);
     return { sealed: [] };
   });
   await controller.retrySend(failed.id);
-  expect(useOutbox.getState().failed).toMatchObject([{ id: failed.id, attachments: [attachment.id], attachmentMetadata: [], error: tNow("chat.missingAttachments") }]);
+  expect(useOutbox.getState().failed).toMatchObject([{ id: failed.id, attachments: [attachment.id], attachmentMetadata: [], reason: "chat.missingAttachments" }]);
+  expect(useOutbox.getState().failed[0]!.unknown).toBeUndefined();
+});
+
+it("keeps the files of a send refused for another reason, and lets it be retried", async () => {
+  const { RequestError } = await import("../net/connection");
+  c.uploaded.set(attachment.id, { conn: link, att: attachment });
+  request.mockRejectedValueOnce(new Error("answer lost"));
+  await controller.sendChat("server", "not about the files", { attachments: [attachment.id] });
+  const failed = useOutbox.getState().failed[0]!;
+  // Access checks answer bad_request too ("not end-to-end encrypted", "invalid conversation").
+  request.mockImplementation(async op => {
+    if (op === "chat.sealed.send") throw new RequestError("bad_request", "this conversation is not end-to-end encrypted");
+    return { sealed: [] };
+  });
+  await controller.retrySend(failed.id);
+  expect(request.mock.calls.filter(([op]) => op === "chat.sealed.history")).toEqual([]);
+  expect(useOutbox.getState().failed).toMatchObject([{ id: failed.id, attachmentMetadata: [attachment], retrying: false }]);
+  expect(useOutbox.getState().failed[0]!.reason).toBeUndefined();
   expect(useOutbox.getState().failed[0]!.unknown).toBeUndefined();
 });

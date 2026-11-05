@@ -170,17 +170,20 @@ export function describeRequestError(e: unknown, action?: Key): string {
 /** A plaintext retry keeps its message ID within this time; the server takes signatures up to 5 minutes old. */
 const PLAIN_RETRY_WINDOW_MS = 4 * 60_000;
 
-/** Server answers that a send card can explain in plain words; others leave it at "Not sent". */
-const SEND_FAILURES = new Set(["not_authenticated", "not_found", "forbidden", "rate_limited", "unavailable", "internal", "banned", "too_large", "quota_exceeded"]);
-/** Why a send failed, in plain words for its card, or "" when no more than "Not sent" can honestly be said
- *  (internal errors are not shown). */
-function sendFailureReason(e: unknown): string {
-  if (e instanceof RequestError) return SEND_FAILURES.has(e.code) ? tNow(`err.req.${e.code}` as Key) : "";
-  if (e instanceof RequestTimeoutError) return tNow("err.req.timeout");
-  if (e instanceof ConnectionLostError) return tNow("err.req.lost");
-  if (e instanceof AttachmentsGoneError) return tNow("chat.missingAttachments");
-  const plain: Key[] = ["chat.securing", "chat.locked", "chat.peerOffline", "chat.missingAttachments", "chat.editChanged"];
-  return e instanceof Error && plain.some(key => tNow(key) === e.message) ? e.message : "";
+/** Server answers that a send card can explain in plain words that stay true after a reconnect;
+ *  others leave it at "Not sent". */
+const SEND_FAILURES = new Set(["not_found", "forbidden", "rate_limited", "unavailable", "internal", "banned", "too_large", "quota_exceeded"]);
+/** Errors thrown with these texts, and the words a card keeps for them (past tense where the state passes). */
+const SEND_FAILURE_TEXTS: [Key, Key][] = [["chat.securing", "chat.failed.securing"], ["chat.locked", "chat.locked"],
+  ["chat.peerOffline", "chat.failed.peerOffline"], ["chat.missingAttachments", "chat.missingAttachments"], ["chat.editChanged", "chat.editChanged"]];
+/** Why a send failed, as the key of a plain sentence for its card (shown in the language of the moment), or
+ *  undefined when no more than "Not sent" can honestly be said (internal errors are not shown). */
+function sendFailureReason(e: unknown): Key | undefined {
+  if (e instanceof RequestError) return SEND_FAILURES.has(e.code) ? `err.req.${e.code}` as Key : undefined;
+  if (e instanceof RequestTimeoutError) return "err.req.timeout";
+  if (e instanceof ConnectionLostError) return "chat.failed.lost";
+  if (e instanceof AttachmentsGoneError) return "chat.missingAttachments";
+  return e instanceof Error ? SEND_FAILURE_TEXTS.find(([thrown]) => tNow(thrown) === e.message)?.[1] : undefined;
 }
 
 /** Why a channel refused me, in the words of joining. */
@@ -2198,7 +2201,7 @@ class Controller {
       // Anchor a new attempt after what is on screen now; a retry keeps the original place.
       const after = retryId === undefined ? useSession.getState().threads[m.thread]?.items.at(-1)?.key : m.after;
       id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata, after,
-        sending: retryId === undefined, retrying: retryId !== undefined, error: "" }).id;
+        sending: retryId === undefined, retrying: retryId !== undefined, reason: undefined }).id;
       this.sendAttempts.set(id, attempt);
       const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id!) === attempt && ownsView() && session === this.sendSession
         && (useOutbox.getState().failed.some(f => f.id === id && f.sealed?.message_id === m.sealed.message_id) || delivered());
@@ -2218,7 +2221,7 @@ class Controller {
       // Dismissal or an authenticated arrival may already have removed this attempt.
       if (useOutbox.getState().failed.some(f => f.id === id)) {
         // Final answers: the card then says what is known instead of offering a retry that cannot work.
-        useOutbox.getState().update(id, { sending: false, retrying: false, error: sendFailureReason(error),
+        useOutbox.getState().update(id, { sending: false, retrying: false, reason: sendFailureReason(error),
           ...(error instanceof DeliveryUnknownError ? { unknown: true } : {}),
           ...(error instanceof AttachmentsGoneError ? { attachmentMetadata: [] } : {}) });
       }
@@ -2254,22 +2257,41 @@ class Controller {
     } catch (e) {
       // A draft whose session has ended belongs to no thread here: it is dropped, never kept for another server.
       if (bound && !bound.current()) { if (retryId !== undefined) useOutbox.getState().remove(retryId); return false; }
-      // The server keeps every message ID it accepted: a retry it refuses as a duplicate was delivered
-      // by an earlier attempt whose answer was lost.
-      if (retryId !== undefined && e instanceof RequestError && e.code === "conflict") {
+      const channel = typeof m.target === "object" && "channel" in m.target ? m.target.channel : null;
+      const client = typeof m.target === "object" && "client" in m.target;
+      // Only a retry that signed the earlier attempt's identity again can be answered as a duplicate of it:
+      // the server keeps every message ID it stored, so that answer means the lost attempt was delivered.
+      const reused = retryId !== undefined && m.identity !== undefined;
+      if (reused && e instanceof RequestError && e.code === "conflict") {
         for (const id of m.attachments ?? []) this.uploaded.delete(id);
         useOutbox.getState().remove(retryId);
         return true;
       }
+      // The server checks uploads before the identity: once a lost attempt was stored, its files are no
+      // longer free, so a retry hears "not found". The channel's history tells whether it arrived.
+      if (reused && channel !== null && m.attachments?.length && e instanceof RequestError && e.code === "not_found") {
+        const found = await this.storedSend(bound!.conn, channel, identity.message_id).catch(() => null);
+        if (!bound!.current() || !useOutbox.getState().failed.some(f => f.id === retryId)) return found === true;
+        if (found) { for (const id of m.attachments) this.uploaded.delete(id); useOutbox.getState().remove(retryId); return true; }
+        useOutbox.getState().update(retryId, { retrying: false, unknown: found === false, reason: undefined });
+        return false;
+      }
       // Dismissed while it was being sent: it stays dismissed.
       if (retryId !== undefined && !useOutbox.getState().failed.some(f => f.id === retryId)) return false;
-      const channel = typeof m.target === "object" && "channel" in m.target, client = typeof m.target === "object" && "client" in m.target;
-      const reason = e instanceof RequestError && e.code === "forbidden" && channel ? tNow("chat.locked")
-        : e instanceof RequestError && e.code === "not_found" && client ? tNow("chat.peerOffline") : sendFailureReason(e);
-      if (retryId !== undefined) useOutbox.getState().update(retryId, { identity, error: reason, retrying: false });
-      else useOutbox.getState().add({ ...m, identity, serverKey: bound?.conn.serverKey ?? null, error: reason });
+      const reason: Key | undefined = e instanceof RequestError && e.code === "forbidden" && channel !== null ? "chat.locked"
+        : e instanceof RequestError && e.code === "not_found" && client ? "chat.failed.peerOffline" : sendFailureReason(e);
+      if (retryId !== undefined) useOutbox.getState().update(retryId, { identity, reason, retrying: false });
+      else useOutbox.getState().add({ ...m, identity, serverKey: bound?.conn.serverKey ?? null, reason });
       return false;
     }
+  }
+
+  /** Whether my message with this identity is in a channel's newest history page; when it is not there, it
+   *  may still be older or have been removed. */
+  private async storedSend(conn: Link, channel: number, messageId: string): Promise<boolean> {
+    const me = useSession.getState().me?.uid;
+    const page = await conn.request("chat.history", { channel, limit: HISTORY_PAGE });
+    return page.messages.some(msg => msg.author_uid === me && msg.signature?.message_id === messageId);
   }
 
   async retrySend(id: number, fresh = false): Promise<void> {
@@ -2304,7 +2326,7 @@ class Controller {
     let target = item.target;
     if (item.dmUid) {
       const peer = Object.values(useSession.getState().clients).find(c => c.uid === item.dmUid);
-      if (!peer) { useOutbox.getState().update(id, { error: tNow("chat.peerOffline") }); return; }
+      if (!peer) { useOutbox.getState().update(id, { reason: "chat.failed.peerOffline" }); return; }
       target = { client: peer.id };
     }
     // An earlier attempt whose answer was lost may already be on screen.

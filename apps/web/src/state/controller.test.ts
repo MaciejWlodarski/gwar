@@ -863,7 +863,7 @@ describe("session resilience", () => {
     await controller.restoreSession();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(connect).toHaveBeenCalledOnce();
-    expect(stores.useConnectUi.getState()).toMatchObject({ restoring: false, busy: false, error: "Cannot reach Friends" });
+    expect(stores.useConnectUi.getState()).toMatchObject({ restoring: false, busy: false });
     expect(session().phase).toBe("idle");
     connect.mockRestore();
   });
@@ -2471,7 +2471,7 @@ describe("edits stay on their connection; history ownership follows each verifie
     const g = await genuine(), { b, switchTo } = await servers(g);
     switchTo();
     stores.useSession.setState({ viewChannel: 1, channels: { 1: chan(1) } });
-    stores.useOutbox.getState().add({ thread: "ch:1", target: { channel: 1 }, text: "draft for A", serverKey: g.ctx.serverKey, error: "x" });
+    stores.useOutbox.getState().add({ thread: "ch:1", target: { channel: 1 }, text: "draft for A", serverKey: g.ctx.serverKey });
     const pending = stores.useOutbox.getState().failed[0]!;
     await controller.retrySend(pending.id);
     expect(b.request).not.toHaveBeenCalled();
@@ -2482,7 +2482,6 @@ describe("edits stay on their connection; history ownership follows each verifie
   it("retries a plaintext send as the same message, and takes the server's duplicate answer as delivered", async () => {
     vi.useRealTimers(); connectFake();
     const { RequestError, RequestTimeoutError } = await import("../net/connection");
-    const { tNow } = await import("../i18n");
     const g = await genuine(), { a } = await servers(g);
     stores.useSession.setState({ viewChannel: 1 });
     const sent = () => (a.request.mock.calls as [string, { signature: { message_id: string; created_at: number } }][]).filter(([op]) => op === "chat.send").map(([, d]) => d.signature);
@@ -2490,7 +2489,7 @@ describe("edits stay on their connection; history ownership follows each verifie
     a.request.mockRejectedValueOnce(new RequestTimeoutError("chat.send"));
     expect(await controller.sendChat("channel", "only once")).toBe(false);
     const failed = stores.useOutbox.getState().failed[0]!;
-    expect(failed).toMatchObject({ text: "only once", error: tNow("err.req.timeout"), identity: { message_id: sent()[0]!.message_id, created_at: sent()[0]!.created_at } });
+    expect(failed).toMatchObject({ text: "only once", reason: "err.req.timeout", identity: { message_id: sent()[0]!.message_id, created_at: sent()[0]!.created_at } });
     a.request.mockRejectedValueOnce(new RequestError("conflict", "message_id already used"));
     await controller.retrySend(failed.id);
     expect(sent()).toHaveLength(2);
@@ -2523,17 +2522,61 @@ describe("edits stay on their connection; history ownership follows each verifie
     g.c.conn = link;
   });
 
+  it("never takes a duplicate answer to a re-signed retry as delivered", async () => {
+    vi.useRealTimers(); connectFake();
+    const { RequestError } = await import("../net/connection");
+    const g = await genuine(), { a } = await servers(g);
+    stores.useSession.setState({ viewChannel: 1 });
+    a.request.mockRejectedValueOnce(new Error("lost"));
+    await controller.sendChat("channel", "too old to sign again");
+    const old = stores.useOutbox.getState().failed[0]! as { id: number; identity?: { message_id: string; created_at: number } };
+    stores.useOutbox.getState().update(old.id, { identity: { ...old.identity!, created_at: Date.now() - 5 * 60_000 } });
+    // A new identity cannot be a copy of the lost attempt, whatever the server says about it.
+    a.request.mockRejectedValueOnce(new RequestError("conflict", "message_id already used"));
+    await controller.retrySend(old.id);
+    expect(stores.useOutbox.getState().failed).toMatchObject([{ id: old.id, text: "too old to sign again", retrying: false }]);
+    expect(stores.useOutbox.getState().failed[0]!.unknown).toBeUndefined();
+    g.c.conn = link;
+  });
+
+  it.each([true, false])("asks the channel history whether a retry with files the server took was delivered (stored=%s)", async stored => {
+    vi.useRealTimers(); connectFake();
+    const { RequestError } = await import("../net/connection");
+    const g = await genuine(), { a } = await servers(g);
+    stores.useSession.setState({ viewChannel: 1 });
+    const uploaded = (controller as unknown as { uploaded: Map<string, { conn: unknown; att: Attachment }> }).uploaded;
+    const att: Attachment = { id: "f9", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/f9/file", sha256: "s" };
+    uploaded.set(att.id, { conn: a, att });
+    let messageId = "";
+    a.request.mockImplementation(async (op: string, d: { signature?: { message_id: string } }) => {
+      if (op === "chat.send" && !messageId) { messageId = d.signature!.message_id; throw new Error("answer lost"); }
+      // The first attempt was stored with its file, so the file is no longer a free upload.
+      if (op === "chat.send") throw new RequestError("not_found", "no such upload");
+      if (op === "chat.history") return { messages: stored ? [{ ...message(90, 1, { author_uid: g.uid, text: "with notes" }), signature: { ...g.msg.signature!, message_id: messageId } }] : [] };
+      return {};
+    });
+    await controller.sendChat("channel", "with notes", { attachments: [att.id] });
+    const failed = stores.useOutbox.getState().failed[0]!;
+    await controller.retrySend(failed.id);
+    expect(a.request).toHaveBeenCalledWith("chat.history", expect.objectContaining({ channel: 1 }));
+    if (stored) expect(stores.useOutbox.getState().failed).toEqual([]);
+    else expect(stores.useOutbox.getState().failed).toMatchObject([{ id: failed.id, unknown: true, retrying: false }]);
+    // Never "That no longer exists": the message may be stored.
+    expect(stores.useOutbox.getState().failed[0]?.reason).toBeUndefined();
+    uploaded.clear();
+    g.c.conn = link;
+  });
+
   it("marks a card while its retry is in flight and gives a plain reason when it fails again", async () => {
     vi.useRealTimers(); connectFake();
     const { RequestError } = await import("../net/connection");
-    const { tNow } = await import("../i18n");
     const g = await genuine(), { a } = await servers(g);
     stores.useSession.setState({ viewChannel: 1 });
     a.request.mockRejectedValueOnce(new Error("internal detail"));
     await controller.sendChat("channel", "retry me");
     const failed = stores.useOutbox.getState().failed[0]!;
     // Internal error text is never shown on the card.
-    expect(failed.error).toBe("");
+    expect(failed.reason).toBeUndefined();
     let reject!: (error: Error) => void;
     a.request.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
     const retry = controller.retrySend(failed.id);
@@ -2543,7 +2586,7 @@ describe("edits stay on their connection; history ownership follows each verifie
     expect(a.request).toHaveBeenCalledTimes(2);
     reject(new RequestError("forbidden", "no access to this channel"));
     await retry;
-    expect(stores.useOutbox.getState().failed).toMatchObject([{ id: failed.id, retrying: false, error: tNow("chat.locked") }]);
+    expect(stores.useOutbox.getState().failed).toMatchObject([{ id: failed.id, retrying: false, reason: "chat.locked" }]);
     g.c.conn = link;
   });
 
@@ -2876,7 +2919,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     sealed.send.mockRejectedValueOnce(new Error(tNow("chat.securing")));
     expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi")).toBe(false);
     const failed = stores.useOutbox.getState().failed.at(-1)!;
-    expect(failed).toMatchObject({ thread, text: "hi", error: tNow("chat.securing"), sealed: { message_id: expect.any(String) } });
+    expect(failed).toMatchObject({ thread, text: "hi", reason: "chat.failed.securing", sealed: { message_id: expect.any(String) } });
     expect(stores.useUi.getState().toasts).toEqual([]);
     await controller.retrySend(failed.id);
     expect(sealed.send).toHaveBeenLastCalledWith(thread, "hi", [], undefined, [], failed.sealed, expect.any(Function));

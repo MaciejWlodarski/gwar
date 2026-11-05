@@ -380,13 +380,14 @@ function FailedMessageRow({ message: f }: { message: FailedSend }) {
   useSession(s => s.epoch);
   const fresh = !!f.sealed && f.session !== controller.sendSession;
   const missing = !!f.sealed && (f.attachments ?? []).some(id => !f.attachmentMetadata?.some(a => a.id === id && a.sealed));
-  // One line: what happened, and why when it can be said plainly.
-  const status = f.unknown ? t("chat.maybeSent") : f.error && f.error !== t("chat.notSent") ? `${t("chat.notSent")} · ${f.error}` : t("chat.notSent");
+  // What happened, and why when it can be said plainly: one line from sm up; a narrow screen wraps it,
+  // since a touch screen cannot show the title.
+  const status = f.unknown ? t("chat.maybeSent") : f.reason ? `${t("chat.notSent")} · ${t(f.reason)}` : t("chat.notSent");
   return (
   <div key={f.id} role="alert" aria-busy={f.retrying || undefined} className="mx-4 mt-2 flex gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2">
     <AlertCircle className="mt-0.5 size-4 shrink-0 text-danger" />
     <div className="min-w-0 flex-1">
-      <div data-failed-status className="truncate text-xs font-medium text-danger" title={status}>
+      <div data-failed-status className="text-xs font-medium break-words text-danger sm:truncate" title={status}>
         {status}
       </div>
       <div className="mt-0.5 text-sm break-words whitespace-pre-wrap text-fg/80">{f.text}</div>

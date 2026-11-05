@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { DeliveryUnknownError, SealedConversations, type SealedRuntime } from "./sealed";
+import { DeliveryUnknownError, INVALID_FILES, SealedConversations, type SealedRuntime } from "./sealed";
 import { useSession, useOutbox } from "./stores";
 import { generateIdentity, uidForPublicKey } from "../net/identity";
 import type { Link } from "../net/connection";
@@ -70,7 +70,7 @@ describe("encrypted DM controller", () => {
   it.each([false, true])("reconciles only authenticated arrivals by author and logical ID (live=%s)", async live => {
     const delivered = await row();
     useOutbox.getState().add({ thread: `dm:${b}`, text: "mine", sealed: { message_id: delivered.message_id, created_at: delivered.sent_at },
-      authorUid: a, serverKey: server, error: "answer lost" });
+      authorUid: a, serverKey: server });
     // Another author with the same logical ID is not our delivery.
     await dm.receive(delivered, live);
     expect(useOutbox.getState().failed).toHaveLength(1);
@@ -133,14 +133,14 @@ describe("encrypted DM controller", () => {
     request.mockImplementation(async op => {
       if (op === "chat.sealed.send") {
         if (sends++ === 0) { stored = drafts.at(-1)!; throw new Error("acknowledgement lost"); }
-        throw new RequestError("bad_request", "upload already attached");
+        throw new RequestError("bad_request", INVALID_FILES);
       }
       opened = stored;
       return { sealed: [{ id: 32, conversation, group, epoch, author_uid: a, author_name: "Alice", message_id: retry.message_id,
         revision: 0, ciphertext: "stored", sent_at: retry.created_at, deleted: false }] };
     });
     await expect(dm.send(`dm:${b}`, "attachment", [], undefined, [att], retry)).rejects.toThrow("acknowledgement lost");
-    useOutbox.getState().add({ thread: `dm:${b}`, text: "attachment", authorUid: a, serverKey: server, error: "lost", sealed: retry, attachments: [att.id], attachmentMetadata: [att] });
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "attachment", authorUid: a, serverKey: server, sealed: retry, attachments: [att.id], attachmentMetadata: [att] });
     await expect(dm.send(`dm:${b}`, "attachment", [], undefined, [att], retry)).resolves.toBeUndefined();
     expect(dm.delivered(`dm:${b}`, retry.message_id)).toBe(true);
     expect(useOutbox.getState().failed).toEqual([]);
@@ -163,7 +163,7 @@ describe("encrypted DM controller", () => {
       if (message.id === earlier.id && pause === "earlier-row") { started(); await held; }
       return { ok: message.id === earlier.id ? earlierPlain : stored };
     });
-    useOutbox.getState().add({ thread: `dm:${b}`, text: "removed while recovering", authorUid: a, serverKey: server, error: "lost", sealed: retry });
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "removed while recovering", authorUid: a, serverKey: server, sealed: retry });
     const sending = dm.send(`dm:${b}`, "removed while recovering", [], undefined, [], retry);
     const outcome = sending.then(() => "delivered", () => "refused");
     await waiting;
@@ -191,7 +191,7 @@ describe("encrypted DM controller", () => {
       if (pause === "ack") { started(); await held; }
       return response;
     });
-    useOutbox.getState().add({ thread: `dm:${b}`, text: "removed before acknowledgement", authorUid: a, serverKey: server, error: "lost", sealed: retry });
+    useOutbox.getState().add({ thread: `dm:${b}`, text: "removed before acknowledgement", authorUid: a, serverKey: server, sealed: retry });
     const sending = dm.send(`dm:${b}`, "removed before acknowledgement", [], undefined, [], retry);
     const outcome = sending.then(() => "delivered", () => "refused");
     await waiting; dm.remove(conversation, [60]); release();

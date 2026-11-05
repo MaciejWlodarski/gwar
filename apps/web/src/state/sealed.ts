@@ -32,6 +32,9 @@ const SCAN_ROWS = 1000;
 export class DeliveryUnknownError extends Error {
   constructor(options?: ErrorOptions) { super("message_id already used, no delivered copy found", options); }
 }
+/** The server's refusal of uploads that are not (or no longer) this send's to attach: `InvalidFiles` in
+ * crates/gwar-server/src/store.rs, whose text a server test pins. Other refusals share its code. */
+export const INVALID_FILES = "files must be distinct, finished, unattached sealed uploads of this author (at most 10)";
 /** The server no longer takes this send's uploads (expired, or tied to an earlier attempt that is gone). */
 export class AttachmentsGoneError extends Error {
   constructor(options?: ErrorOptions) { super(tNow("chat.missingAttachments"), options); }
@@ -437,7 +440,7 @@ export class SealedConversations {
           checkSession();
           // Upload ownership is checked before duplicate message IDs: an attached upload can
           // turn a lost acknowledgement into bad_request rather than conflict.
-          if (!original && error instanceof RequestError && (error.code === "conflict" || (error.code === "bad_request" && attachments.length > 0))) {
+          if (!original && error instanceof RequestError && (error.code === "conflict" || (error.code === "bad_request" && attachments.length > 0 && error.message === INVALID_FILES))) {
             if (await this.recoverDelivery(thread, retry.message_id, checkSession)) return;
             // Neither answer changes on another try with the same message and files.
             throw error.code === "conflict" ? new DeliveryUnknownError({ cause: error }) : new AttachmentsGoneError({ cause: error });

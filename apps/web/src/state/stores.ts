@@ -301,7 +301,9 @@ interface FailedMessage {
   attachments?: string[];
   /** The server (key) the draft was written for; a retry goes nowhere else. */
   serverKey: string | null;
-  error: string;
+  /** Why it was not sent: the key of a sentence that stays true later, shown in the current language.
+   *  None when "Not sent" is all that can honestly be said. */
+  reason?: Key;
   /** The page/connection/session that owns this attempt. */
   session?: string;
   authorUid?: string;
