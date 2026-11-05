@@ -863,7 +863,7 @@ describe("session resilience", () => {
     await controller.restoreSession();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(connect).toHaveBeenCalledOnce();
-    expect(stores.useConnectUi.getState()).toMatchObject({ restoring: false, busy: false });
+    expect(stores.useConnectUi.getState()).toMatchObject({ restoring: false, busy: false, error: "Cannot reach Friends" });
     expect(session().phase).toBe("idle");
     connect.mockRestore();
   });
@@ -2534,6 +2534,9 @@ describe("edits stay on their connection; history ownership follows each verifie
     // A new identity cannot be a copy of the lost attempt, whatever the server says about it.
     a.request.mockRejectedValueOnce(new RequestError("conflict", "message_id already used"));
     await controller.retrySend(old.id);
+    const sent = (a.request.mock.calls as [string, { signature: { message_id: string } }][]).filter(([op]) => op === "chat.send").map(([, d]) => d.signature.message_id);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).not.toBe(sent[0]);
     expect(stores.useOutbox.getState().failed).toMatchObject([{ id: old.id, text: "too old to sign again", retrying: false }]);
     expect(stores.useOutbox.getState().failed[0]!.unknown).toBeUndefined();
     g.c.conn = link;
@@ -2565,6 +2568,57 @@ describe("edits stay on their connection; history ownership follows each verifie
     expect(stores.useOutbox.getState().failed[0]?.reason).toBeUndefined();
     uploaded.clear();
     g.c.conn = link;
+  });
+
+  /** A channel send with a file whose first answer was lost; `history` answers the retry's lookup. */
+  async function lostFileSend(history: (ids: string[]) => Promise<unknown>) {
+    vi.useRealTimers(); connectFake();
+    const { RequestError } = await import("../net/connection");
+    const g = await genuine(), { a } = await servers(g);
+    stores.useSession.setState({ viewChannel: 1 });
+    const uploaded = (controller as unknown as { uploaded: Map<string, { conn: unknown; att: Attachment }> }).uploaded;
+    const att: Attachment = { id: "f8", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/f8/file", sha256: "s" };
+    uploaded.set(att.id, { conn: a, att });
+    const ids: string[] = [];
+    a.request.mockImplementation(async (op: string, d: { signature?: { message_id: string } }) => {
+      if (op === "chat.send") { ids.push(d.signature!.message_id); throw ids.length === 1 ? new Error("answer lost") : new RequestError("not_found", "no such upload"); }
+      if (op === "chat.history") return history(ids);
+      return {};
+    });
+    await controller.sendChat("channel", "with notes", { attachments: [att.id] });
+    const failed = stores.useOutbox.getState().failed[0]!;
+    const stored = (id: string) => ({ messages: [{ ...message(91, 1, { author_uid: g.uid, text: "with notes" }), signature: { ...g.msg.signature!, message_id: id } }] });
+    return { a, g, ids, failed, stored, done: () => { uploaded.clear(); g.c.conn = link; } };
+  }
+
+  it("drops the card, never leaving it on Sending…, when the session changes during the history lookup", async () => {
+    const t = await lostFileSend(async () => { stores.useSession.setState(s => ({ epoch: s.epoch + 1 })); return { messages: [] }; });
+    await controller.retrySend(t.failed.id);
+    expect(t.a.request).toHaveBeenCalledWith("chat.history", expect.anything());
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    t.done();
+  });
+
+  it("keeps a plain, retryable card when the history lookup itself fails", async () => {
+    const t = await lostFileSend(async () => { throw new Error("history unavailable"); });
+    await controller.retrySend(t.failed.id);
+    expect(stores.useOutbox.getState().failed).toMatchObject([{ id: t.failed.id, retrying: false }]);
+    expect(stores.useOutbox.getState().failed[0]!.unknown).toBeFalsy();
+    expect(stores.useOutbox.getState().failed[0]!.reason).toBeUndefined();
+    await controller.retrySend(t.failed.id);
+    expect(t.ids).toHaveLength(3);
+    t.done();
+  });
+
+  it("finds a delivered file send by its first ID after a retry past the signing window", async () => {
+    const t = await lostFileSend(async ids => t.stored(ids[0]!));
+    const card = stores.useOutbox.getState().failed[0]! as { id: number; identity?: { message_id: string; created_at: number } };
+    stores.useOutbox.getState().update(card.id, { identity: { ...card.identity!, created_at: Date.now() - 5 * 60_000 } });
+    await controller.retrySend(card.id);
+    // The retry was signed anew, but the first attempt is the one stored with the file.
+    expect(t.ids[1]).not.toBe(t.ids[0]);
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    t.done();
   });
 
   it("marks a card while its retry is in flight and gives a plain reason when it fails again", async () => {

@@ -318,8 +318,9 @@ interface FailedMessage {
   unknown?: boolean;
 }
 
-/** A plaintext message's signed ID and creation time, kept so a retry is the same message. */
-type PlainIdentity = { identity?: { message_id: string; created_at: number } };
+/** A plaintext message's signed ID and creation time, kept so a retry is the same message, and every ID
+ *  signed for it (a retry past the signing window is a new ID; any of them may be the one that arrived). */
+type PlainIdentity = { identity?: { message_id: string; created_at: number }; sentIds?: string[] };
 export type FailedSend = FailedMessage & (
   | ({ target: ChatTarget; dmUid?: string; sealed?: never } & PlainIdentity)
   | { sealed: { message_id: string; created_at: number }; target?: never; dmUid?: never }
