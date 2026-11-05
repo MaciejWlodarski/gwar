@@ -841,7 +841,11 @@ async function run(browsers, web, server, token) {
   assert.ok(await wv.evaluate(() => [...window.__stageVideos].every(([share, video]) => document.querySelector(`video[data-share="${share}"]`) === video)), "a focus change preserves both attached media players");
   const afterFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
   await wv.evaluate(state => { window.__screenFocusState.after = state; window.__screenFocusState.finishedAt = Date.now(); }, afterFocus);
-  assert.deepEqual(afterFocus, beforeFocus, "a focus change keeps the transport and watches");
+  // What a focus change keeps: the transport, and each watch with its slot and sound. `paused` and
+  // `waiting` are the SFU's bandwidth allocation, on its own clock and allowed to follow focus: a
+  // share paused before the click can resume while its player is checked (both snapshots above).
+  const kept = ({ transport, watches }) => ({ transport, watches: watches.map(({ share, id, slot, status, audio }) => ({ share, id, slot, status, audio })) });
+  assert.deepEqual(kept(afterFocus), kept(beforeFocus), "a focus change keeps the transport and watches");
 
   if (process.env.E2E_SCREEN_RECONNECT_ONLY === "1") {
     await reconnectAndScreenshots(cs, cv, [cv, wv], chromiumTab);
