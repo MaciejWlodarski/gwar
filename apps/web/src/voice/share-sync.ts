@@ -47,8 +47,16 @@ export const SETTLING_LOOKS = 10;
  * moved the picture the whole way (Opus review r1, S12).
  */
 const AGREE_LOOKS = 3;
-/** Looks after a break: the backlog lands in the first, and the others may move the whole way, once. */
+/**
+ * Looks after a break: the backlog lands in the first, and the others may move the whole way,
+ * once, by at least `BREAK_AGREE_LOOKS` of their own looks.
+ */
 const BREAK_LOOKS = 4;
+/**
+ * A break's whole move goes by this many looks since the break: just after one is when a look is
+ * noisiest, and a whole move on one look is what S12 took away (Opus review r2, S19).
+ */
+const BREAK_AGREE_LOOKS = 2;
 /** A gap smaller than this after a break is not worth the one move: sound may still land. */
 const BREAK_MOVE_MS = 45;
 /** The picture's wait, which a Bluetooth speaker can reach. The receiver's own limit is 4 s. */
@@ -210,8 +218,13 @@ export class PictureSync {
     // The backlog lands in this look: what it measures is neither the old link nor the new.
     if (state.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS - 1 }); return; }
     const lags = [...state.lags ?? [], measured].slice(-AGREE_LOOKS);
-    const lag = median(lags);
     const breakLooks = state.breakLooks ?? 0;
+    // One look since the break is not enough to move by, gently or the whole way.
+    if (breakLooks > 0 && lags.length < BREAK_AGREE_LOOKS) {
+      this.states.set(slot, { ...state, lags, breakLooks: breakLooks - 1 });
+      return;
+    }
+    const lag = median(lags);
     const whole = state.looks === SETTLING_LOOKS || (breakLooks > 0 && Math.abs(lag) > BREAK_MOVE_MS);
     this.set(slot, state, { ...state, lags, waits: nextWaits(state.waits, lag, whole, shown, this.link.soundWaits), looks: state.looks + 1, breakLooks: whole ? 0 : Math.max(0, breakLooks - 1) });
   }

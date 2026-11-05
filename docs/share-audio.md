@@ -400,7 +400,8 @@ is measured from that aim.
 **The picture waits.** Sound carries speech, and a picture a few tens of milliseconds later is the
 smaller loss. `jitterBufferTarget` is a minimum, so a wait starts from the delay the receiver
 already has. Each move goes by the median of the last three looks (fewer just after a start or a
-break), since one look can be off by a packet of sound or a held-up frame. The first move goes the
+break, but never one alone after a break), since one look can be off by a packet of sound or a
+held-up frame. The first move goes the
 whole way, since nobody has seen the picture settle; later ones move at most 40 ms at half the
 error, and nothing moves for less than 10 ms. How long the receiver held the picture is asked at
 every look, settling ones too, so the first move reads the last second and not the stream's start. A wait starts only

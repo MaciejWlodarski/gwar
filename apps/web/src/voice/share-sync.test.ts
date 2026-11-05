@@ -135,7 +135,9 @@ describe("PictureSync", () => {
     sync.linkBack(1);
     await sync.tick([slot]);
     expect(waits.at(-1)).toEqual(at(85));
-    // After the break only its own looks count: the whole way, then gently.
+    // After the break only its own looks count, two of them at least: the whole way, then gently.
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(85));
     await sync.tick([slot]);
     expect(waits.at(-1)).toEqual(at(385));
     await sync.tick([slot]);
@@ -175,7 +177,26 @@ describe("PictureSync", () => {
     sync.linkBack(1);
     await sync.tick([slot]);
     await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(230));
+    await sync.tick([slot]);
     expect(waits.at(-1)).toEqual(at(80));
+  });
+
+  it("does not move the whole way on the one look after a break", async () => {
+    // Opus review r2 (S19): just after a break is when one look is noisiest.
+    const { waits, sync, link } = fixture(0);
+    await settle(sync);
+    await sync.tick([slot]);
+    expect(waits).toEqual([]);
+    sync.linkBack(1);
+    await sync.tick([slot]);
+    const noisy = pair(300 + SOUND_AIM_MS);
+    link.sound.mockResolvedValueOnce(noisy.sound);
+    await sync.tick([slot]);
+    expect(waits).toEqual([]);
+    // The next look agrees with the old ones: the median of two is halfway, and is the move.
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(30 + 150));
   });
 
   it("aims at the middle of what nobody notices, not at the edge sound must not lead past", async () => {
@@ -243,6 +264,8 @@ describe("PictureSync", () => {
     shown(30);
     await look;
     const before = waits.at(-1)![1].picture;
+    await sync.tick([slot]);
+    expect(waits.at(-1)![1].picture).toBe(before);
     await sync.tick([slot]);
     expect(waits.at(-1)![1].picture).toBe(before + 300);
   });
