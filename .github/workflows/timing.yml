@@ -1,0 +1,404 @@
+name: timing
+
+# Lip-sync A/B timing (apps/web/e2e/share-sync.mjs) on hosted runners, sharded: docs/timing-runs.md.
+# Manual only. The measured code comes from `ref`; this workflow's own scripts (scripts/timing)
+# come from the commit it was dispatched from, so a branch's kit can be measured before it merges.
+run-name: timing ${{ inputs.ref }} [${{ inputs.rows }}] [${{ inputs.arms }}] x${{ inputs.runs }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA whose code is measured (must contain apps/web/e2e/share-sync.mjs)
+        required: true
+        type: string
+      rows:
+        description: Comma list of rows (plain, j5, j10, j20, r10, h10, cap, steps, stall2s, return, custom)
+        required: true
+        default: j10
+        type: string
+      arms:
+        description: Comma list of arms, the first is the baseline (off, on, nofilter, nohold, nowait)
+        required: true
+        default: off,on
+        type: string
+      runs:
+        description: Runs per arm per row
+        required: true
+        default: "8"
+        type: string
+      viewers:
+        description: Viewers watching side by side in every run (browser, desktop)
+        required: true
+        default: browser,desktop
+        type: string
+      engine:
+        description: The viewers' engine (the sharer is always Chromium)
+        required: true
+        default: chromium
+        type: choice
+        options: [chromium, webkit]
+      seconds:
+        description: Watch length per run in seconds; empty uses the row's own (45, return 30)
+        required: false
+        default: ""
+        type: string
+      net:
+        description: LATENCY_NET spec for the `custom` row
+        required: false
+        default: ""
+        type: string
+      shards:
+        description: Parallel jobs (at most 20, the free tier's limit; normal CI queues meanwhile)
+        required: true
+        default: "20"
+        type: string
+      profile:
+        description: Cargo profile of the fixture and native bridge
+        required: true
+        default: release
+        type: choice
+        options: [release, debug]
+      seed:
+        description: Seed of the run order; empty uses this run's id
+        required: false
+        default: ""
+        type: string
+
+# Actions are pinned to commits, as in ci.yml. Only the wasm job reads other runs' artifacts.
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      timeout: ${{ steps.plan.outputs.timeout }}
+      ref: ${{ steps.plan.outputs.ref }}
+      profile: ${{ steps.plan.outputs.profile }}
+      engine: ${{ steps.plan.outputs.engine }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          sparse-checkout: scripts/timing
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 5
+        with:
+          node-version: 22.23.3
+      - name: Timing scripts' own tests
+        timeout-minutes: 2
+        run: node --test scripts/timing/timing.test.mjs
+      - name: Plan the interleaved runs
+        id: plan
+        timeout-minutes: 2
+        env:
+          TIMING_REF: ${{ inputs.ref }}
+          TIMING_ROWS: ${{ inputs.rows }}
+          TIMING_ARMS: ${{ inputs.arms }}
+          TIMING_RUNS: ${{ inputs.runs }}
+          TIMING_VIEWERS: ${{ inputs.viewers }}
+          TIMING_ENGINE: ${{ inputs.engine }}
+          TIMING_SECONDS: ${{ inputs.seconds }}
+          TIMING_NET: ${{ inputs.net }}
+          TIMING_SHARDS: ${{ inputs.shards }}
+          TIMING_PROFILE: ${{ inputs.profile }}
+          TIMING_SEED: ${{ inputs.seed || github.run_id }}
+        run: |
+          node scripts/timing/plan.mjs "$RUNNER_TEMP/timing/plan.json"
+          case "$TIMING_PROFILE" in release|debug) ;; *) echo "profile must be release or debug" >&2; exit 1 ;; esac
+          {
+            echo "ref=$TIMING_REF"
+            echo "profile=$TIMING_PROFILE"
+            echo "engine=$TIMING_ENGINE"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 5
+        with:
+          name: timing-plan
+          path: ${{ runner.temp }}/timing/plan.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # The fixture (server, relay and network emulator) and the desktop viewer's engine, built once.
+  native:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        timeout-minutes: 5
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        timeout-minutes: 5
+        with:
+          prefix-key: timing-v1
+          key: ${{ needs.plan.outputs.profile }}
+          cache-bin: false
+      - name: System libraries (Opus, ALSA)
+        timeout-minutes: 8
+        run: bash scripts/ci/apt-install.sh libopus-dev libasound2-dev pkg-config
+      - name: Fixture and native bridge
+        timeout-minutes: 35
+        env:
+          PROFILE: ${{ needs.plan.outputs.profile }}
+        run: |
+          flag=; if [ "$PROFILE" = release ]; then flag=--release; fi
+          cargo build --locked $flag -p gwar-client --no-default-features --example web_latency --example native_bridge
+          mkdir -p "$RUNNER_TEMP/native/target/timing"
+          cp "target/$PROFILE/examples/web_latency" "target/$PROFILE/examples/native_bridge" "$RUNNER_TEMP/native/target/timing/"
+          tar -C "$RUNNER_TEMP/native" -czf "$RUNNER_TEMP/timing-native.tar.gz" target
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 5
+        with:
+          name: timing-native
+          path: ${{ runner.temp }}/timing-native.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # The web app's two wasm packages: from the measured commit's own CI run when it still has them,
+  # else from this workflow's cache, else built as ci.yml builds them.
+  wasm:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      - name: The commit's CI artifacts
+        id: ci
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$sha" --limit 10 --json databaseId -q '.[].databaseId'); do
+            rm -rf crates/gwar-mls-wasm/pkg crates/gwar-denoise-wasm/pkg
+            if gh run download "$run" --repo "$GITHUB_REPOSITORY" -n mls-wasm -D crates/gwar-mls-wasm/pkg \
+              && gh run download "$run" --repo "$GITHUB_REPOSITORY" -n denoise-wasm -D crates/gwar-denoise-wasm/pkg; then
+              echo "wasm from CI run $run of $sha"
+              echo "found=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          rm -rf crates/gwar-mls-wasm/pkg crates/gwar-denoise-wasm/pkg
+          echo "no CI run of $sha still has both wasm artifacts: building"
+      # The fallback mirrors ci.yml's mls-wasm and denoise-wasm jobs; keep the pins in step.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        if: steps.ci.outputs.found != 'true'
+        timeout-minutes: 5
+        with:
+          toolchain: 1.99.0
+          targets: wasm32-unknown-unknown
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: steps.ci.outputs.found != 'true'
+        timeout-minutes: 5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.ci.outputs.found != 'true'
+        timeout-minutes: 5
+        with:
+          node-version: 22.23.3
+          cache: pnpm
+      - name: Exact wasm output keys
+        if: steps.ci.outputs.found != 'true'
+        id: keys
+        timeout-minutes: 5
+        # ci.yml's exact keys, which this workflow only reads; it saves under its own prefix.
+        run: |
+          for kind in mls denoise; do
+            echo "$kind=$(GITHUB_OUTPUT=/dev/null python3 scripts/ci/wasm-key.py "$kind" | tail -n 1)" >> "$GITHUB_OUTPUT"
+          done
+      - name: Restore finished mls wasm
+        if: steps.ci.outputs.found != 'true'
+        id: mls
+        timeout-minutes: 5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/gwar-mls-wasm/pkg/
+          key: timing-${{ steps.keys.outputs.mls }}
+          restore-keys: ${{ steps.keys.outputs.mls }}
+      - name: Restore finished denoise wasm
+        if: steps.ci.outputs.found != 'true'
+        id: denoise
+        timeout-minutes: 5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/gwar-denoise-wasm/pkg/
+          key: timing-${{ steps.keys.outputs.denoise }}
+          restore-keys: ${{ steps.keys.outputs.denoise }}
+      - name: Build mls wasm
+        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-matched-key == ''
+        timeout-minutes: 25
+        env:
+          WASM_OPT: .build-tools/node_modules/.bin/wasm-opt
+        run: |
+          pnpm install --frozen-lockfile
+          cargo install wasm-bindgen-cli --version 0.2.129 --locked
+          npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
+          scripts/mls-wasm/build.sh
+      - name: Build denoise wasm
+        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-matched-key == ''
+        timeout-minutes: 20
+        env:
+          WASM_OPT: .build-tools/node_modules/.bin/wasm-opt
+        run: |
+          [ -x "$WASM_OPT" ] || npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
+          scripts/denoise-wasm/build.sh
+      - name: Save mls wasm
+        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-matched-key == ''
+        timeout-minutes: 5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/gwar-mls-wasm/pkg/
+          key: timing-${{ steps.keys.outputs.mls }}
+      - name: Save denoise wasm
+        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-matched-key == ''
+        timeout-minutes: 5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/gwar-denoise-wasm/pkg/
+          key: timing-${{ steps.keys.outputs.denoise }}
+      - name: Pack
+        timeout-minutes: 2
+        run: tar -czf "$RUNNER_TEMP/timing-wasm.tar.gz" crates/gwar-mls-wasm/pkg crates/gwar-denoise-wasm/pkg
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 5
+        with:
+          name: timing-wasm
+          path: ${{ runner.temp }}/timing-wasm.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  measure:
+    needs: [plan, native, wasm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+      # This workflow's scripts, beside the measured tree and outside its pnpm workspace.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          path: .timing-kit
+          sparse-checkout: scripts/timing
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 5
+        with:
+          pattern: timing-{plan,native,wasm}
+          path: ${{ runner.temp }}/timing-in
+      - name: Restore the built binaries and wasm
+        timeout-minutes: 2
+        run: |
+          tar -xzf "$RUNNER_TEMP/timing-in/timing-native/timing-native.tar.gz"
+          tar -xzf "$RUNNER_TEMP/timing-in/timing-wasm/timing-wasm.tar.gz"
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        timeout-minutes: 5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 5
+        with:
+          node-version: 22.23.3
+          cache: pnpm
+      - name: Native runtime libraries
+        timeout-minutes: 8
+        run: bash scripts/ci/apt-install.sh libopus0 libasound2t64 pulseaudio
+      - run: pnpm install --frozen-lockfile
+        timeout-minutes: 5
+      - name: Browser system dependencies
+        timeout-minutes: 8
+        env:
+          ENGINE: ${{ needs.plan.outputs.engine }}
+        # The sharer is always Chromium.
+        run: |
+          browsers=(chromium); if [ "$ENGINE" = webkit ]; then browsers+=(webkit); fi
+          bash scripts/ci/apt-install.sh --playwright "${browsers[@]}"
+      - name: Install browsers
+        timeout-minutes: 5
+        env:
+          ENGINE: ${{ needs.plan.outputs.engine }}
+        run: |
+          browsers=(chromium); if [ "$ENGINE" = webkit ]; then browsers+=(webkit); fi
+          pnpm --filter web exec playwright install "${browsers[@]}"
+      - name: Measure this shard's runs
+        timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+        env:
+          SYNC_FIXTURE: ${{ github.workspace }}/target/timing/web_latency
+          NATIVE_BRIDGE_BIN: ${{ github.workspace }}/target/timing/native_bridge
+          SHARD: ${{ matrix.shard }}
+        # Silent, as ci.yml's browser-share-sync: every sound goes to a null sink.
+        run: |
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=e2e
+          pactl set-default-sink e2e
+          node .timing-kit/scripts/timing/run-shard.mjs "$RUNNER_TEMP/timing-in/timing-plan/plan.json" "$SHARD" "$RUNNER_TEMP/timing-out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        timeout-minutes: 5
+        with:
+          name: timing-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/timing-out/
+          if-no-files-found: warn
+          retention-days: 14
+
+  aggregate:
+    needs: [plan, measure]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          sparse-checkout: scripts/timing
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        timeout-minutes: 5
+        with:
+          node-version: 22.23.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        timeout-minutes: 5
+        with:
+          pattern: timing-{plan,shard-*}
+          path: ${{ runner.temp }}/timing-in
+      - name: Table, comparison and job summary
+        timeout-minutes: 5
+        run: |
+          node scripts/timing/aggregate.mjs "$RUNNER_TEMP/timing-in/timing-plan/plan.json" "$RUNNER_TEMP/timing-in" "$RUNNER_TEMP/timing-report"
+          cp "$RUNNER_TEMP/timing-in/timing-plan/plan.json" "$RUNNER_TEMP/timing-report/"
+          mkdir -p "$RUNNER_TEMP/timing-report/records"
+          find "$RUNNER_TEMP/timing-in" -path '*/records/*.json' -exec cp {} "$RUNNER_TEMP/timing-report/records/" \;
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        timeout-minutes: 5
+        with:
+          name: timing-report
+          path: ${{ runner.temp }}/timing-report/
+          if-no-files-found: warn
+          retention-days: 30
