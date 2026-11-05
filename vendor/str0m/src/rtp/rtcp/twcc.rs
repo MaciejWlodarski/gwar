@@ -515,6 +515,9 @@ fn build_interims(
     interims.clear();
     let report_from = queue.iter().skip(report_from);
 
+    // The time is the one the report states so far, not the true arrival: each delta is
+    // truncated to 250 us, and taking the next one from the true arrival would let those
+    // truncations add up over the report.
     let mut prev = (base_seq, base_time);
 
     for r in report_from {
@@ -554,7 +557,13 @@ fn build_interims(
         };
 
         interims.push_back(ChunkInterim::Received(status, time));
-        prev = (r.seq, r.time);
+        let reported = Duration::from_micros(250 * time.unsigned_abs() as u64);
+        let reported_time = if time < 0 {
+            prev.1.checked_sub(reported).unwrap_or(prev.1)
+        } else {
+            prev.1 + reported
+        };
+        prev = (r.seq, reported_time);
     }
 }
 
@@ -1578,6 +1587,37 @@ mod test {
 
         assert_eq!(header, report.header());
         assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn deltas_do_not_drift_over_a_report() {
+        let mut reg = TwccRecvRegister::new(100);
+
+        let now = Instant::now();
+
+        // 1.1 ms apart: each delta is 4.4 steps of 250 us. Taken from the true previous
+        // arrival, every delta lost 100 us, and the 40th packet was reported 3.9 ms early.
+        let arrivals: Vec<Instant> = (0..40u64)
+            .map(|n| now + Duration::from_micros(1100 * n))
+            .collect();
+        for (n, at) in arrivals.iter().enumerate() {
+            reg.update_seq((10 + n as u64).into(), *at);
+        }
+
+        let report = reg.build_report(1000).unwrap();
+        assert_eq!(report.status_count, 40);
+
+        let reported: Vec<_> = report.into_iter(now, 10.into()).collect();
+        assert_eq!(reported.len(), 40);
+        for ((seq, _, time), at) in reported.iter().zip(&arrivals) {
+            let time = time.expect("received");
+            assert!(time <= *at, "{seq:?} reported after it arrived");
+            assert!(
+                *at - time < Duration::from_micros(250),
+                "{seq:?} reported {:?} early",
+                *at - time
+            );
+        }
     }
 
     #[test]
