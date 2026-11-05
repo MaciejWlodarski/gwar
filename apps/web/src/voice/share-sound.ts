@@ -180,17 +180,20 @@ export class ComputerSound {
 }
 
 let receiving: Promise<boolean> | undefined;
+let probeTimeouts = 0;
+/** A worker that never answers costs each watch the full wait: after this many, the answer is no. */
+const PROBE_TIMEOUTS = 2;
 /**
  * Whether received sound can be kept from the webview's decoder, which is the only way the
  * desktop app may negotiate it. Asked of the real worker: a refused or missing worker leaves
  * viewers with the picture alone and nothing that claims sound. An answer is kept for the page;
  * a worker that did not answer in time is asked again next time, so one slow start cannot leave
- * every later watch without sound.
+ * every later watch without sound, but only once: one that never answers counts as no.
  */
 export function shareSoundReceivable(create: () => Worker = createWorker, timeoutMs = 3_000): Promise<boolean> {
   if (receiving) return receiving;
   const asking = probeReceiving(create, timeoutMs).then(answer => {
-    if (answer === null && receiving === asking) receiving = undefined;
+    if (answer === null && ++probeTimeouts < PROBE_TIMEOUTS && receiving === asking) receiving = undefined;
     return answer === true;
   });
   receiving = asking;

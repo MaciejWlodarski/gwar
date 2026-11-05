@@ -1051,24 +1051,27 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     /// The speakers' callback runs on the OS's realtime audio thread: a trip to the allocator
-    /// there can stall the sound. Built for a 44.1 kHz device, callbacks of every usual size
-    /// resample and play without one.
+    /// there can stall the sound. At every usual device rate, callbacks of every usual length,
+    /// from a few milliseconds to a sixth of a second, resample and play without one.
     #[test]
     fn the_speakers_callback_never_allocates() {
-        let mut to_device = super::ToDevice::new(44_100);
-        let (mut tx, mut rx) = rtrb::RingBuffer::<[f32; 2]>::new(48_000);
-        for i in 0..48_000 {
-            let _ = tx.push([i as f32, -(i as f32)]);
-        }
-        let trips = crate::voice::apm::tests::heap::trips(|| {
-            for frames in [512, 4096, 441, 1024, 8192] {
-                to_device.fill(&mut rx, frames);
-                let take = to_device.pending.len().min(frames);
-                std::hint::black_box(to_device.pair(take - 1));
-                to_device.played(take);
+        for rate in [8_000, 16_000, 44_100, 48_000, 96_000, 192_000] {
+            let mut to_device = super::ToDevice::new(rate);
+            let (mut tx, mut rx) = rtrb::RingBuffer::<[f32; 2]>::new(48_000);
+            for i in 0..48_000 {
+                let _ = tx.push([i as f32, -(i as f32)]);
             }
-        });
-        assert_eq!(trips, 0, "the callback went to the allocator");
+            let trips = crate::voice::apm::tests::heap::trips(|| {
+                for ms in [3, 10, 11, 21, 43, 85, 171] {
+                    let frames = (rate * ms / 1000) as usize;
+                    to_device.fill(&mut rx, frames);
+                    let take = to_device.pending.len().min(frames);
+                    std::hint::black_box(to_device.pair(take - 1));
+                    to_device.played(take);
+                }
+            });
+            assert_eq!(trips, 0, "the callback went to the allocator at {rate} Hz");
+        }
     }
 
     /// Like cpal: the guard only queues Stop; the input stream drops later on its thread.

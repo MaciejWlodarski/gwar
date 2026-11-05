@@ -405,13 +405,12 @@ impl Jitter {
         self.started
     }
 
-    /// After the stream ran dry. What arrives next starts a new stretch: its gap from the last
-    /// arrival is the pause in the sound, not the network's jitter.
+    /// After the stream ran dry. The last arrival stays: a network stall that ran the queue dry is
+    /// what the delay has to learn, and a pause in the sound is [`DISCONTINUITY`]'s.
     fn restart(&mut self) {
         self.started = false;
         self.next = None;
         self.dry_since = None;
-        self.last_arrival = None;
     }
 
     /// A stall's backlog goes, oldest first, once the queue has stayed over its limit through
@@ -646,6 +645,9 @@ impl Worker {
     }
 }
 
+/// Interruptions remembered per consent: enough for any limit on how often a capture restarts.
+const INTERRUPTIONS_KEPT: usize = 8;
+
 /// How much captured stereo may wait for the webview: anything older is gone, not delayed.
 const CAPTURE_LIMIT: usize = (RATE / 5) as usize * 2;
 
@@ -658,8 +660,11 @@ pub struct CaptureQueue {
     closed: AtomicBool,
     /// This queue's stream came up, so an ending from it is the OS's and not a failed start.
     stream_up: AtomicBool,
-    /// The running stream stopped for a technical reason: the capture may start again.
-    interrupted: AtomicBool,
+    /// When the stream came up.
+    up_at: std::sync::OnceLock<Instant>,
+    /// How long the stream ran before it stopped for a technical reason, when it did: the
+    /// capture may start again.
+    interrupted_after: std::sync::OnceLock<Duration>,
     consent: Arc<CaptureConsent>,
 }
 
@@ -668,6 +673,8 @@ pub struct CaptureQueue {
 #[derive(Default)]
 struct CaptureConsent {
     ended_by_system: AtomicBool,
+    /// When its streams were interrupted, the latest few.
+    interruptions: Mutex<VecDeque<Instant>>,
     /// The queue in use. Set and ended under this lock, so one comes first.
     open: Mutex<std::sync::Weak<CaptureQueue>>,
 }
@@ -685,7 +692,8 @@ impl Default for CaptureQueue {
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
             stream_up: AtomicBool::new(false),
-            interrupted: AtomicBool::new(false),
+            up_at: std::sync::OnceLock::new(),
+            interrupted_after: std::sync::OnceLock::new(),
             consent: Arc::default(),
         }
     }
@@ -736,7 +744,13 @@ impl CaptureQueue {
 
     /// The OS stream feeding this queue is running. A start already given up on stays failed.
     pub fn stream_started(&self) {
+        self.stream_started_at(Instant::now());
+    }
+
+    /// [`Self::stream_started`], `at` when it happened.
+    pub fn stream_started_at(&self, at: Instant) {
         if !self.is_closed() {
+            let _ = self.up_at.set(at);
             self.stream_up.store(true, Ordering::SeqCst);
         }
     }
@@ -757,15 +771,35 @@ impl CaptureQueue {
     /// pauses the capture, which the share resumes as after a stall; one that never came up is
     /// only a failed start.
     pub fn stream_interrupted(&self) {
-        if self.stream_up.load(Ordering::SeqCst) {
-            self.interrupted.store(true, Ordering::SeqCst);
+        self.stream_interrupted_at(Instant::now());
+    }
+
+    /// [`Self::stream_interrupted`], `at` when it happened.
+    pub fn stream_interrupted_at(&self, at: Instant) {
+        if self.stream_up.load(Ordering::SeqCst)
+            && let Some(&up) = self.up_at.get()
+            && self.interrupted_after.set(at.saturating_duration_since(up)).is_ok()
+        {
+            let mut log = self.consent.interruptions.lock().unwrap_or_else(|e| e.into_inner());
+            if log.len() == INTERRUPTIONS_KEPT {
+                log.pop_front();
+            }
+            log.push_back(at);
         }
         self.close();
     }
 
-    /// Whether the running stream stopped by [`Self::stream_interrupted`].
-    pub fn was_interrupted(&self) -> bool {
-        self.interrupted.load(Ordering::SeqCst)
+    /// How long the stream ran before [`Self::stream_interrupted`], if that is how it stopped.
+    pub fn interrupted_after(&self) -> Option<Duration> {
+        self.interrupted_after.get().copied()
+    }
+
+    /// How many of this capture's streams, under its consent and this one included, were
+    /// interrupted within `window` before the latest interruption.
+    pub fn interruptions_within(&self, window: Duration) -> usize {
+        let log = self.consent.interruptions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&latest) = log.back() else { return 0 };
+        log.iter().filter(|&&at| latest.saturating_duration_since(at) <= window).count()
     }
 
     pub fn was_ended_by_system(&self) -> bool {

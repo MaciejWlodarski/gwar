@@ -210,6 +210,22 @@ fn a_pause_in_the_sound_does_not_hold_it_behind_the_picture() {
     assert!(rms(&left[left.len() - 4800..]) > 0.05, "and the sound came back");
 }
 
+/// A network stall long enough to run the queue dry and start the stream over is still the
+/// network's: the delay grows to absorb the next one instead of losing it again.
+#[test]
+fn a_stall_that_ran_the_queue_dry_still_raises_the_delay() {
+    let (mut worker, bus, playout) = worker();
+    let mut encoder = encoder();
+    playout.open(0, 1, 1.0);
+    let at = Instant::now();
+    feed(&mut worker, &mut encoder, (0, 1), 0, 50, (440.0, 440.0), at);
+    drain(&mut worker, &bus, 120);
+    assert!(!worker.streams[0].as_ref().unwrap().jitter.started, "the stall ran it dry");
+    let late = at + Duration::from_millis(49 * 20 + 220);
+    feed(&mut worker, &mut encoder, (0, 1), 50, 10, (440.0, 440.0), late);
+    assert_eq!(worker.streams[0].as_ref().unwrap().jitter.delay(), MAX_DELAY);
+}
+
 /// The same pause while sound was still queued, so the stream never started over.
 #[test]
 fn an_arrival_long_after_its_predecessor_is_not_jitter() {
@@ -506,17 +522,23 @@ fn an_idle_share_thread_sleeps_and_a_command_wakes_it() {
 async fn an_interrupted_stream_keeps_its_consent_and_a_failed_start_is_only_closed() {
     let queue = Arc::new(CaptureQueue::default());
     queue.stream_interrupted();
-    assert!(queue.is_closed() && !queue.was_interrupted(), "it never came up: a failed start");
+    assert!(queue.is_closed() && queue.interrupted_after().is_none(), "it never came up: a failed start");
     let queue = Arc::new(CaptureQueue::default());
     assert!(queue.adopt());
-    queue.stream_started();
-    queue.stream_interrupted();
-    assert!(queue.is_closed() && queue.was_interrupted());
+    let up = Instant::now();
+    queue.stream_started_at(up);
+    queue.stream_interrupted_at(up + Duration::from_millis(500));
+    assert!(queue.is_closed());
+    assert_eq!(queue.interrupted_after(), Some(Duration::from_millis(500)), "when it died, not when it was noticed");
     assert!(!queue.was_ended_by_system(), "a lost device is not the user taking the sound back");
     let again = queue.restarted();
     assert!(again.adopt(), "the same share may capture again");
     again.write(&[0.5, -0.5]);
     assert_eq!(again.read(Duration::from_millis(5)).await, [0.5, -0.5]);
+    again.stream_started_at(up + Duration::from_secs(70));
+    again.stream_interrupted_at(up + Duration::from_secs(75));
+    assert_eq!(again.interruptions_within(Duration::from_secs(60)), 1, "a minute ago is forgotten");
+    assert_eq!(again.interruptions_within(Duration::from_secs(80)), 2, "both are under one consent");
 }
 
 #[tokio::test]
