@@ -88,13 +88,15 @@ datagrams. The "Invalid and missing runs" table lists them.
 
 ## How long it takes
 
-Measured in the validation run below: `plan` 12 s; `native` 5.5 min with a cold Rust cache
-(less once this workflow's cache is warm); `wasm` 15 s when the commit's CI artifacts still exist
-(a cold build of both packages takes about 15 minutes, in parallel with `native`); each shard about
-1.5 minutes of setup (apt, pnpm, browsers); a run of 45 s about 57 s, of 30 s about 42 s. So
-rows=4, arms=2, runs=8 (64 runs in 32 blocks, at most 2 blocks of 2 runs per shard over 20 shards)
-takes about 12 to 15 minutes from dispatch to table, against about 1.5 hours in series on the Mac,
-as long as 20 jobs can start at once.
+Measured in the validation runs below: `plan` about 15 s; `native` 3.5 to 5.5 min (warm or cold
+Rust cache); `wasm` 15 s when a `main` push run of the commit still has the packages, otherwise
+about 14.5 minutes for a cold build of both, in parallel with `native`, and seconds once this
+workflow's cache has them (the first dispatch of a branch pays the build, later ones of the same
+packages do not); each shard about 1.5 minutes of setup (apt, pnpm, browsers); a run of 45 s about
+57 s, of 30 s about 42 s. So rows=4, arms=2, runs=8 (64 runs in 32 blocks, at most 2 blocks of 2
+runs per shard over 20 shards) takes about 12 minutes from dispatch to table with warm caches, or
+about 22 with a cold wasm build, against about 1.5 hours in series on the Mac, as long as 20 jobs
+can start at once.
 
 ## Reading the table
 
@@ -152,10 +154,19 @@ Check the viewers' `granted` against the stall in the raw reports when that row 
 
 ## Validation
 
-The workflow was validated before it merged, from a temporary branch whose only extra commit gave it
-a `push` trigger (a `workflow_dispatch` workflow can only be dispatched once it is on the default
-branch), since deleted: [run 42015282056](https://github.com/MaciejWlodarski/gwar/actions/runs/42015282056),
-`ref=screen/share-sound-sync` (`f987ed68`), `rows=j10`, `arms=off,on`, `runs=2`, `viewers=browser`,
-2 shards, 9 min 42 s in all. All 4 runs were valid; the runners were an AMD EPYC 7763 and an EPYC
-9V74, 4 CPUs each, with peak loads of 3.1 to 3.8, 43 to 55% busy and no steal. Two runs per arm show
-that the pipeline works, not a result: the permutation p cannot go below 0.33 with them.
+A `workflow_dispatch` workflow can only be dispatched once it is on the default branch, so it was
+validated before it merged from a temporary branch (since deleted) whose only extra commit added a
+`push` trigger for that branch and set the `TIMING_*` values at the top of the workflow, which a
+dispatch fills from its inputs, to fixed ones. Everything after them ran as a dispatch runs it.
+`ref=screen/share-sound-sync`, `rows=j10`, `arms=off,on`, `runs=2`, `viewers=browser`, 2 shards:
+
+- [Run 42018438394](https://github.com/MaciejWlodarski/gwar/actions/runs/42018438394), on the
+  final workflow: 18 min 29 s in all, 14.5 of them the cold wasm build (the branch has no `main`
+  push run). The ref resolved to `f987ed68` and every run measured it. All 4 runs were valid on an
+  AMD EPYC 7763 and an EPYC 9V74, 4 CPUs each, with peak loads of 2.4 to 3.8, 47 to 57% busy and
+  no steal.
+- [Run 42015282056](https://github.com/MaciejWlodarski/gwar/actions/runs/42015282056), on the first
+  version (unpaired comparison, a load limit of 3 per CPU): 9 min 42 s, with the wasm packages
+  taken from a pull request's CI run, which the final workflow no longer does.
+
+Two blocks show that the pipeline works, not a result: their sign-flip p cannot go below 0.5.
