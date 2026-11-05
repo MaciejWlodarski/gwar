@@ -129,7 +129,7 @@ fn shipped_p7_echo_tables() {
     );
 }
 
-fn route_arm(
+pub(super) fn route_arm(
     mode: u8,
     profile: u8,
     (pin, moved, told): (usize, usize, bool),

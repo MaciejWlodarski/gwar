@@ -4,8 +4,10 @@
 //! Voice comes first. Share sound runs on its own ordinary-priority thread, which decodes
 //! ahead into one bounded stereo ring. The voice pipeline only takes what that ring holds
 //! and never waits: a late, slow or dead share thread is silence in the share, nothing else.
-//! The final left and right channels, voice and share together and clipped, are the echo
-//! canceller's reference, so a viewer's microphone does not send the share back into the call.
+//! The final left and right channels, voice and share together and clipped, go to the echo
+//! canceller, so a viewer's microphone does not send the share back into the call. Its stereo
+//! canceller still takes only the left one as its reference: see the known defect in
+//! vendor/sonora/GWAR-PATCH.md.
 
 use std::{
     collections::VecDeque,
@@ -51,9 +53,23 @@ const BACKLOG_MARGIN: Duration = Duration::from_millis(80);
 const BACKLOG_WATCH: usize = (RATE / 2) as usize; // 500 ms
 /// A stream that has nothing for this long stops concealing and starts over.
 const CONCEAL_LIMIT: u32 = 5;
+/// An arrival this much later than its RTP time says cannot be jitter: the queue ran dry and the
+/// stream started over long before. The server keeps share sound's RTP time contiguous across a
+/// pause in the sound, so the first packet after one arrives seconds "late".
+const DISCONTINUITY: Duration = Duration::from_millis(MAX_DELAY.as_millis() as u64 + (CONCEAL_LIMIT * FRAME_MS) as u64);
 
 /// Frames wait here while the share thread runs; a full queue drops share sound only.
 const INPUT_QUEUE: usize = 256;
+/// How often the share thread tops the ring up while a stream is open. With none open it sleeps
+/// until a frame or a command comes.
+const TICK: Duration = Duration::from_millis(5);
+
+/// What reaches the share thread.
+enum Inbox {
+    Frame(ShareFrame, Instant),
+    /// A command is waiting in [`Controls`]: the thread may be asleep with nothing open.
+    Wake,
+}
 
 /// Encoded share sound from one watch slot, in arrival order.
 #[derive(Debug, Clone)]
@@ -110,6 +126,9 @@ struct Counters {
     backlog_drops: AtomicU64,
     input_drops: AtomicU64,
     ring_underruns: AtomicU64,
+    /// Times the share thread woke up.
+    #[cfg(test)]
+    wakeups: AtomicU64,
 }
 
 /// What the voice pipeline reads: decoded share sound, independent of any one voice run.
@@ -166,7 +185,7 @@ impl Drop for Stop {
 /// Native playout of every watched share. It outlives voice runs: a reconnect replaces the
 /// pipeline reading [`ShareBus`], not the streams.
 pub struct SharePlayout {
-    input: SyncSender<(ShareFrame, Instant)>,
+    input: SyncSender<Inbox>,
     controls: Arc<Controls>,
     bus: Arc<ShareBus>,
     counters: Arc<Counters>,
@@ -228,6 +247,8 @@ impl SharePlayout {
             let Ok(stream) = Stream::new(run) else { return false };
             *control = SlotControl { run, open: true, replacement: Some(stream) };
             self.controls.changed.store(true, Ordering::Release);
+            // A full queue needs no nudge: the thread is busy with it and finds the command.
+            let _ = self.input.try_send(Inbox::Wake);
         }
         self.store_gain(slot, gain);
         true
@@ -270,7 +291,7 @@ impl SharePlayout {
     /// Never blocks; a full queue costs share sound, not the caller.
     pub fn push(&self, frame: ShareFrame) {
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
-        if let Err(TrySendError::Full(_)) = self.input.try_send((frame, Instant::now())) {
+        if let Err(TrySendError::Full(_)) = self.input.try_send(Inbox::Frame(frame, Instant::now())) {
             self.counters.input_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -343,7 +364,9 @@ impl Jitter {
         {
             let sent = f64::from(ahead(rtp_time, time)) / f64::from(RATE);
             let error = (now.saturating_duration_since(at).as_secs_f64() - sent).abs();
-            self.deviation = error.max(self.deviation * 0.995);
+            if error <= DISCONTINUITY.as_secs_f64() {
+                self.deviation = error.max(self.deviation * 0.995);
+            }
         }
         if self.last_arrival.is_none_or(|(_, time)| ahead(rtp_time, time) > 0) {
             self.last_arrival = Some((now, rtp_time));
@@ -382,6 +405,8 @@ impl Jitter {
         self.started
     }
 
+    /// After the stream ran dry. The last arrival stays: a network stall that ran the queue dry is
+    /// what the delay has to learn, and a pause in the sound is [`DISCONTINUITY`]'s.
     fn restart(&mut self) {
         self.started = false;
         self.next = None;
@@ -520,7 +545,7 @@ impl Stream {
 }
 
 struct Worker {
-    inbox: Receiver<(ShareFrame, Instant)>,
+    inbox: Receiver<Inbox>,
     controls: Arc<Controls>,
     ring: Producer<[f32; 2]>,
     streams: Vec<Option<Stream>>,
@@ -532,19 +557,35 @@ struct Worker {
 }
 
 impl Worker {
+    /// Wakes every [`TICK`] while a stream is open. With none open nothing is due, so it sleeps
+    /// until a frame or a command arrives; the playout going away wakes it to end.
     fn run(mut self) {
         while !self.stop.load(Ordering::Relaxed) {
-            match self.inbox.recv_timeout(Duration::from_millis(5)) {
-                Ok((frame, arrived)) => {
-                    self.receive(frame, arrived);
-                    while let Ok((frame, arrived)) = self.inbox.try_recv() {
-                        self.receive(frame, arrived);
+            let next = if self.bus.active() {
+                self.inbox.recv_timeout(TICK)
+            } else {
+                self.inbox.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            };
+            #[cfg(test)]
+            self.counters.wakeups.fetch_add(1, Ordering::Relaxed);
+            match next {
+                Ok(message) => {
+                    self.take(message);
+                    while let Ok(message) = self.inbox.try_recv() {
+                        self.take(message);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             self.produce();
+        }
+    }
+
+    fn take(&mut self, message: Inbox) {
+        match message {
+            Inbox::Frame(frame, arrived) => self.receive(frame, arrived),
+            Inbox::Wake => self.apply_controls(),
         }
     }
 
@@ -604,6 +645,9 @@ impl Worker {
     }
 }
 
+/// Interruptions remembered per consent: enough for any limit on how often a capture restarts.
+const INTERRUPTIONS_KEPT: usize = 8;
+
 /// How much captured stereo may wait for the webview: anything older is gone, not delayed.
 const CAPTURE_LIMIT: usize = (RATE / 5) as usize * 2;
 
@@ -616,6 +660,11 @@ pub struct CaptureQueue {
     closed: AtomicBool,
     /// This queue's stream came up, so an ending from it is the OS's and not a failed start.
     stream_up: AtomicBool,
+    /// When the stream came up.
+    up_at: std::sync::OnceLock<Instant>,
+    /// How long the stream ran before it stopped for a technical reason, when it did: the
+    /// capture may start again.
+    interrupted_after: std::sync::OnceLock<Duration>,
     consent: Arc<CaptureConsent>,
 }
 
@@ -624,6 +673,8 @@ pub struct CaptureQueue {
 #[derive(Default)]
 struct CaptureConsent {
     ended_by_system: AtomicBool,
+    /// When its streams were interrupted, the latest few.
+    interruptions: Mutex<VecDeque<Instant>>,
     /// The queue in use. Set and ended under this lock, so one comes first.
     open: Mutex<std::sync::Weak<CaptureQueue>>,
 }
@@ -641,6 +692,8 @@ impl Default for CaptureQueue {
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
             stream_up: AtomicBool::new(false),
+            up_at: std::sync::OnceLock::new(),
+            interrupted_after: std::sync::OnceLock::new(),
             consent: Arc::default(),
         }
     }
@@ -691,19 +744,62 @@ impl CaptureQueue {
 
     /// The OS stream feeding this queue is running. A start already given up on stays failed.
     pub fn stream_started(&self) {
+        self.stream_started_at(Instant::now());
+    }
+
+    /// [`Self::stream_started`], `at` when it happened.
+    pub fn stream_started_at(&self, at: Instant) {
         if !self.is_closed() {
+            let _ = self.up_at.set(at);
             self.stream_up.store(true, Ordering::SeqCst);
         }
     }
 
-    /// The OS stream feeding this queue stopped without Gwar asking. One that was running ended
-    /// the capture; one that never came up is only a failed start, and the share can try again.
+    /// The user stopped the OS stream feeding this queue, as from macOS's menu bar. One that was
+    /// running ended the capture; one that never came up is only a failed start, and the share
+    /// can try again. A technical ending is [`Self::stream_interrupted`].
     pub fn stream_ended(&self) {
         if self.stream_up.load(Ordering::SeqCst) {
             self.end_by_system();
         } else {
             self.close();
         }
+    }
+
+    /// The OS stream feeding this queue stopped for a reason of its own, not the user's: its
+    /// device went away, the audio service restarted. The consent stays. One that was running
+    /// pauses the capture, which the share resumes as after a stall; one that never came up is
+    /// only a failed start.
+    pub fn stream_interrupted(&self) {
+        self.stream_interrupted_at(Instant::now());
+    }
+
+    /// [`Self::stream_interrupted`], `at` when it happened.
+    pub fn stream_interrupted_at(&self, at: Instant) {
+        if self.stream_up.load(Ordering::SeqCst)
+            && let Some(&up) = self.up_at.get()
+            && self.interrupted_after.set(at.saturating_duration_since(up)).is_ok()
+        {
+            let mut log = self.consent.interruptions.lock().unwrap_or_else(|e| e.into_inner());
+            if log.len() == INTERRUPTIONS_KEPT {
+                log.pop_front();
+            }
+            log.push_back(at);
+        }
+        self.close();
+    }
+
+    /// How long the stream ran before [`Self::stream_interrupted`], if that is how it stopped.
+    pub fn interrupted_after(&self) -> Option<Duration> {
+        self.interrupted_after.get().copied()
+    }
+
+    /// How many of this capture's streams, under its consent and this one included, were
+    /// interrupted within `window` before the latest interruption.
+    pub fn interruptions_within(&self, window: Duration) -> usize {
+        let log = self.consent.interruptions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(&latest) = log.back() else { return 0 };
+        log.iter().filter(|&&at| latest.saturating_duration_since(at) <= window).count()
     }
 
     pub fn was_ended_by_system(&self) -> bool {

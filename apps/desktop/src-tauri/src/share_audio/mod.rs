@@ -46,6 +46,13 @@ const READ_WAIT: Duration = Duration::from_millis(100);
 /// recover. A webview that is gone never asks, so its JavaScript need not clean up after a crash.
 const READER_LEASE: Duration = Duration::from_secs(5);
 const LEASE_CHECK: Duration = Duration::from_secs(1);
+/// A stream the OS interrupts sooner than this after it came up ends its capture, as a failed
+/// start would: a device that keeps failing must not have the share restart it in a loop.
+const SETTLED: Duration = Duration::from_secs(2);
+/// A capture whose streams the OS interrupts this often within [`INTERRUPTION_WINDOW`] ends
+/// instead of restarting again: the share goes on without sound and says so.
+const INTERRUPTION_LIMIT: usize = 3;
+const INTERRUPTION_WINDOW: Duration = Duration::from_secs(60);
 
 /// Whether this system can share its sound with Gwar's own sound left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -208,11 +215,32 @@ impl ShareCapture {
         }
     }
 
-    /// Why a read of capture `id` found its queue closed: a pause, or the end of it.
+    /// Why a read of capture `id` found its queue closed: a pause, or the end of it. A stream the
+    /// OS interrupted for a technical reason pauses the capture, as a stalled reader does, and the
+    /// share resumes it the same way: the user did not take the sound back, so nothing they did
+    /// should be needed to get it back. Unless the stream died at once, or keeps dying.
     fn closed(&self, id: u64) -> &'static str {
-        if self.lock().paused(id) {
+        let mut state = self.lock();
+        if state.paused(id) {
             return "paused";
         }
+        let interrupted = state.running.as_ref().is_some_and(|running| {
+            running.id == id
+                && !running.queue.was_ended_by_system()
+                && running.queue.interrupted_after().is_some_and(|ran| ran >= SETTLED)
+                && running.queue.interruptions_within(INTERRUPTION_WINDOW) < INTERRUPTION_LIMIT
+        });
+        if interrupted {
+            tracing::info!("share sound paused: the system interrupted it");
+            let running = state.running.take();
+            if let Some(running) = &running {
+                state.paused = Some(Paused { id, owner: running.owner, queue: running.queue.clone() });
+            }
+            drop(state);
+            Self::end(running);
+            return "paused";
+        }
+        drop(state);
         self.stop(id);
         "closed"
     }
@@ -656,6 +684,65 @@ mod tests {
         assert!(capture.keep_alive(5, Instant::now()), "and it is watched again");
         assert!(!stalled(&capture, 5), "a second stall pauses it just the same");
         resumed(&capture, 5);
+    }
+
+    /// The OS stream of `queue` came up at `up` and was interrupted `ran` later.
+    fn interrupted(queue: &CaptureQueue, up: Instant, ran: Duration) {
+        queue.stream_started_at(up);
+        queue.stream_interrupted_at(up + ran);
+    }
+
+    #[test]
+    fn a_lost_device_pauses_the_capture_and_the_share_gets_it_back() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        interrupted(&queue, Instant::now(), SETTLED);
+        assert_eq!(capture.closed(5), "paused", "the OS interrupted it; the user did not stop it");
+        assert!(matches!(capture.reader(5), Reading::Paused));
+        let back = resumed(&capture, 5);
+        assert!(!back.is_closed() && capture.reader(5).is_queue());
+    }
+
+    #[test]
+    fn a_capture_ends_when_its_stream_fails_at_once_or_the_user_stopped_it() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        // Noticed only seconds later: what counts is how long the stream itself ran.
+        interrupted(&queue, Instant::now() - Duration::from_secs(5), Duration::from_millis(500));
+        assert_eq!(capture.closed(5), "closed", "a stream that dies at once is not restarted");
+        assert!(capture.resume(5, OWNER).is_err());
+        let queue = running(&capture, 6);
+        queue.stream_started();
+        queue.stream_ended();
+        assert_eq!(capture.closed(6), "closed", "the user took the sound back");
+        assert!(capture.resume(6, OWNER).is_err());
+    }
+
+    #[test]
+    fn a_device_that_keeps_failing_ends_the_capture_instead_of_restarting_forever() {
+        let capture = ShareCapture::default();
+        let start = Instant::now();
+        let mut queue = running(&capture, 5);
+        for n in 0..INTERRUPTION_LIMIT as u32 - 1 {
+            interrupted(&queue, start + n * 2 * SETTLED, SETTLED + Duration::from_secs(1));
+            assert_eq!(capture.closed(5), "paused", "interruption {n} is resumed");
+            queue = resumed(&capture, 5);
+        }
+        interrupted(&queue, start + 10 * SETTLED, SETTLED + Duration::from_secs(1));
+        assert_eq!(capture.closed(5), "closed", "{INTERRUPTION_LIMIT} within a minute end it");
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    #[test]
+    fn interruptions_far_apart_each_resume() {
+        let capture = ShareCapture::default();
+        let start = Instant::now();
+        let mut queue = running(&capture, 5);
+        for n in 0..2 * INTERRUPTION_LIMIT as u32 {
+            interrupted(&queue, start + n * INTERRUPTION_WINDOW, SETTLED);
+            assert_eq!(capture.closed(5), "paused", "interruption {n}");
+            queue = resumed(&capture, 5);
+        }
     }
 
     #[test]

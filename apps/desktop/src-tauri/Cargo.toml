@@ -38,7 +38,7 @@ objc2-core-audio-types = { version = "0.3", default-features = false, features =
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGWindow"] }
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMBase", "CMBlockBuffer", "CMSampleBuffer", "CMSync", "CMTime", "objc2-core-audio-types"] }
-objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-graphics", "objc2-core-media", "objc2-core-foundation", "libc"] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCError", "SCShareableContent", "SCStream", "block2", "dispatch2", "objc2-core-graphics", "objc2-core-media", "objc2-core-foundation", "libc"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

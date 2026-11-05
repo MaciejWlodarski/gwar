@@ -183,6 +183,9 @@ struct Warming {
     sound: Arc<AtomicUsize>,
     /// Whether it ever reached [`ECHO_FOUND`].
     found_echo: bool,
+    /// Microphone frames heard since the last one at [`ECHO_FOUND`]: the audit's F5 candidate.
+    #[cfg(test)]
+    since_echo: usize,
     /// The unbroken stretch of the session it has heard: [`Processing::break_history`].
     history: u32,
 }
@@ -199,7 +202,26 @@ impl Warming {
         } else {
             stage
         };
-        Self { stage, sound: sound.clone(), found_echo: false, history }
+        Self {
+            stage,
+            sound: sound.clone(),
+            found_echo: false,
+            #[cfg(test)]
+            since_echo: 0,
+            history,
+        }
+    }
+
+    /// Whether it may take over: it found an echo, so the speakers reach the microphone.
+    fn has_echo(&self) -> bool {
+        #[cfg(test)]
+        {
+            let recent = AEC_RECENT_ECHO.load(Ordering::Relaxed);
+            if recent > 0 && AEC_NATIVE_PROFILE.load(Ordering::Relaxed) == SHIPPED_AEC_PROFILE {
+                return self.found_echo && self.since_echo < recent;
+            }
+        }
+        self.found_echo
     }
 
     /// Everything waiting in the ring. A frame from a later stretch starts it all over, here on the
@@ -212,6 +234,10 @@ impl Warming {
                 *self.stage = Stage::stereo();
                 self.sound.store(0, Ordering::Relaxed);
                 self.found_echo = false;
+                #[cfg(test)]
+                {
+                    self.since_echo = 0;
+                }
             }
             match heard {
                 Heard::Speakers([far_left, far_right]) => {
@@ -224,7 +250,12 @@ impl Warming {
                     let _ = self.stage.apm.set_stream_delay_ms(delay_ms);
                     let _ = self.stage.apm.process_capture_f32(&[&microphone], &mut [&mut near]);
                     let taken_down = self.stage.apm.statistics().echo_return_loss_enhancement;
-                    self.found_echo |= taken_down.is_some_and(|enhancement| enhancement >= ECHO_FOUND);
+                    let found = taken_down.is_some_and(|enhancement| enhancement >= ECHO_FOUND);
+                    self.found_echo |= found;
+                    #[cfg(test)]
+                    {
+                        self.since_echo = if found { 0 } else { self.since_echo.saturating_add(1) };
+                    }
                 }
             }
         }
@@ -299,7 +330,7 @@ impl StereoWorker {
                     WARM if warming.is_some() => thread::park(),
                     WARM => warming = Some(Warming::new(&learned, 0)),
                     BUILD => match warming.take() {
-                        Some(warmed) if warmed.found_echo => {
+                        Some(warmed) if warmed.has_echo() => {
                             #[cfg(test)]
                             stall(&held, HOLD_DELIVERY);
                             let _ = offer.push(warmed);
@@ -721,6 +752,16 @@ impl Processing {
     /// Hands one whole frame to the canceller. Errors are only for formats other than the ones built above.
     fn render_frame(&mut self) {
         self.collect_warmed();
+        #[cfg(test)]
+        if AEC_MID_REFERENCE.load(Ordering::Relaxed)
+            && AEC_NATIVE_PROFILE.load(Ordering::Relaxed) == SHIPPED_AEC_PROFILE
+        {
+            let [left, right] = &mut self.render;
+            for (left, right) in left.iter_mut().zip(right) {
+                let mid = 0.5 * (*left + *right);
+                (*left, *right) = (mid, mid);
+            }
+        }
         let [left, right] = &self.render;
         let [left_out, right_out] = &mut self.render_scratch;
         let stereo = match &mut self.channels {
@@ -826,6 +867,14 @@ static AEC_APPROVED_ECHO: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 static AEC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The audit's F5 candidate (shipped profile only): a warmed canceller may take over only if it
+/// found an echo within this many microphone frames of sound; 0 keeps the shipped latch.
+#[cfg(test)]
+static AEC_RECENT_ECHO: AtomicUsize = AtomicUsize::new(0);
+/// The audit's F1 candidate (shipped profile only): every stereo canceller, warming, learning or
+/// in charge, hears `[mid, mid]`, the mono canceller's reference, instead of left and right.
+#[cfg(test)]
+static AEC_MID_REFERENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Serializes every test that changes the measurement controls above. They are process-wide, so
 /// ignored measurement tests must also run single-threaded: a test that only reads them through
@@ -882,6 +931,8 @@ fn reset_measurement_controls() {
     AEC_APPROVED_ECHO.store(false, Ordering::Relaxed);
     AEC_TRACE.store(false, Ordering::Relaxed);
     MEASURE_MONO_SUPPRESSOR.store(false, Ordering::Relaxed);
+    AEC_MID_REFERENCE.store(false, Ordering::Relaxed);
+    AEC_RECENT_ECHO.store(0, Ordering::Relaxed);
 }
 
 /// Isolated timing control. The production path never reads these test-only choices.
@@ -912,7 +963,7 @@ pub(super) fn with_native_pipeline_option(id: u8, run: impl FnOnce()) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     const RATE: usize = super::super::io::RATE as usize;
@@ -1067,7 +1118,7 @@ mod tests {
 
     /// Counts this thread's trips to the allocator while it is switched on: the voice thread must
     /// make none on the way to stereo.
-    mod heap {
+    pub(in crate::voice) mod heap {
         use std::{
             alloc::{GlobalAlloc, Layout, System},
             cell::Cell,
@@ -3257,6 +3308,8 @@ mod tests {
     mod tones;
 
     mod reference_options;
+
+    mod audit_candidates;
 
     /// A talker that shares nothing with [`long_voice`]: its own vibrato and syllable rates and its
     /// own harmonic phases, so no part of it is a delayed copy of the far voice that a canceller

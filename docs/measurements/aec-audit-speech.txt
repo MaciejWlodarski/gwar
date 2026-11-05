@@ -1,0 +1,12 @@
+audit-speech,lead=6,echo=false,noise=0,active=1155,cold-hold=25,cold-kept-frames=851,shipped-hold=25,shipped-kept-frames=850,mid-hold=41,mid-kept-frames=809,recent-hold=25,recent-kept-frames=850
+audit-speech,lead=6,echo=false,noise=50,active=1155,cold-hold=37,cold-kept-frames=823,shipped-hold=37,shipped-kept-frames=824,mid-hold=41,mid-kept-frames=777,recent-hold=37,recent-kept-frames=824
+audit-speech,lead=6,echo=false,noise=100,active=1155,cold-hold=37,cold-kept-frames=824,shipped-hold=37,shipped-kept-frames=825,mid-hold=41,mid-kept-frames=775,recent-hold=37,recent-kept-frames=825
+audit-speech,lead=6,echo=true,noise=0,active=1155,cold-hold=49,cold-kept-frames=965,shipped-hold=0,shipped-kept-frames=1155,mid-hold=363,mid-kept-frames=38,recent-hold=0,recent-kept-frames=1155
+audit-speech,lead=6,echo=true,noise=50,active=1155,cold-hold=70,cold-kept-frames=320,shipped-hold=0,shipped-kept-frames=707,mid-hold=497,mid-kept-frames=26,recent-hold=0,recent-kept-frames=707
+audit-speech,lead=6,echo=true,noise=100,active=1155,cold-hold=136,cold-kept-frames=121,shipped-hold=49,shipped-kept-frames=487,mid-hold=586,mid-kept-frames=25,recent-hold=49,recent-kept-frames=487
+audit-speech,lead=10,echo=false,noise=0,active=1155,cold-hold=84,cold-kept-frames=795,shipped-hold=79,shipped-kept-frames=800,mid-hold=38,mid-kept-frames=754,recent-hold=79,recent-kept-frames=800
+audit-speech,lead=10,echo=false,noise=50,active=1155,cold-hold=84,cold-kept-frames=765,shipped-hold=79,shipped-kept-frames=771,mid-hold=45,mid-kept-frames=728,recent-hold=79,recent-kept-frames=771
+audit-speech,lead=10,echo=false,noise=100,active=1155,cold-hold=84,cold-kept-frames=763,shipped-hold=79,shipped-kept-frames=772,mid-hold=45,mid-kept-frames=727,recent-hold=79,recent-kept-frames=772
+audit-speech,lead=10,echo=true,noise=0,active=1155,cold-hold=93,cold-kept-frames=980,shipped-hold=0,shipped-kept-frames=1155,mid-hold=408,mid-kept-frames=56,recent-hold=0,recent-kept-frames=1155
+audit-speech,lead=10,echo=true,noise=50,active=1155,cold-hold=105,cold-kept-frames=355,shipped-hold=0,shipped-kept-frames=705,mid-hold=882,mid-kept-frames=37,recent-hold=0,recent-kept-frames=705
+audit-speech,lead=10,echo=true,noise=100,active=1155,cold-hold=106,cold-kept-frames=148,shipped-hold=49,shipped-kept-frames=492,mid-hold=874,mid-kept-frames=35,recent-hold=49,recent-kept-frames=492

@@ -22,8 +22,8 @@ use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCapture
 use objc2_core_media::{CMBlockBuffer, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_foundation::{NSArray, NSError, NSProcessInfo};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamOutput,
-    SCStreamOutputType,
+    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate, SCStreamErrorCode,
+    SCStreamErrorDomain, SCStreamOutput, SCStreamOutputType,
 };
 
 use super::{Refusal, Support};
@@ -56,10 +56,22 @@ define_class!(
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn stopped(&self, _stream: &SCStream, error: &NSError) {
             tracing::warn!("share sound stopped: {error}");
-            self.ivars().queue.stream_ended();
+            // SAFETY: a constant ScreenCaptureKit defines for as long as it is loaded.
+            let ours = *error.domain() == *unsafe { SCStreamErrorDomain };
+            if withdrawn(ours, SCStreamErrorCode(error.code())) {
+                self.ivars().queue.stream_ended();
+            } else {
+                self.ivars().queue.stream_interrupted();
+            }
         }
     }
 );
+
+/// Whether a stream's error is the user taking the sound back: the stop in the menu bar, or
+/// declining it. Anything else is technical, and the share may capture again.
+fn withdrawn(screen_capture_error: bool, code: SCStreamErrorCode) -> bool {
+    screen_capture_error && matches!(code, SCStreamErrorCode::UserStopped | SCStreamErrorCode::UserDeclined)
+}
 
 impl Output {
     fn new(queue: Arc<CaptureQueue>) -> Retained<Self> {
@@ -249,5 +261,25 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
         Ok(None) => Ok(Box::new(guard)),
         Ok(Some(error)) => Err(Refusal::Failed(error)),
         Err(_) => Err(Refusal::Failed("timed out starting capture".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_user_takes_the_sound_back() {
+        assert!(withdrawn(true, SCStreamErrorCode::UserStopped));
+        assert!(withdrawn(true, SCStreamErrorCode::UserDeclined));
+        for technical in [
+            SCStreamErrorCode::SystemStoppedStream,
+            SCStreamErrorCode::FailedApplicationConnectionInterrupted,
+            SCStreamErrorCode::FailedToStartAudioCapture,
+            SCStreamErrorCode::InternalError,
+        ] {
+            assert!(!withdrawn(true, technical), "{technical:?}");
+        }
+        assert!(!withdrawn(false, SCStreamErrorCode::UserStopped), "another domain's -3817 means something else");
     }
 }
