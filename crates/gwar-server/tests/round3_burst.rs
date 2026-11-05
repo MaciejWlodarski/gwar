@@ -158,10 +158,23 @@ async fn four_unknown_or_large_sources_deliver_within_30s_over_srtp() {
                 times.iter().map(|at| at.saturating_duration_since(start).as_millis()).collect()
             })
             .collect();
+        // Per share, the packets of each response frame that reached the viewer: a frame short of
+        // 200 the SFU did not ask again for is a loss on the way to the viewer, not a storm.
+        let received: Vec<Vec<_>> = (0..4)
+            .map(|i| {
+                let mut got: Vec<_> =
+                    frames.iter().filter(|((s, _), _)| *s == i).map(|((_, ts), p)| (*ts, p.len())).collect();
+                got.sort_unstable();
+                got.into_iter().map(|(_, n)| n).collect()
+            })
+            .collect();
         eprintln!(
-            "LARGE_STARTUP known={known} completed={complete:?} PLIs={requests:?} seeds={seeds:?} at_ms={times:?}"
+            "LARGE_STARTUP known={known} completed={complete:?} PLIs={requests:?} seeds={seeds:?} at_ms={times:?} received={received:?}"
         );
-        assert!(complete.iter().all(|delay| delay.is_some_and(|delay| delay < Duration::from_secs(30))));
+        assert!(
+            complete.iter().all(|delay| delay.is_some_and(|delay| delay < Duration::from_secs(30))),
+            "every share delivers a whole keyframe within 30 s: completed {complete:?}, packets per response {received:?}, requests at {times:?} ms"
+        );
         assert!(seeds.iter().all(|&n| n <= 1), "a share asks once for its first keyframe: {seeds:?}");
         let viewer_requests: u64 = requests.iter().sum::<u64>() - seeds.iter().sum::<u64>();
         let last = times.iter().flatten().max().copied().unwrap_or(0) as f64 / 1000.0;
