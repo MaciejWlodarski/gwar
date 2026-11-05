@@ -471,7 +471,13 @@ throws, every later frame passes, and if the stream fails, what still flows is p
 unfiltered, so a slot can never freeze on it. A worker that never runs would leave every transform
 unread, picture and sound alike: it has to say it loaded within 2 s, and if it does not, or fails
 at any time, every receiver's transform comes off and the session's later transports go without
-the filter.
+the filter. The 2 s count the worker's download, so on a link that slow the session simply plays
+without the filter. Taking the transforms off is not enough: Chromium decodes nothing more on a
+receiver whose transform was taken off, whether the worker never loaded or died while pictures
+flowed (packets keep arriving, no frame reaches the decoder). So a failed worker also replaces the
+watch transport with one without the filter, at once and with no notice, as after a transport
+failure. CI's share-sync job breaks the worker on purpose, at load and while pictures flow, and
+checks that every viewer's picture, and a browser viewer's sound, play on.
 
 The first frame of a backlog proves the link is back, so that is when the viewer sends
 `screen.stalled`, and again at the first frame in time, because frames were dropped since any

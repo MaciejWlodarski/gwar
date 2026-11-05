@@ -938,6 +938,21 @@ jobs:
           SYNC_OUT="$RUNNER_TEMP/share-sync/chromium.json" node apps/web/e2e/share-sync.mjs || failed=$?
           SYNC_ENGINE=webkit SYNC_OUT="$RUNNER_TEMP/share-sync/webkit.json" node apps/web/e2e/share-sync.mjs || failed=$?
           exit "$failed"
+      - name: Viewers play on when the late-frame worker fails
+        if: ${{ !cancelled() }}
+        timeout-minutes: 7
+        env:
+          SYNC_FIXTURE: ${{ github.workspace }}/target/debug/examples/web_latency
+          NATIVE_BRIDGE_BIN: ${{ github.workspace }}/target/debug/examples/native_bridge
+          SYNC_FAKE_TAB: "1"
+          SYNC_SECONDS: "5"
+        # Linux WebKit has no RTCRtpScriptTransform, so it filters nothing and must simply play.
+        run: |
+          failed=0
+          SYNC_WORKER_FAIL=crash SYNC_OUT="$RUNNER_TEMP/share-sync/chromium-crash.json" node apps/web/e2e/share-sync.mjs || failed=$?
+          SYNC_WORKER_FAIL=load SYNC_OUT="$RUNNER_TEMP/share-sync/chromium-load.json" node apps/web/e2e/share-sync.mjs || failed=$?
+          SYNC_ENGINE=webkit SYNC_WORKER_FAIL=crash SYNC_OUT="$RUNNER_TEMP/share-sync/webkit-crash.json" node apps/web/e2e/share-sync.mjs || failed=$?
+          exit "$failed"
       - name: Retain lip-sync reports even on failure
         if: always()
         timeout-minutes: 5

@@ -1608,7 +1608,10 @@ export interface WatchParams {
   frameLost?(slot: number): void;
   /** No late-frame filter: an earlier transport's worker never ran (`lateFramesFailed`). */
   skipLateFrames?: boolean;
-  /** The late-frame worker failed to load or crashed: the transport plays on without it. */
+  /**
+   * The late-frame worker failed to load or crashed. Only a new transport, without the filter,
+   * plays again: Chromium decodes nothing more on a receiver whose transform was taken off.
+   */
   lateFramesFailed?(): void;
   state(state: TransportState): void;
   /** A slot's video track arrived (once per slot and transport). */
@@ -1617,7 +1620,11 @@ export interface WatchParams {
 
 export interface SlotStats { width: number; height: number; fps: number; framesDecoded: number }
 
-/** How long the late-frame worker has to load before its transforms are taken off. */
+/**
+ * How long the late-frame worker has to load before its transforms are taken off. It counts from
+ * the worker's creation, its chunk's download included: on a link that slow the watch plays on
+ * without the filter for the session, as it would where the engine has none (review r2, S21).
+ */
 export const LATE_FRAMES_READY_MS = 2_000;
 
 /**
@@ -1730,7 +1737,13 @@ export class ScreenWatchTransport {
     return worker;
   }
 
-  /** Every receiver the filter held plays as without it, and later transports start without it. */
+  /**
+   * The filter is off for good, and later transports start without it. Taking a transform off a
+   * live receiver does not bring it back in Chromium: packets keep arriving and no frame reaches
+   * the decoder, whether the worker never loaded or died while pictures flowed (measured with
+   * `SYNC_WORKER_FAIL`, Opus review r2, S18). So the transforms come off in case an engine does
+   * play on, and the owner replaces the transport.
+   */
   private dropLateFrames(): void {
     if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
     this.lateFramesReady = null;

@@ -3107,6 +3107,20 @@ describe("late-frame worker that never runs", () => {
     transport.close();
   });
 
+  it("takes every transform off when a worker that loaded crashes later", async () => {
+    const workers = stubLateFramesWorker();
+    const lateFramesFailed = vi.fn();
+    const transport = watch({ lateFramesFailed });
+    await transport.start();
+    workers[0]!.say({ ready: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(transforms().every(t => t !== null)).toBe(true);
+    workers[0]!.onerror?.(new Event("error"));
+    expect(transforms()).toEqual(transforms().map(() => null));
+    expect(lateFramesFailed).toHaveBeenCalledOnce();
+    transport.close();
+  });
+
   it("keeps a worker that loaded, and starts none once one failed", async () => {
     const workers = stubLateFramesWorker();
     const lateFramesFailed = vi.fn();

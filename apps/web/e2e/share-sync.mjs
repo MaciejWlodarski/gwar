@@ -25,6 +25,9 @@
  *   SYNC_RETURN=1                               the sound stops 8 s into the watch and returns 5 s later
  *   SYNC_OUT=path.json                          every burst and the summaries
  *   SYNC_FAKE_TAB=1                             the sharer's page is the source (Linux, where a tab's sound is not captured)
+ *   SYNC_WORKER_FAIL=load|crash                 the late-frame worker never loads, or dies 6 s into the watch after
+ *                                               pictures flowed; the run fails unless every viewer's picture (and a
+ *                                               browser viewer's sound) still plays after it
  */
 import { spawn, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
@@ -188,10 +191,15 @@ function viewerPatch() {
   window.__linkBacks = [];
   /** Every word of the filter, picture and sound: what it dropped since the last, and when. */
   window.__sheds = [];
+  /** The late-frame workers, for `SYNC_WORKER_FAIL`. */
+  window.__lateFrameWorkers = [];
   window.Worker = new Proxy(window.Worker, {
     construct(target, args) {
-      const worker = new target(...args);
-      if (args[1]?.name === "gwar-late-frames") worker.addEventListener("message", event => {
+      const filter = args[1]?.name === "gwar-late-frames";
+      // A chunk that is not there, as after a deploy while the tab stayed open.
+      const worker = new target(...(filter && window.__workerFail === "load" ? ["/late-frames-worker-gone.js", args[1]] : args));
+      if (filter) window.__lateFrameWorkers.push(worker);
+      if (filter) worker.addEventListener("message", event => {
         if (event.data?.slot === undefined) return;
         window.__sheds.push(event.data);
         if (event.data.kind === "video") window.__linkBacks.push(Date.now());
@@ -205,6 +213,24 @@ function viewerPatch() {
   window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
     construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
   });
+  /**
+   * What each connection's receivers played so far, by its place in `__pcs`: pictures decoded, and
+   * sound that was not concealment. A closed connection counts what it had.
+   */
+  window.__played = async () => {
+    const run = (await window.__gwarE2eImport("/src/state/screen.ts")).useScreen.getState().transport.run;
+    const pcs = {};
+    for (const [i, pc] of window.__pcs.entries()) {
+      if (pc.connectionState !== "connected") continue;
+      const played = pcs[i] = { video: 0, audio: 0 };
+      for (const stat of (await pc.getStats()).values()) {
+        if (stat.type !== "inbound-rtp") continue;
+        if (stat.kind === "video") played.video += stat.framesDecoded ?? 0;
+        else played.audio += (stat.totalSamplesReceived ?? 0) - (stat.concealedSamples ?? 0);
+      }
+    }
+    return { run, pcs };
+  };
   /** Every second, what the receivers say: the picture's and the sound's delay, and repairs. */
   window.__health = [];
   window.__followHealth = () => setInterval(async () => {
@@ -334,6 +360,7 @@ async function device(browser, web, server, name, native = false) {
   });
   if (process.env.SYNC_NOFILTER) await context.addInitScript(() => { window.__noFilter = true; });
   if (process.env.SYNC_NOWAIT) await context.addInitScript(() => { window.__noWait = true; });
+  if (process.env.SYNC_WORKER_FAIL) await context.addInitScript(mode => { window.__workerFail = mode; }, process.env.SYNC_WORKER_FAIL);
   await context.addInitScript(viewerPatch);
   if (process.env.SYNC_FAKE_TAB && name === "sync-sharer") await context.addInitScript({ content: fakeTab });
   // The picker's first answer has the tab's picture only, as a share nobody asked sound for.
@@ -470,6 +497,38 @@ async function turnOnSound(sharer, viewers) {
   return Date.now();
 }
 
+/**
+ * `SYNC_WORKER_FAIL`: after the late-frame worker failed to load, or died while pictures flowed,
+ * every viewer must play on, in place or on a new transport (Opus review r2, S18).
+ */
+async function workerFailed(pages, mode) {
+  await sleep(6_000);
+  const failed = await Promise.all(pages.map(page => page.evaluate(async crash => {
+    const { run } = await window.__played();
+    if (crash) for (const worker of window.__lateFrameWorkers) { worker.terminate(); worker.dispatchEvent(new ErrorEvent("error", { message: "e2e: the worker died" })); }
+    return { workers: window.__lateFrameWorkers.length, run };
+  }, mode === "crash")));
+  const before = await Promise.all(pages.map(page => page.evaluate(() => window.__played())));
+  // Long enough for the transport to be taken for stuck and rebuilt, if it is.
+  await sleep(9_000);
+  const after = await Promise.all(pages.map(page => page.evaluate(() => window.__played())));
+  // What each connection's receivers say, for a run that fails.
+  const receivers = await Promise.all(pages.map(page => page.evaluate(async () => Promise.all(window.__pcs.map(async pc => ({
+    state: pc.connectionState,
+    filtered: pc.getReceivers().map(r => `${r.track.kind}:${r.transform ? "on" : "off"}`).join(),
+    inbound: pc.connectionState === "closed" ? [] : [...(await pc.getStats()).values()].filter(s => s.type === "inbound-rtp").map(s => ({ kind: s.kind, mid: s.mid, packets: s.packetsReceived, frames: s.framesReceived, decoded: s.framesDecoded, samples: s.totalSamplesReceived, concealed: s.concealedSamples })),
+}))))));
+  return pages.map((page, i) => {
+    const gained = kind => Object.entries(after[i].pcs).reduce((sum, [pc, now]) => sum + now[kind] - (before[i].pcs[pc]?.[kind] ?? 0), 0);
+    const result = { viewer: page.kind, mode, workers: failed[i].workers, rebuilt: after[i].run !== failed[i].run, video: gained("video"), audio: gained("audio"), receivers: receivers[i] };
+    console.log(JSON.stringify({ workerFail: result }));
+    assert.ok(result.video >= 60, `the ${page.kind} viewer's picture stopped after the worker failed (${mode}): ${JSON.stringify(result)}`);
+    // Two seconds' worth in nine; a desktop viewer's sound leaves the webview.
+    if (page.kind === "browser") assert.ok(result.audio >= 2 * 48_000, `the browser viewer's sound stopped after the worker failed (${mode}): ${JSON.stringify(result)}`);
+    return result;
+  });
+}
+
 async function viewerRecord(page) {
   const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted, baseline: window.__baseline, linkBacks: window.__linkBacks, sheds: window.__sheds, looks: window.__looks, waits: window.__waits }));
   if (page.native) {
@@ -520,6 +579,7 @@ async function run() {
 
     const watching = [];
     for (const kind of VIEWERS) watching.push(await viewer(viewerEngine, web, ready.url, "sync-sharer", kind));
+    const workerFail = process.env.SYNC_WORKER_FAIL ? await workerFailed(watching, process.env.SYNC_WORKER_FAIL) : null;
     let soundBack = null;
     if (process.env.SYNC_ADD) { await sleep(8_000); soundBack = await turnOnSound(sharer, watching); }
     if (process.env.SYNC_RETURN) {
@@ -530,7 +590,7 @@ async function run() {
     }
     await sleep(seconds * 1000);
     const bursts = await source.evaluate(() => window.__bursts);
-    const report = { net: netName, spec: netSpec, bursts, soundBack, viewers: {} };
+    const report = { net: netName, spec: netSpec, bursts, soundBack, workerFail, viewers: {} };
     for (const page of watching) {
       if (page.pictureOnly) {
         await checkPictureOnly(page);

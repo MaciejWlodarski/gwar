@@ -1127,7 +1127,18 @@ export class ScreenController {
         }
       },
       skipLateFrames: this.lateFramesFailed,
-      lateFramesFailed: () => { this.lateFramesFailed = true; },
+      lateFramesFailed: () => {
+        this.lateFramesFailed = true;
+        if (this.transport !== transport) return;
+        // The engine does not play a receiver again once its transform is off: as after a
+        // failure, a new transport, which starts without the filter, picks every watch up
+        // again, but at once and with no notice (Opus review r2, S18).
+        const watches = useScreen.getState().watches;
+        dispatch({ type: "transport", run, phase: "failed" });
+        this.dropTransport();
+        for (const watch of watches) this.waitForWatch(watch.id);
+        this.resumeWatches();
+      },
       decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
     });

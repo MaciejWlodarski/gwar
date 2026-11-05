@@ -689,6 +689,48 @@ describe("watch recovery", () => {
     screen.reset();
   });
 
+  it("rebuilds the watch transport without the filter when the late-frame worker fails, with no notice", async () => {
+    // Opus review r2 (S18): Chromium decodes nothing more on a receiver whose transform was taken
+    // off, so the old fallback left the watch frozen, sound and all.
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A"); await flush();
+    type Params = { state(s: string): void; lateFramesFailed(): void; skipLateFrames?: boolean };
+    const first = media.transports[0]! as unknown as { params: Params; close: () => void };
+    expect(first.params.skipLateFrames).toBe(false);
+    first.params.state("connected"); await watching;
+    first.params.lateFramesFailed(); await flush();
+    expect(first.close).toHaveBeenCalled();
+    const second = media.transports[1]! as unknown as { params: Params };
+    expect(second.params.skipLateFrames).toBe(true);
+    second.params.state("connected"); await flush();
+    expect(useScreen.getState().watches).toMatchObject([{ share: "A", status: "watching" }]);
+    expect(calls.filter(([op]) => op === "screen.watch")).toHaveLength(2);
+    // A late word from the old transport changes nothing.
+    first.params.lateFramesFailed(); await flush();
+    expect(media.transports).toHaveLength(2);
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("rebuilds a transport whose worker fails before it connects, and still watches", async () => {
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A"); await flush();
+    type Params = { state(s: string): void; lateFramesFailed(): void; skipLateFrames?: boolean };
+    const first = media.transports[0]! as unknown as { params: Params };
+    first.params.lateFramesFailed(); await flush();
+    await watching;
+    const second = media.transports.at(-1)! as unknown as { params: Params };
+    expect(second).not.toBe(first);
+    expect(second.params.skipLateFrames).toBe(true);
+    second.params.state("connected"); await flush();
+    expect(useScreen.getState().watches).toMatchObject([{ share: "A", status: "watching" }]);
+    expect(calls.filter(([op]) => op === "screen.watch")).toHaveLength(1);
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
   it.each([null, 2])("ends a voluntary sharer leave/move on the next client update (%s)", async channel => {
     const { link } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
     const screen = new ScreenController(() => link, String); initialise(screen);
