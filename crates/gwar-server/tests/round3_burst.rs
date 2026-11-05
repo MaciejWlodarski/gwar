@@ -73,8 +73,16 @@ async fn growing_initial_keyframes_survive_real_srtp_admission() {
 /// 200-packet (about 208 KiB on the wire) keyframes represent large 1440p
 /// responses. Exercise both an unmeasured and an already measured source with
 /// real cold-estimator feedback and budgeted retries, without synthetic BWE.
+///
+/// A storm is a keyframe request the SFU's limits do not pay for. Each unknown
+/// source's one-packet seed is no keyframe, so its share asks for one before anyone
+/// watches; every later request is the viewer's and comes out of its budget
+/// (`VIEWER_KEYFRAMES_BURST` plus `VIEWER_KEYFRAMES_PER_SECOND`). A busy machine
+/// starts slower, and the budget refills meanwhile, so the bound grows with the
+/// startup instead of being a fixed count.
 #[tokio::test]
 async fn four_unknown_or_large_sources_deliver_within_30s_over_srtp() {
+    use gwar_server::media::screen::{VIEWER_KEYFRAMES_BURST, VIEWER_KEYFRAMES_PER_SECOND};
     use std::collections::{HashMap, HashSet};
     for known in [false, true] {
         let server = TestServer::start().await;
@@ -94,6 +102,19 @@ async fn four_unknown_or_large_sources_deliver_within_30s_over_srtp() {
             shares.push(share);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+        if !known {
+            // The shares' own requests for their first keyframe, before any viewer.
+            let asked = Instant::now();
+            while sources.iter().enumerate().any(|(i, s)| s.publisher(&shares[i]).keyframe_requests() == 0) {
+                assert!(
+                    asked.elapsed() < Duration::from_secs(5),
+                    "a share waiting for its first keyframe asks for one"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let seeds: Vec<_> =
+            sources.iter().enumerate().map(|(i, s)| s.publisher(&shares[i]).keyframe_requests()).collect();
         viewer.viewer = Some(screen::Viewer::start(&mut viewer, 1).await);
         let start = Instant::now();
         for share in &shares {
@@ -129,8 +150,25 @@ async fn four_unknown_or_large_sources_deliver_within_30s_over_srtp() {
         }
         let requests: Vec<_> =
             sources.iter().enumerate().map(|(i, s)| s.publisher(&shares[i]).keyframe_requests()).collect();
-        eprintln!("LARGE_STARTUP known={known} completed={complete:?} PLIs={requests:?}");
+        let times: Vec<Vec<_>> = sources
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let times = s.publisher(&shares[i]).request_times.lock().unwrap().clone();
+                times.iter().map(|at| at.saturating_duration_since(start).as_millis()).collect()
+            })
+            .collect();
+        eprintln!(
+            "LARGE_STARTUP known={known} completed={complete:?} PLIs={requests:?} seeds={seeds:?} at_ms={times:?}"
+        );
         assert!(complete.iter().all(|delay| delay.is_some_and(|delay| delay < Duration::from_secs(30))));
-        assert!(requests.iter().sum::<u64>() <= 15, "startup must not create a PLI storm");
+        assert!(seeds.iter().all(|&n| n <= 1), "a share asks once for its first keyframe: {seeds:?}");
+        let viewer_requests: u64 = requests.iter().sum::<u64>() - seeds.iter().sum::<u64>();
+        let last = times.iter().flatten().max().copied().unwrap_or(0) as f64 / 1000.0;
+        let budget = VIEWER_KEYFRAMES_BURST + VIEWER_KEYFRAMES_PER_SECOND * last;
+        assert!(
+            viewer_requests as f64 <= budget,
+            "startup must not create a PLI storm: {viewer_requests} viewer requests by {last:.1} s, budget {budget:.1}"
+        );
     }
 }
