@@ -456,9 +456,10 @@ So a viewer drops the backlog before its receiver sees it (`apps/web/src/voice/l
 `RTCRtpScriptTransform` runs on each received frame and works out how much longer it took than the
 quickest of the last few seconds, by the media's own clock. It only acts after arrivals stopped for
 200 ms: frames that are late without that are a queue, which the receiver drains by itself. A
-picture frame over 500 ms late, or a
-sound frame over 200 ms late, goes; in the desktop app sound leaves for the mixer, which drops late
-frames itself. Keyframes are always kept, and a run that opens with one is a resumed slot's first
+frame over 500 ms late goes, picture or sound alike: shed alone, sound ran ahead of a picture still
+playing its backlog, and a browser does not line them up again (270 ms stalls in a browser: 75 % of
+bursts in range without sync, 70 % with a 200 ms threshold for sound). In the desktop app sound
+leaves for the mixer, which drops a backlog itself, and the picture's wait lines the two up. Keyframes are always kept, and a run that opens with one is a resumed slot's first
 picture, held up by its own size, not a backlog. Nothing is shed for more than a second in a row: a
 link that stays that slow is the link now, and it sets the new measure. Without script transforms a
 viewer plays the backlog, as before. The filter never stops a frame on its own failure: if it

@@ -67,11 +67,14 @@ describe("LateFrames", () => {
     for (let n = 0; n < 100; n++) expect(late.see((first + n * 2970) % 2 ** 32, n * 33, false).keep).toBe(true);
   });
 
-  it("is stricter with sound, on its own clock", () => {
+  it("sheds sound only from where it sheds the picture, on the sound's own clock", () => {
+    // A 270 ms stall left sound 400 ms late: shed alone, it ran ahead of a picture still playing
+    // its backlog (final re-measure of #213, 270 ms stalls in a browser).
     const late = new LateFrames("audio");
     for (let n = 0; n < 300; n++) late.see(n * 960, n * 20, false);
-    expect(late.see(300 * 960, 300 * 20 + 150, false).keep).toBe(true);
-    expect(late.see(301 * 960, 301 * 20 + 400, false).keep).toBe(false);
+    expect(late.see(300 * 960, 300 * 20 + 400, false).keep).toBe(true);
+    for (let n = 301; n < 600; n++) late.see(n * 960, n * 20 + 400, false);
+    expect(late.see(600 * 960, 600 * 20 + 1_000, false).keep).toBe(false);
   });
 
   it("takes a resumed slot's late first keyframe and the frames behind it as new, not as a link back", () => {

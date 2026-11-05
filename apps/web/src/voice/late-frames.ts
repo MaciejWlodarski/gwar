@@ -8,10 +8,16 @@
 
 export type MediaKind = "video" | "audio";
 
-/** Ticks per millisecond, and how late is later than the SFU itself holds a frame back. */
+/** How late is later than the SFU itself holds a frame back. */
+const LATE_MS = 500;
+/**
+ * Ticks per millisecond, and how late a frame goes. Sound goes only from where the picture does: a
+ * stall that cut the sound alone left the picture playing its backlog behind a sound that had moved
+ * on, and a browser does not line them up again (270 ms stalls: 75 % of bursts in range → 70 %).
+ */
 const KINDS: Record<MediaKind, { ticks: number; lateMs: number }> = {
-  video: { ticks: 90, lateMs: 500 },
-  audio: { ticks: 48, lateMs: 200 },
+  video: { ticks: 90, lateMs: LATE_MS },
+  audio: { ticks: 48, lateMs: LATE_MS },
 };
 /** A stall stops arrivals first. Frames late without that are a queue, which the receiver can drain. */
 const STALL_GAP_MS = 200;
