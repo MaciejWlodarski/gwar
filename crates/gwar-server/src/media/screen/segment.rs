@@ -42,6 +42,11 @@ impl Segment {
         self.waiting
     }
 
+    /// The highest output number written so far: a segment started later begins above it.
+    pub fn highest_out(&self) -> Option<u64> {
+        self.highest_out
+    }
+
     /// The output sequence number and timestamp for a source packet, or `None` to drop it.
     pub fn map(&mut self, source: u64, timestamp: u32, keyframe: bool, now: Instant) -> Option<(u64, u32)> {
         if self.waiting {
