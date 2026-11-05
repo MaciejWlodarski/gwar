@@ -1,5 +1,7 @@
 # Main 1099a6817bbbabb9074004000915a3c884262cdd, unchanged policy arm.
 # SFU observed through the seeded drop matrix, not an analytical capacity bound.
+# Regenerated on #230 (screen/viewer-start 1b896336, the base of #213): all 2,560 cases equal
+# to main's, so the rows and the noise bounds from main's controls stand unchanged.
 seed,cadence_ms,loss_ppm,aggregate_ms,cross_bps,from_bps,to_bps,ramp,phase_ms,above_ms,voice_hurt_ms
 1,5,0,0,0,6000000,2000000,0,0,3830,630
 1,5,0,0,0,6000000,2000000,0,200,5000,170
