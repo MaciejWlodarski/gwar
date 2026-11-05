@@ -312,6 +312,26 @@ describe("MLS synchronization", () => {
     await f.runtime.sync();
     expect(f.runtime.status(broken)).toBe("ready");
   });
+  it("keeps the key archive running while one DM persistently fails to sync", async () => {
+    const broken = `dm:${[await uidForPublicKey(device), b64(6,20)].sort().join(":")}`;
+    const brokenGroup = b64(6);
+    const f = await fixture({ ...clean(), groups: [{ ...summary(), conversation: broken, group: Array(32).fill(6) }] }, false);
+    // A Connect device's archive: an isolated DM failure must not starve it.
+    const pass = vi.fn(async () => null);
+    const internals = f.runtime as unknown as { archive: { pass: typeof pass }; archiveAt: number; synchronize: () => Promise<unknown[]> };
+    internals.archive = { pass };
+    f.world.groups = [{ conversation: broken, group: brokenGroup, incarnation: 0, epoch: 0, pending: false }];
+    const error = new Error("unrelated log unavailable");
+    f.world.logErrors.set(brokenGroup, error);
+    await expect(f.runtime.sync()).rejects.toBe(error);
+    expect(pass).toHaveBeenCalledTimes(1);
+    // A pass that fails as a whole still holds the archive back.
+    internals.archiveAt = 0;
+    const whole = new Error("connection lost");
+    vi.spyOn(internals, "synchronize").mockRejectedValueOnce(whole);
+    await expect(f.runtime.sync()).rejects.toBe(whole);
+    expect(pass).toHaveBeenCalledTimes(1);
+  });
   it("settles persisted Creating groups from the authoritative group list", async () => {
     const f = await fixture({ ...clean(), groups: [summary("creating")] });
     expect(f.operations.some(op => op.op === "settle")).toBe(true);

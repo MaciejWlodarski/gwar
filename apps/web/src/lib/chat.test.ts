@@ -96,6 +96,22 @@ describe("threadRows", () => {
     const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "m3" }]);
     expect(keys(rows)).toEqual(["day", "failed:1", "m5", "m6"]);
   });
+  it("compares a deleted anchor only with rows of its own kind in a thread holding both", () => {
+    // The reducer's order for such a thread: every message by id (see reducer.test.ts).
+    const sealed = (id: number, at: number): ChatItem => ({ ...m(id, "b", at), key: `e${id}` });
+    const raw = [sealed(3, base), m(100, "b", base + 2000), m(101, "b", base + 3000)];
+    // The card's own time is before everything, so only its anchor keeps it lower.
+    // e150 is gone: e3 is the last sealed row at or below it (m100 and m101 have lower ids too, but are not sealed).
+    expect(keys(threadRows(raw, () => true, [{ key: "failed:1", at: base - 1000, after: "e150" }]))).toEqual(["day", "e3", "failed:1", "m100", "m101"]);
+    // m50 is gone and no plaintext row is at or below it (e3 is not one): the card falls back to time order.
+    expect(keys(threadRows(raw, () => true, [{ key: "failed:1", at: base - 1000, after: "m50" }]))).toEqual(["day", "failed:1", "e3", "m100", "m101"]);
+  });
+  it("keeps the card below what was shown when its encrypted anchor message is deleted", () => {
+    const sealed = (id: number, at: number, created: number): ChatItem => ({ ...signed(id, at, created), key: `e${id}` });
+    const raw = [sealed(1, base, base + 59_000), sealed(3, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "e2" }]);
+    expect(keys(rows)).toEqual(["day", "e1", "failed:1", "e3"]);
+  });
 });
 
 describe("unreadLabel", () => {

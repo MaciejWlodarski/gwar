@@ -667,6 +667,19 @@ describe("direct message routing", () => {
 });
 
 
+describe("a thread with plaintext and sealed rows", () => {
+  // Encryption is fixed when a channel (or server chat) is created, so the server never mixes the two; if a
+  // thread ever held both, the reducer orders all its messages by id although the ids come from different
+  // tables. Failed-send anchors therefore compare only rows of their own kind (lib/chat threadRows).
+  it("orders every message by id when a sealed row arrives", () => {
+    let s = ev(online(), { ev: "chat.message", d: msg(100) });
+    s = ev(s, { ev: "chat.message", d: msg(101) });
+    const row = { id: 3, conversation: "channel:1", group: "g", epoch: 0, author_uid: "u2", author_name: "n2", message_id: "e3", revision: 0, ciphertext: "x", sent_at: 1003, deleted: false };
+    s = reduce(s, { type: "sealed", thread: "ch:1", live: true, item: { kind: "msg", key: "e3", at: 1003, msg: msg(3), sealed: row, authentic: true } });
+    expect(s.threads["ch:1"]?.items.map(i => i.key)).toEqual(["e3", "m100", "m101"]);
+  });
+});
+
 describe("encrypted server chat", () => {
   const server = { ...welcome().server, server_chat: { encrypted: true, history: true } };
   const row = { id: 8, conversation: "server", group: "g", epoch: 0, author_uid: "u2", author_name: "n2", message_id: "m8", revision: 0, ciphertext: "x", sent_at: 1008, deleted: false };

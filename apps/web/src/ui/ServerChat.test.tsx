@@ -129,7 +129,7 @@ it("clears only the original retained draft when a later admission succeeds", as
 
 it("shows a failed encrypted message in its timeline position with Polish retry labels", async () => {
   useSettings.setState({ language: "pl" });
-  useOutbox.getState().add({ thread: "server", text: "failed earlier", at: 100, session: controller.sendSession, sealed: { message_id: "retry", created_at: 100 }, serverKey: "", error: "offline" });
+  useOutbox.getState().add({ thread: "server", text: "failed earlier", at: 100, session: controller.sendSession, sealed: { message_id: "retry", created_at: 100 }, serverKey: "" });
   useSession.setState(s => ({ threads: { server: { ...s.threads.server!, items: [{ kind: "msg", key: "e2", at: 200,
     msg: { id: 2, target: "server", author: 2, author_uid: "other", author_name: "Other", text: "later message", sent_at: 200 } }] } } }));
   await show();
@@ -142,7 +142,7 @@ it("shows a failed encrypted message in its timeline position with Polish retry 
 });
 
 it("hides a retained in-flight attempt until delivery fails", async () => {
-  const item = useOutbox.getState().add({ thread: "server", text: "waiting for delivery", serverKey: "", error: "Not sent", sending: true,
+  const item = useOutbox.getState().add({ thread: "server", text: "waiting for delivery", serverKey: "", sending: true,
     sealed: { message_id: "pending-id", created_at: 100 }, session: controller.sendSession });
   await show();
   expect(container.querySelector('[role="alert"]')).toBeNull();
@@ -153,7 +153,7 @@ it("hides a retained in-flight attempt until delivery fails", async () => {
 
 it("keeps attachment chips and requires an explicit fresh send after the session changes", async () => {
   const retry = vi.spyOn(controller, "retrySend").mockResolvedValue();
-  useOutbox.getState().add({ thread: "server", text: "failed draft", serverKey: "", authorUid: "me", error: "connection lost",
+  useOutbox.getState().add({ thread: "server", text: "failed draft", serverKey: "", authorUid: "me",
     attachments: ["f1"], sealed: { message_id: "old-id", created_at: 100 },
     attachmentMetadata: [{ id: "f1", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/f1/file", sha256: "hash", sealed: { key: "key", sha256: "cipherhash", size: 33 } }] });
   await show();
@@ -169,8 +169,45 @@ it("keeps attachment chips and requires an explicit fresh send after the session
   expect(retry).toHaveBeenCalledWith(useOutbox.getState().failed[0]!.id, true);
 });
 
+it("says on one line why a message was not sent, and shows a retry in progress", async () => {
+  const item = useOutbox.getState().add({ thread: "server", text: "slow server", serverKey: "", authorUid: "me", reason: "err.req.timeout",
+    sealed: { message_id: "slow-id", created_at: 100 }, session: controller.sendSession });
+  await show();
+  const failed = container.querySelector('[role="alert"]')!;
+  const status = failed.querySelector("[data-failed-status]")!;
+  expect(status.textContent).toBe("Not sent · The server took too long to answer.");
+  // One line from sm up; a narrow (touch) screen wraps it instead of hiding the rest behind a title.
+  expect(status.classList.contains("sm:truncate")).toBe(true);
+  expect(status.classList.contains("truncate")).toBe(false);
+  await act(async () => useOutbox.getState().update(item.id, { retrying: true }));
+  const sending = [...failed.querySelectorAll("button")].find(b => b.textContent?.includes("Sending…"))!;
+  expect(sending.disabled).toBe(true);
+  expect(failed.getAttribute("aria-busy")).toBe("true");
+  await act(async () => useOutbox.getState().update(item.id, { retrying: false }));
+  expect([...failed.querySelectorAll("button")].find(b => b.textContent?.includes("Send again"))!.disabled).toBe(false);
+});
+
+it("says why in the language chosen now, in words that stay true after a reconnect", async () => {
+  useOutbox.getState().add({ thread: "server", text: "while offline", serverKey: "", authorUid: "me", reason: "chat.failed.lost",
+    sealed: { message_id: "lost-id", created_at: 100 }, session: controller.sendSession });
+  await show();
+  const status = () => container.querySelector("[data-failed-status]")!.textContent;
+  expect(status()).toBe("Not sent · The connection was lost.");
+  await act(async () => useSettings.setState({ language: "pl" }));
+  expect(status()).toBe("Nie wysłano · Połączenie zostało przerwane.");
+});
+
+it("offers only Dismiss for a message that may have been sent or removed", async () => {
+  useOutbox.getState().add({ thread: "server", text: "gone", serverKey: "", authorUid: "me", unknown: true,
+    sealed: { message_id: "gone-id", created_at: 100 }, session: controller.sendSession });
+  await show();
+  const failed = container.querySelector('[role="alert"]')!;
+  expect(failed.querySelector("[data-failed-status]")!.textContent).toBe("May have been sent or removed");
+  expect([...failed.querySelectorAll("button")].map(b => b.textContent)).toEqual(["Dismiss"]);
+});
+
 it("keeps a failed message visible when an attachment cannot be sent", async () => {
-  useOutbox.getState().add({ thread: "server", text: "text survives", serverKey: "", error: "lost",
+  useOutbox.getState().add({ thread: "server", text: "text survives", serverKey: "",
     attachments: ["lost-file"], sealed: { message_id: "old-id", created_at: 100 } });
   await show();
   const failed = container.querySelector('[role="alert"]')!;

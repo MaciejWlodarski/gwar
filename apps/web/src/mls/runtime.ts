@@ -161,7 +161,7 @@ export class MlsRuntime {
   /** Volatile voice calls under this device lease, closed with it. */
   private readonly calls = new Set<VoiceCall>();
   private readonly now: () => number;
-  /** The key archive runs after a successful pass, at most once a minute, backing off on failures. */
+  /** The key archive runs after a pass that did not fail as a whole, at most once a minute, backing off on failures. */
   private readonly archive: KeyArchive | undefined;
   private archiveAt = 0;
   private archiveDelay = 60_000;
@@ -486,7 +486,10 @@ export class MlsRuntime {
       // sooner for a channel group whose create or join comes due.
       const wake = this.wakeAt === undefined ? 15_000 : Math.max(200, Math.min(15_000, this.wakeAt - this.now()));
       this.schedule(!failed && this.dirty ? 200 : wake);
-      if (!failed) this.archivePass();
+      // A pass that failed only for some DMs finished everything else, and each failed DM was
+      // reloaded to its durable state: the archive then sees only committed epochs, as it does
+      // between any two passes. Only a pass that failed as a whole holds it back.
+      if (!failed || isolated) this.archivePass();
     });
     return this.syncing;
   }

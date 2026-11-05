@@ -7,7 +7,7 @@ import { permissionsOf } from "../lib/permissions";
 import { channelPermissions } from "../lib/channel-permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
 import { attachment as attachmentSchema } from "../net/schema";
-import { SealedConversations, type SealedKey } from "./sealed";
+import { AttachmentsGoneError, DeliveryUnknownError, SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
 import type { VoiceCall } from "../mls/voice";
 import type { OwnerView, Roster } from "../mls/types";
@@ -165,6 +165,25 @@ export function describeRequestError(e: unknown, action?: Key): string {
   if (e instanceof RequestTimeoutError) return tNow("err.req.timeout");
   if (e instanceof ConnectionLostError) return tNow("err.req.lost");
   return e instanceof Error ? e.message : String(e);
+}
+
+/** A plaintext retry keeps its message ID within this time; the server takes signatures up to 5 minutes old. */
+const PLAIN_RETRY_WINDOW_MS = 4 * 60_000;
+
+/** Server answers that a send card can explain in plain words that stay true after a reconnect;
+ *  others leave it at "Not sent". */
+const SEND_FAILURES = new Set(["not_found", "forbidden", "rate_limited", "unavailable", "internal", "banned", "too_large", "quota_exceeded"]);
+/** Errors thrown with these texts, and the words a card keeps for them (past tense where the state passes). */
+const SEND_FAILURE_TEXTS: [Key, Key][] = [["chat.securing", "chat.failed.securing"], ["chat.locked", "chat.locked"],
+  ["chat.peerOffline", "chat.failed.peerOffline"], ["chat.missingAttachments", "chat.missingAttachments"], ["chat.editChanged", "chat.editChanged"]];
+/** Why a send failed, as the key of a plain sentence for its card (shown in the language of the moment), or
+ *  undefined when no more than "Not sent" can honestly be said (internal errors are not shown). */
+function sendFailureReason(e: unknown): Key | undefined {
+  if (e instanceof RequestError) return SEND_FAILURES.has(e.code) ? `err.req.${e.code}` as Key : undefined;
+  if (e instanceof RequestTimeoutError) return "err.req.timeout";
+  if (e instanceof ConnectionLostError) return "chat.failed.lost";
+  if (e instanceof AttachmentsGoneError) return "chat.missingAttachments";
+  return e instanceof Error ? SEND_FAILURE_TEXTS.find(([thrown]) => tNow(thrown) === e.message)?.[1] : undefined;
 }
 
 /** Why a channel refused me, in the words of joining. */
@@ -2121,7 +2140,8 @@ class Controller {
     return { conn, current, check: () => { if (!current()) throw new ConnectionLostError(); } };
   }
 
-  private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature, conn = this.connection): Promise<MessageSignature> {
+  private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature, conn = this.connection,
+    retry?: Pick<MessageSignature, "message_id" | "created_at">): Promise<MessageSignature> {
     // The direct TeamSpeak transport ignores Gwar signatures.
     if (!(conn instanceof Connection)) return { server_key: "", conversation: "server", group_id: "-", epoch: "-", author_uid: "", key: "", certificate: null, certificate_hash: "-", message_id: "", revision: 0, previous_revision_hash: "-", created_at: 0, signed_at: 0, body_hash: "", signature: "" };
     const s = useSession.getState();
@@ -2134,7 +2154,7 @@ class Controller {
       signedTarget = messageTarget(`dm:${peer.uid}`, s.me?.uid ?? "", s.me?.uid);
     }
     if (!s.me) throw new Error("no session");
-    return signMessage(conn.identity, { serverKey: conn.serverKey!, target: signedTarget }, await uidForPublicKey(accountKeyOf(conn.identity)), text, mentions, attachments, original);
+    return signMessage(conn.identity, { serverKey: conn.serverKey!, target: signedTarget }, await uidForPublicKey(accountKeyOf(conn.identity)), text, mentions, attachments, original, retry);
   }
 
   async sendChat(key: ThreadKey, text: string, options: SendOptions = {}): Promise<boolean> {
@@ -2164,7 +2184,7 @@ class Controller {
 
   /** Own the text and file keys before awaiting delivery. Resync keeps the originating
    * session, so sending in its successor always needs an explicit fresh send. */
-  private async deliverSealed(m: Omit<Extract<FailedSend, { sealed: object }>, "id" | "error" | "serverKey">, retryId?: number, onRetained?: () => void, attempt = new AbortController()): Promise<boolean> {
+  private async deliverSealed(m: Omit<Extract<FailedSend, { sealed: object }>, "id" | "reason" | "serverKey">, retryId?: number, onRetained?: () => void, attempt = new AbortController()): Promise<boolean> {
     const conn = this.conn, sealed = this.sealed;
     const session = this.sendSession, authorUid = useSession.getState().me?.uid, serverKey = conn?.serverKey ?? null;
     const ownsView = () => this.conn === conn && (conn?.serverKey ?? null) === serverKey && useSession.getState().me?.uid === authorUid;
@@ -2181,7 +2201,7 @@ class Controller {
       // Anchor a new attempt after what is on screen now; a retry keeps the original place.
       const after = retryId === undefined ? useSession.getState().threads[m.thread]?.items.at(-1)?.key : m.after;
       id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata, after,
-        sending: retryId === undefined, error: tNow("chat.notSent") }).id;
+        sending: retryId === undefined, retrying: retryId !== undefined, reason: undefined }).id;
       this.sendAttempts.set(id, attempt);
       const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id!) === attempt && ownsView() && session === this.sendSession
         && (useOutbox.getState().failed.some(f => f.id === id && f.sealed?.message_id === m.sealed.message_id) || delivered());
@@ -2199,13 +2219,22 @@ class Controller {
       if (!ownsView() || id === undefined) return false;
       if (delivered()) { useOutbox.getState().remove(id); return true; }
       // Dismissal or an authenticated arrival may already have removed this attempt.
-      if (useOutbox.getState().failed.some(f => f.id === id)) useOutbox.getState().update(id, { sending: false, error: describeRequestError(error) });
+      if (useOutbox.getState().failed.some(f => f.id === id)) {
+        // Final answers: the card then says what is known instead of offering a retry that cannot work.
+        useOutbox.getState().update(id, { sending: false, retrying: false, reason: sendFailureReason(error),
+          ...(error instanceof DeliveryUnknownError ? { unknown: true } : {}),
+          ...(error instanceof AttachmentsGoneError ? { attachmentMetadata: [] } : {}) });
+      }
       return false;
     } finally { if (id !== undefined && this.sendAttempts.get(id) === attempt) this.sendAttempts.delete(id); }
   }
 
-  private async deliver(m: Omit<Extract<FailedSend, { target: ChatTarget }>, "id" | "error" | "serverKey">): Promise<boolean> {
+  /** Sends a plaintext message; a failure becomes (or, with `retryId`, updates) its card. A retry signs
+   *  the same message ID and creation time, so a server that already stored it answers `conflict`. */
+  private async deliver(m: Omit<Extract<FailedSend, { target: ChatTarget }>, "id" | "reason" | "serverKey">, retryId?: number): Promise<boolean> {
     let bound: ReturnType<Controller["bind"]> | undefined;
+    const identity = m.identity ?? { message_id: encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))), created_at: Date.now() };
+    const sentIds = [...new Set([...m.sentIds ?? [], identity.message_id])];
     try {
       bound = this.bind();
       const conn = bound.conn;
@@ -2214,7 +2243,7 @@ class Controller {
         if ((upload?.conn !== conn && conn instanceof Connection) || upload?.att.sealed) throw new Error("unknown upload");
         return upload?.att as Attachment;
       });
-      const signature = await this.signChat(m.target, m.text, m.mentions ?? [], attachments, undefined, conn);
+      const signature = await this.signChat(m.target, m.text, m.mentions ?? [], attachments, undefined, conn, identity);
       bound.check();
       await conn.request("chat.send", {
         signature,
@@ -2224,24 +2253,60 @@ class Controller {
         ...(m.attachments ? { attachments: m.attachments } : {}),
       });
       for (const id of m.attachments ?? []) this.uploaded.delete(id);
+      if (retryId !== undefined) useOutbox.getState().remove(retryId);
       return true;
     } catch (e) {
       // A draft whose session has ended belongs to no thread here: it is dropped, never kept for another server.
-      if (bound && !bound.current()) return false;
-      const locked = e instanceof RequestError && e.code === "forbidden" && typeof m.target === "object" && "channel" in m.target;
-      useOutbox.getState().add({ ...m, serverKey: bound?.conn.serverKey ?? null, error: locked ? tNow("chat.locked") : describeRequestError(e) });
+      if (bound && !bound.current()) { if (retryId !== undefined) useOutbox.getState().remove(retryId); return false; }
+      const channel = typeof m.target === "object" && "channel" in m.target ? m.target.channel : null;
+      const client = typeof m.target === "object" && "client" in m.target;
+      // Only a retry that signed the earlier attempt's identity again can be answered as a duplicate of it:
+      // the server keeps every message ID it stored, so that answer means the lost attempt was delivered.
+      const reused = retryId !== undefined && m.identity !== undefined;
+      if (reused && e instanceof RequestError && e.code === "conflict") {
+        for (const id of m.attachments ?? []) this.uploaded.delete(id);
+        useOutbox.getState().remove(retryId);
+        return true;
+      }
+      // The server checks uploads before the identity: once an earlier attempt was stored, its files are no
+      // longer free, so a retry hears "not found". The channel's history tells whether one of them arrived,
+      // under whichever ID it was signed (a retry past the signing window has a new one).
+      if (retryId !== undefined && m.sentIds?.length && channel !== null && m.attachments?.length && e instanceof RequestError && e.code === "not_found") {
+        const found = await this.storedSend(bound!.conn, channel, m.sentIds).catch(() => null);
+        // The session ended meanwhile: like any failure of an ended session, the draft is dropped.
+        if (!bound!.current()) { useOutbox.getState().remove(retryId); return found === true; }
+        if (!useOutbox.getState().failed.some(f => f.id === retryId)) return found === true;
+        if (found) { for (const id of m.attachments) this.uploaded.delete(id); useOutbox.getState().remove(retryId); return true; }
+        useOutbox.getState().update(retryId, { retrying: false, unknown: found === false, reason: undefined, identity, sentIds });
+        return false;
+      }
+      // Dismissed while it was being sent: it stays dismissed.
+      if (retryId !== undefined && !useOutbox.getState().failed.some(f => f.id === retryId)) return false;
+      const reason: Key | undefined = e instanceof RequestError && e.code === "forbidden" && channel !== null ? "chat.locked"
+        : e instanceof RequestError && e.code === "not_found" && client ? "chat.failed.peerOffline" : sendFailureReason(e);
+      if (retryId !== undefined) useOutbox.getState().update(retryId, { identity, sentIds, reason, retrying: false });
+      else useOutbox.getState().add({ ...m, identity, sentIds, serverKey: bound?.conn.serverKey ?? null, reason });
       return false;
     }
   }
 
+  /** Whether my message with one of these identities is in a channel's newest history page; when it is not
+   *  there, it may still be older or have been removed. */
+  private async storedSend(conn: Link, channel: number, messageIds: string[]): Promise<boolean> {
+    const me = useSession.getState().me?.uid;
+    const page = await conn.request("chat.history", { channel, limit: HISTORY_PAGE });
+    return page.messages.some(msg => msg.author_uid === me && !!msg.signature && messageIds.includes(msg.signature.message_id));
+  }
+
   async retrySend(id: number, fresh = false): Promise<void> {
     const item = useOutbox.getState().failed.find(f => f.id === id);
-    if (!item || item.sending || this.sendAttempts.has(id)) return;
+    if (!item || item.sending || item.retrying || item.unknown || this.sendAttempts.has(id)) return;
     if (item.serverKey !== (this.conn?.serverKey ?? null)) { if (!item.sealed) useOutbox.getState().remove(id); useUi.getState().toast("error", tNow("err.req.lost")); return; }
     if (item.sealed) {
       if (item.authorUid && item.authorUid !== useSession.getState().me?.uid) return;
       if (item.session !== this.sendSession && !fresh) return;
       const attempt = new AbortController(); this.sendAttempts.set(id, attempt);
+      useOutbox.getState().update(id, { retrying: true });
       try {
         const bound = this.bind(), sealed = this.sealed;
         if (!sealed) return;
@@ -2256,17 +2321,34 @@ class Controller {
         if (!currentAttempt() || !useOutbox.getState().failed.some(f => f.id === id)) return;
         await this.deliverSealed(item, id, undefined, attempt);
       } catch { /* Keep the existing card for another explicit attempt. */ }
-      finally { if (this.sendAttempts.get(id) === attempt) this.sendAttempts.delete(id); }
+      finally {
+        if (this.sendAttempts.get(id) === attempt) this.sendAttempts.delete(id);
+        if (!this.sendAttempts.has(id)) useOutbox.getState().update(id, { retrying: false });
+      }
       return;
     }
-    useOutbox.getState().remove(id);
     let target = item.target;
     if (item.dmUid) {
       const peer = Object.values(useSession.getState().clients).find(c => c.uid === item.dmUid);
-      if (!peer) { useOutbox.getState().add({ ...item, error: tNow("chat.peerOffline") }); return; }
+      if (!peer) { useOutbox.getState().update(id, { reason: "chat.failed.peerOffline" }); return; }
       target = { client: peer.id };
     }
-    await this.deliver({ thread: item.thread, at: item.at, target, text: item.text, mentions: item.mentions, attachments: item.attachments, dmUid: item.dmUid });
+    // An earlier attempt whose answer was lost may already be on screen, under any ID signed for it.
+    const me = useSession.getState().me?.uid;
+    const sentIds = item.sentIds ?? (item.identity ? [item.identity.message_id] : []);
+    if (me && useSession.getState().threads[item.thread]?.items.some(i => i.kind === "msg" && i.msg.author_uid === me
+      && !!i.msg.signature && sentIds.includes(i.msg.signature.message_id))) { useOutbox.getState().remove(id); return; }
+    // The server accepts a signature made within 5 minutes; past that, the same ID cannot be signed again
+    // and the retry is a new message.
+    const identity = item.identity && Date.now() - item.identity.created_at < PLAIN_RETRY_WINDOW_MS ? item.identity : undefined;
+    useOutbox.getState().update(id, { retrying: true });
+    try {
+      await this.deliver({ thread: item.thread, at: item.at, target, text: item.text, mentions: item.mentions, attachments: item.attachments,
+        dmUid: item.dmUid, identity, sentIds }, id);
+    } finally {
+      // Whatever ended the attempt, a card that is still shown can be retried again.
+      useOutbox.getState().update(id, { retrying: false });
+    }
   }
 
   dismissSend(id: number): void {
