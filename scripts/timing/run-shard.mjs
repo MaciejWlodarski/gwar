@@ -6,7 +6,7 @@
  *
  *   node run-shard.mjs PLAN.json SHARD OUT_DIR       (from the root of the measured checkout)
  *
- * TIMING_MAX_LOAD_PER_CPU (default 3): a 1-minute load average above this many per CPU, at any
+ * TIMING_MAX_LOAD_PER_CPU (default 2): a 1-minute load average above this many per CPU, at any
  *   sample during the run, voids it. TIMING_MAX_STEAL (default 0.05): CPU time taken by the
  *   hypervisor, as a share of the run's CPU time, above this voids it.
  */
@@ -26,7 +26,7 @@ if (!shard) throw new Error(`no shard ${shardArg} in the plan`);
 const repoRoot = process.cwd();
 const script = path.join(repoRoot, "apps/web/e2e/share-sync.mjs");
 if (!existsSync(script)) throw new Error(`${script} is missing: this ref has no lip-sync kit`);
-const maxLoadPerCpu = Number(process.env.TIMING_MAX_LOAD_PER_CPU ?? 3);
+const maxLoadPerCpu = Number(process.env.TIMING_MAX_LOAD_PER_CPU ?? 2);
 const maxSteal = Number(process.env.TIMING_MAX_STEAL ?? 0.05);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 

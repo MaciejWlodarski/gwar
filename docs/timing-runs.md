@@ -71,17 +71,20 @@ Arms: `off` (`SYNC_OFF=1`, main's playback), `on`, `nofilter` (`SYNC_NOFILTER=1`
 4. `aggregate` builds the table from every shard's records, even when a shard failed.
 
 A run is **invalid**, kept with its reasons and left out of the table, when share-sync failed or
-timed out, when the 1-minute load peaked above 3 per CPU (`TIMING_MAX_LOAD_PER_CPU`), when the
+timed out, when the 1-minute load peaked above 2 per CPU (`TIMING_MAX_LOAD_PER_CPU`; a valid run peaks
+near 1 per CPU), when the
 hypervisor took over 5% of the CPU time (`TIMING_MAX_STEAL`), or when the relay could not send
 datagrams. The "Invalid and missing runs" table lists them.
 
 ## How long it takes
 
-Setup is about 10 to 15 minutes before the first run: the release build of the two binaries with
-a warm cache, the wasm packages, then each shard's apt, browser and pnpm install. A run then takes
-its watch plus about a minute and a half (the web app's build, the joins, the teardown). For
-example rows=4, arms=2, runs=8 is 64 runs in 32 blocks over 20 shards, at most 2 blocks (4 runs of
-45 s) per shard: about 25 to 30 minutes in all, against about 2 hours in series on the Mac.
+Measured in the validation run below: `plan` 12 s; `native` 5.5 min with a cold Rust cache
+(less once this workflow's cache is warm); `wasm` 15 s when the commit's CI artifacts still exist
+(a cold build of both packages takes about 15 minutes, in parallel with `native`); each shard about
+1.5 minutes of setup (apt, pnpm, browsers); a run of 45 s about 57 s, of 30 s about 42 s. So
+rows=4, arms=2, runs=8 (64 runs in 32 blocks, at most 2 blocks of 2 runs per shard over 20 shards)
+takes about 12 to 15 minutes from dispatch to table, against about 1.5 hours in series on the Mac,
+as long as 20 jobs can start at once.
 
 ## Reading the table
 
@@ -126,5 +129,8 @@ Check the viewers' `granted` against the stall in the raw reports when that row 
 
 The workflow was validated before it merged, from a temporary branch whose only extra commit gave it
 a `push` trigger (a `workflow_dispatch` workflow can only be dispatched once it is on the default
-branch): `ref=screen/share-sound-sync`, `rows=j10`, `arms=off,on`, `runs=2`, `viewers=browser`,
-2 shards.
+branch), since deleted: [run 42015282056](https://github.com/MaciejWlodarski/gwar/actions/runs/42015282056),
+`ref=screen/share-sound-sync` (`f987ed68`), `rows=j10`, `arms=off,on`, `runs=2`, `viewers=browser`,
+2 shards, 9 min 42 s in all. All 4 runs were valid; the runners were an AMD EPYC 7763 and an EPYC
+9V74, 4 CPUs each, with peak loads of 3.1 to 3.8, 43 to 55% busy and no steal. Two runs per arm show
+that the pipeline works, not a result: the permutation p cannot go below 0.33 with them.
