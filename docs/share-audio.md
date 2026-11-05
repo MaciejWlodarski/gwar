@@ -274,8 +274,13 @@ apart, for a machine that has just woken; after that, or if the OS withdrew perm
 share goes on without sound and Details says why.
 
 The clocks differ across sleep: macOS's stops, so a nap may not reach the five seconds, while
-Windows's runs, so waking there pauses first and resumes on the next read. A capture the OS itself
-ended stays ended: on macOS the user can stop it from the menu bar, and that must not come back.
+Windows's runs, so waking there pauses first and resumes on the next read. A capture the user
+ended through the OS stays ended: on macOS they can stop it from the menu bar (or decline it),
+and that must not come back. Any other ending the OS reports, such as a device or audio service
+that went away, keeps the consent and pauses the capture like a stall, so it resumes the same
+way; a stream that fails again within two seconds of its start ends the capture instead of
+restarting in a loop. Windows's process loopback has no control of the user's, so every ending
+there is of this kind.
 Every restart of a share carries the same consent, so a stop that arrives late, from a stream
 already replaced, ends the one running now. Its sound stops being passed on at once, and the OS
 stream within a second. A newer share has its own consent. Only a stream that came up can end

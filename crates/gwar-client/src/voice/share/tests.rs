@@ -184,8 +184,44 @@ fn delay_stays_in_its_bounds_and_follows_late_arrivals() {
     assert_eq!(jitter.delay(), MIN_DELAY);
     jitter.observe(10 * 960, start + Duration::from_millis(200 + 50));
     assert!(jitter.delay() > Duration::from_millis(100));
-    jitter.observe(11 * 960, start + Duration::from_secs(10));
+    // Late, but not so late that the stream must have started over: see `DISCONTINUITY`.
+    jitter.observe(11 * 960, start + Duration::from_millis(220 + 200));
     assert_eq!(jitter.delay(), MAX_DELAY);
+}
+
+/// The server keeps share sound's RTP time contiguous across a pause in the sound
+/// (gwar-server's media/screen/audio.rs), so the first packet after one arrives seconds after its
+/// predecessor for 20 ms of RTP time. That is a new start, not jitter: the delay must not grow.
+#[test]
+fn a_pause_in_the_sound_does_not_hold_it_behind_the_picture() {
+    let (mut worker, bus, playout) = worker();
+    let mut encoder = encoder();
+    playout.open(0, 1, 1.0);
+    let at = Instant::now();
+    feed(&mut worker, &mut encoder, (0, 1), 0, 50, (440.0, 440.0), at);
+    drain(&mut worker, &bus, 150);
+    let stream = worker.streams[0].as_ref().unwrap();
+    assert!(!stream.jitter.started, "the queue ran dry and the stream started over");
+    assert_eq!(stream.jitter.delay(), MIN_DELAY);
+    feed(&mut worker, &mut encoder, (0, 1), 50, 50, (440.0, 440.0), at + Duration::from_secs(3));
+    let (left, _) = drain(&mut worker, &bus, 60);
+    let stream = worker.streams[0].as_ref().unwrap();
+    assert_eq!(stream.jitter.delay(), MIN_DELAY, "the pause became 'jitter'");
+    assert!(rms(&left[left.len() - 4800..]) > 0.05, "and the sound came back");
+}
+
+/// The same pause while sound was still queued, so the stream never started over.
+#[test]
+fn an_arrival_long_after_its_predecessor_is_not_jitter() {
+    let mut jitter = Jitter::new();
+    let start = Instant::now();
+    for n in 0..10u32 {
+        jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+    }
+    jitter.observe(10 * 960, start + Duration::from_secs(3));
+    assert_eq!(jitter.delay(), MIN_DELAY);
+    jitter.observe(11 * 960, start + Duration::from_secs(3) + Duration::from_millis(20));
+    assert_eq!(jitter.delay(), MIN_DELAY, "it starts a new stretch");
 }
 
 #[test]
@@ -327,8 +363,8 @@ fn a_full_frame_queue_cannot_lose_a_replacement() {
     }
     assert!(playout.stats().input_drops > 0, "the queue really was full");
     assert!(playout.open(0, 2, 1.0), "the replacement is in force");
-    while let Ok((frame, arrived)) = worker.inbox.try_recv() {
-        worker.receive(frame, arrived);
+    while let Ok(message) = worker.inbox.try_recv() {
+        worker.take(message);
     }
     assert_eq!(worker.streams[0].as_ref().map(|stream| stream.run), Some(2));
     assert!(worker.streams[0].as_ref().unwrap().jitter.queue.is_empty(), "the old run's backlog stays out");
@@ -440,6 +476,47 @@ fn the_thread_serves_a_real_stream_and_drops_rather_than_blocks() {
     assert_eq!(stats.frames, 20_001);
     assert!(stats.input_drops > 0 || stats.late_drops > 0);
     assert!(playout.bus().active());
+}
+
+/// With nothing open the share thread has nothing to do until a frame or a command comes, and
+/// it lives as long as the page: it must sleep, not wake every few milliseconds.
+#[test]
+fn an_idle_share_thread_sleeps_and_a_command_wakes_it() {
+    let playout = SharePlayout::new().unwrap();
+    let wakeups = || playout.counters.wakeups.load(Ordering::Relaxed);
+    sleep(Duration::from_millis(200));
+    assert!(wakeups() <= 1, "woke {} times with nothing open", wakeups());
+    assert!(playout.open(0, 1, 1.0));
+    let started = Instant::now();
+    while !playout.bus().active() && started.elapsed() < Duration::from_secs(2) {
+        sleep(Duration::from_millis(1));
+    }
+    assert!(playout.bus().active(), "an open command alone wakes it");
+    let serving = wakeups();
+    sleep(Duration::from_millis(100));
+    assert!(wakeups() >= serving + 5, "it tops the ring up while a stream is open");
+    assert!(playout.close(0, 1));
+    sleep(Duration::from_millis(50));
+    let closed = wakeups();
+    sleep(Duration::from_millis(200));
+    assert!(wakeups() <= closed + 1, "and sleeps again once it is closed: {} wakeups", wakeups() - closed);
+}
+
+#[tokio::test]
+async fn an_interrupted_stream_keeps_its_consent_and_a_failed_start_is_only_closed() {
+    let queue = Arc::new(CaptureQueue::default());
+    queue.stream_interrupted();
+    assert!(queue.is_closed() && !queue.was_interrupted(), "it never came up: a failed start");
+    let queue = Arc::new(CaptureQueue::default());
+    assert!(queue.adopt());
+    queue.stream_started();
+    queue.stream_interrupted();
+    assert!(queue.is_closed() && queue.was_interrupted());
+    assert!(!queue.was_ended_by_system(), "a lost device is not the user taking the sound back");
+    let again = queue.restarted();
+    assert!(again.adopt(), "the same share may capture again");
+    again.write(&[0.5, -0.5]);
+    assert_eq!(again.read(Duration::from_millis(5)).await, [0.5, -0.5]);
 }
 
 #[tokio::test]

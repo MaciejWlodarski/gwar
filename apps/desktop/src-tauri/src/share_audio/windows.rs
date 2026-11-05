@@ -276,11 +276,13 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
             if let Err(error) = capture(&queue, &flag, stop_event, opened) {
                 tracing::warn!("share sound stopped: {error}");
             }
-            // Gwar's own stop can still come back; an ending it did not ask for cannot.
+            // Process loopback has no control of the user's to stop it: an ending Gwar did not
+            // ask for is technical (a device went away, the audio service restarted), and the
+            // share may capture again.
             if flag.load(Ordering::Relaxed) {
                 queue.close();
             } else {
-                queue.stream_ended();
+                queue.stream_interrupted();
             }
             if joined {
                 // SAFETY: this thread initialized COM above.
