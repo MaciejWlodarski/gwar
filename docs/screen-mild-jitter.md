@@ -53,8 +53,8 @@ Main, 12 runs per row (6 seeds × 2 cadences):
 
 "Plan below the share" is the time the originals budget, `PLAN` = 0.8 × estimate, was
 below the share's rate. Both it and the lowest estimate are sampled every 100 ms, so the
-true lowest estimate can be lower still. The worst single runs kept 19, 30 and 31 of 60 seconds whole
-(seed 4, 5 Mb/s at a 10 ms cadence; seed 42 and seed 5, 4 Mb/s at 5 ms).
+true lowest estimate can be lower still. The worst single runs kept 19, 30 and 31 of 60
+seconds whole (seed 4, 5 Mb/s at a 10 ms cadence; seed 42 and seed 5, 4 Mb/s at 5 ms).
 
 ## Root cause: probes misread as saturated
 
@@ -239,7 +239,7 @@ vendored str0m and `egress.rs`. On a later main, apply it with `git apply --3way
 git apply --3way docs/data/mild-jitter/experiment.patch
 GWAR_BWE_VARIANT=3 CARGO_BUILD_JOBS=2 nice -n 19 cargo test --release -p gwar-server --lib steady_jitter_matrix -- --ignored --nocapture
 GWAR_BWE_VARIANT=3 CARGO_BUILD_JOBS=2 nice -n 19 cargo test --release -p gwar-server --lib drop_sweep -- --ignored --nocapture
-git apply -R docs/data/mild-jitter/experiment.patch
+git apply -R --index docs/data/mild-jitter/experiment.patch
 ```
 
 Each switch is off unless `GWAR_BWE_VARIANT` selects it. With only the patch's trace
