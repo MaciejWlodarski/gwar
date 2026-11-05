@@ -1065,7 +1065,10 @@ mod tests {
         assert_ne!(link.jitter_value, draw, "a fresh draw after the hold");
     }
 
-    fn jitter_case(seed: u64, cadence: u32, jitter: u32, hold: u32, bitrate: u64, key: usize) -> serde_json::Value {
+    /// A viewer behind a downlink with no rate limit, 20 ms of propagation and `jitter` of
+    /// signed uniform delay, one draw per `hold` (zero: per packet), order kept, as the netem
+    /// `keep_order` profile; the SFU runs every `cadence` ms.
+    fn jittery_sim(seed: u64, cadence: u32, jitter: u32, hold: u32) -> Sim {
         let mut sim = Sim::with_seed(None, seed);
         sim.server_interval = cadence * MS;
         sim.up.delay = Duration::ZERO;
@@ -1074,6 +1077,11 @@ mod tests {
         sim.down.jitter_hold = hold * MS;
         sim.down.keep_order = true;
         sim.down.jitter_seed = seed;
+        sim
+    }
+
+    fn jitter_case(seed: u64, cadence: u32, jitter: u32, hold: u32, bitrate: u64, key: usize) -> serde_json::Value {
+        let mut sim = jittery_sim(seed, cadence, jitter, hold);
         sim.join("jitter", bitrate, 60, key, 8_000_000);
         sim.run(60 * SECOND);
         let mut paused = None;
@@ -1120,6 +1128,69 @@ mod tests {
                         let picture = jitter_case(seed, cadence, jitter, hold, bitrate, key);
                         println!(
                             "JITTER {}",
+                            serde_json::json!({"seed": seed, "cadence": cadence,
+                            "jitter_ms": jitter, "hold_ms": hold, "bitrate": bitrate, "key": key,
+                            "picture": picture})
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A steady share already running when the viewer joins, on a 20 ms link with `jitter` of
+    /// signed uniform delay (`hold` between draws, order kept), observed for 60 s
+    /// (docs/screen-mild-jitter.md). A second is whole when the SFU evicted, refused and failed
+    /// nothing in it and the slot was not paused at its end. The estimate and plan are sampled
+    /// every 100 ms, so the lowest estimate reported is an upper bound on the true lowest.
+    fn steady_jitter_case(
+        seed: u64,
+        cadence: u32,
+        jitter: u32,
+        hold: u32,
+        bitrate: u64,
+        key: usize,
+    ) -> serde_json::Value {
+        let mut sim = jittery_sim(seed, cadence, jitter, hold);
+        sim.join("steady", bitrate, 60, key, 8_000_000);
+        let mut whole = 0;
+        let mut min_estimate = u64::MAX;
+        let mut plan_below_share = Duration::ZERO;
+        for _ in 0..60 {
+            let before = sim.w.egress.counters;
+            for _ in 0..10 {
+                sim.run(100 * MS);
+                min_estimate = min_estimate.min(sim.w.egress.estimate());
+                if sim.w.egress.plan() < bitrate as f64 {
+                    plan_below_share += 100 * MS;
+                }
+            }
+            let c = sim.w.egress.counters;
+            let clean = (c.evicted, c.rejected, c.failed_keyframes)
+                == (before.evicted, before.rejected, before.failed_keyframes);
+            whole += u32::from(clean && sim.paused(0).is_none());
+        }
+        let c = sim.w.egress.counters;
+        serde_json::json!({"whole_s": whole, "plan_below_share_ms": plan_below_share.as_millis() as u64,
+            "min_estimate_kbps": min_estimate / 1000, "evicted": c.evicted,
+            "failed_keyframes": c.failed_keyframes, "pauses": pauses(&sim, 0).len(),
+            "final_estimate_kbps": sim.w.egress.estimate() / 1000})
+    }
+
+    /// Steady shares behind a mild-jitter link next to the same link without jitter; one JSON
+    /// line per case. `JITTER_SEEDS` picks seeds (default 1–5 and 42).
+    #[test]
+    #[ignore = "manual seeded mild-jitter steady-share report"]
+    fn steady_jitter_matrix() {
+        let seeds: Vec<u64> = std::env::var("JITTER_SEEDS")
+            .map_or(vec![1, 2, 3, 4, 5, 42], |s| s.split(',').map(|n| n.parse().unwrap()).collect());
+        for &seed in &seeds {
+            for cadence in [5, 10] {
+                for (jitter, hold) in [(0, 0), (5, 0), (5, 5)] {
+                    for (bitrate, key) in [(3_000_000, 32_000), (4_000_000, 150_000), (5_000_000, 150_000)] {
+                        let picture = steady_jitter_case(seed, cadence, jitter, hold, bitrate, key);
+                        println!(
+                            "STEADY {}",
                             serde_json::json!({"seed": seed, "cadence": cadence,
                             "jitter_ms": jitter, "hold_ms": hold, "bitrate": bitrate, "key": key,
                             "picture": picture})
