@@ -21,9 +21,10 @@ import { nextMediaRun } from "../voice/engine";
 import { applyCaptureSpec, captureScreen, captureSupport, captureTabSound, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
 import { defaultShareAudio } from "../voice/share-audio";
 import { computerSoundSupport, ComputerSound, shareSoundReceivable, ShareSoundReceiver, type ComputerSoundState, type ShareSoundLink } from "../voice/share-sound";
+import { PictureSync } from "../voice/share-sync";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
-import { useSession, useUi } from "./stores";
+import { useSession, useUi, useVoice } from "./stores";
 
 /** Why this device cannot share here, or "ok". */
 export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak" | "encrypted" | "forbidden";
@@ -36,6 +37,8 @@ const WATCH_UNAVAILABLE_MS = 5_000;
  * or AV1 for everyone watching with this viewer.
  */
 const WATCH_FEATURE_TIMEOUT_MS = 10_000;
+/** A picture that is late stops holding the sound back: sound matters more than the picture. */
+const SOUND_HOLD_MS = 1_500;
 /** A watch's first frame must arrive within this long after its grant, across stage changes. */
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
 /** The server takes a Try again at most this long after the share's last start or retry for me, and holds an earlier one until then (`RETRY_FIRST`). */
@@ -124,6 +127,10 @@ export class ScreenController {
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
   private watchAudio = false;
+  /** The late-frame worker failed once: this session's transports go without the filter. */
+  private lateFramesFailed = false;
+  /** The desktop app's lip-sync, for as long as sound reaches the native mixer. */
+  private pictureSync: PictureSync | null = null;
   /** Desktop app: this share's computer sound, from the sharer's confirmation until it ends. */
   private sound: ComputerSound | null = null;
   /**
@@ -144,7 +151,7 @@ export class ScreenController {
   private audioTimer: ReturnType<typeof setInterval> | null = null;
   /** Owned by the grant, not by a stage/thumbnail video that can remount. */
   /** Each granted watch still waiting for its first frame; no timer while the server pauses it. */
-  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> | null }>();
+  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> | null; sound: ReturnType<typeof setTimeout> }>();
   private attempts = 0;
   private watchIds = 0;
   /** Each share's watch requests, one at a time. */
@@ -889,13 +896,23 @@ export class ScreenController {
   private expectFirstFrame(share: string, run: number, id: number): void {
     this.clearFirstFrame(id);
     const timer = setTimeout(() => this.frameFailed(share, run, id), FIRST_FRAME_TIMEOUT_MS);
-    this.firstFrameTimers.set(id, { run, timer });
+    const sound = setTimeout(() => this.releaseSound(id), SOUND_HOLD_MS);
+    this.firstFrameTimers.set(id, { run, timer, sound });
   }
 
   private clearFirstFrame(id: number): void {
     const pending = this.firstFrameTimers.get(id);
     if (pending?.timer) clearTimeout(pending.timer);
+    if (pending) clearTimeout(pending.sound);
     this.firstFrameTimers.delete(id);
+  }
+
+  /** The watch's sound starts here, so it never plays ahead of a picture that is not there yet. */
+  private releaseSound(id: number): void {
+    const watch = useScreen.getState().watches.find(w => w.id === id);
+    if (!watch?.soundHeld) return;
+    dispatch({ type: "soundReleased", id });
+    if (watch.slot !== null) this.setSoundGain(watch.share, watch.slot);
   }
 
   /**
@@ -914,6 +931,12 @@ export class ScreenController {
     }
   }
 
+  /** The link is back after a stall: the server restores this viewer's estimate as well. */
+  private frameLost(share: string, run: number, id: number): void {
+    const conn = this.link();
+    if (conn) void conn.request("screen.stalled", { share }).catch(() => this.requestFrame(share, run, id));
+  }
+
   /** A warm receiver can need a keyframe for its newly initialized media player. */
   requestFrame(share: string, run: number, id: number): void {
     const screen = useScreen.getState();
@@ -926,6 +949,7 @@ export class ScreenController {
     const screen = useScreen.getState();
     if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
     if (this.firstFrameTimers.get(id)?.run === run) this.clearFirstFrame(id);
+    this.releaseSound(id);
     this.watchRecoveries = 0;
   }
 
@@ -974,7 +998,7 @@ export class ScreenController {
 
   private soundGain(share: string): number {
     const { volume, muted } = useSettings.getState().shareAudio[share] ?? defaultShareAudio;
-    return muted ? 0 : volume;
+    return muted || useScreen.getState().watches.some(w => w.share === share && w.soundHeld) ? 0 : volume;
   }
 
   /** The player of a watch with confirmed sound; its controls appear only if this succeeds. */
@@ -986,6 +1010,7 @@ export class ScreenController {
   }
 
   closeSound(id: number, slot: number): void {
+    this.pictureSync?.release(slot);
     this.receiver?.closeSlot(slot);
     dispatch({ type: "watchSound", id, ready: false });
   }
@@ -998,6 +1023,14 @@ export class ScreenController {
     // No answer says nothing about the share, and a stalled page would drop its player for it.
     const audio = await conn.request("screen.audio.state", { share, stopped: false }, { timeoutMs: 1_500 }).then(r => r.audio).catch(() => null);
     if (audio !== null && this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share && w.status === "watching")) dispatch({ type: "watchAudio", run, id, audio });
+  }
+
+  /** One look at every watch with sound that can be heard here. */
+  private syncPictures(): void {
+    const deafened = useVoice.getState().deafened;
+    const native = this.receiver !== null;
+    void this.pictureSync?.tick(useScreen.getState().watches.flatMap(w => w.status === "watching" && w.slot !== null && (native ? w.soundReady : w.audio)
+      ? [{ share: w.share, slot: w.slot, heard: !deafened && this.soundGain(w.share) > 0, paused: w.paused !== undefined }] : []));
   }
 
   /** The session's watch transport, negotiated on the first watch and kept; resolves to its run once connected. */
@@ -1038,7 +1071,23 @@ export class ScreenController {
         const link = native && server && await shareSoundReceivable() ? await this.soundLink()?.catch(() => null) : null;
         const enabled = native ? !!link : server;
         if (this.transport !== transport) return enabled;
-        if (link) this.receiver = new ShareSoundReceiver(link, run);
+        const receiver = link ? new ShareSoundReceiver(link, run) : null;
+        if (receiver) this.receiver = receiver;
+        // Only where sound leaves the webview: a browser's own sync lines its picture and sound up,
+        // and a second controller on the same pair, waiting on one noisy look, only disturbed it
+        // (Opus review r1, S12). There the late-frame filter does a stall's part.
+        if (receiver) this.pictureSync = new PictureSync({
+          association: share => conn.request("screen.audio.sync", { share }, { timeoutMs: 1_000 }),
+          sound: async slot => receiver.clock(slot),
+          picture: slot => transport.pictureClock(slot),
+          shown: slot => transport.pictureDelay(slot),
+          wait: (slot, waits) => {
+            transport.setPictureWait(slot, waits.picture);
+            receiver.hold(slot, waits.sound);
+          },
+          soundWaits: true,
+          now: () => Date.now(),
+        });
         this.watchAudio = enabled;
         return enabled;
       },
@@ -1066,8 +1115,29 @@ export class ScreenController {
           settle.resolve(run);
           if (this.watchAudio && !this.audioTimer) this.audioTimer = setInterval(() => {
             for (const w of useScreen.getState().watches) if (w.status === "watching") void this.refreshAudio(conn, run, w.id, w.share);
+            this.syncPictures();
           }, 1_000);
         }
+      },
+      frameLost: slot => {
+        const watch = useScreen.getState().watches.find(w => w.slot === slot);
+        if (watch && this.transport === transport) {
+          this.pictureSync?.linkBack(slot);
+          this.frameLost(watch.share, run, watch.id);
+        }
+      },
+      skipLateFrames: this.lateFramesFailed,
+      lateFramesFailed: () => {
+        this.lateFramesFailed = true;
+        if (this.transport !== transport) return;
+        // The engine does not play a receiver again once its transform is off: as after a
+        // failure, a new transport, which starts without the filter, picks every watch up
+        // again, but at once and with no notice (Opus review r2, S18).
+        const watches = useScreen.getState().watches;
+        dispatch({ type: "transport", run, phase: "failed" });
+        this.dropTransport();
+        for (const watch of watches) this.waitForWatch(watch.id);
+        this.resumeWatches();
       },
       decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
@@ -1103,9 +1173,10 @@ export class ScreenController {
     if (this.audioTimer) clearInterval(this.audioTimer);
     this.audioTimer = null;
     this.watchAudio = false;
+    this.pictureSync = null;
     this.receiver?.close();
     this.receiver = null;
-    for (const { timer } of this.firstFrameTimers.values()) if (timer) clearTimeout(timer);
+    for (const { timer, sound } of this.firstFrameTimers.values()) { if (timer) clearTimeout(timer); clearTimeout(sound); }
     this.firstFrameTimers.clear();
     // A new watch transport starts its spacing over.
     this.lastStart = null;

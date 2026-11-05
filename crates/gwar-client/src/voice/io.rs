@@ -60,6 +60,8 @@ pub struct OutputTiming {
     pub(crate) callback_peak: AtomicUsize,
     pub(crate) callback_max_samples: AtomicUsize,
     pub(crate) headroom_samples: AtomicUsize,
+    /// How long after its callback the device says the sound comes out, in 48 kHz samples.
+    pub(crate) device_latency_samples: AtomicUsize,
     pub(crate) playing: AtomicBool,
     pub(crate) underruns: AtomicU64,
     pub(crate) capture_overflow_samples: AtomicU64,
@@ -835,13 +837,17 @@ fn open_output(
     let mut to_device = ToDevice::new(config.sample_rate());
     let stream = device.build_output_stream(
         config.config(),
-        move |data: &mut [f32], _| {
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
             let frames = data.len() / channels;
             // A stream opened beside the playing one stays silent until it takes over.
             if active.load(Ordering::Acquire) != id {
                 data.fill(0.0);
                 return;
             }
+            let moment = info.timestamp();
+            let ahead = moment.playback.duration_since(moment.callback);
+            let samples = (ahead.as_secs_f64() * RATE as f64) as usize;
+            timing.device_latency_samples.store(samples, Ordering::Relaxed);
             if let Some(mut speaker_rx) = try_lock(&speaker) {
                 to_device.fill(&mut speaker_rx, frames);
             }

@@ -9,6 +9,7 @@
 //! stdout: {"id", "ok"} | {"id", "error"} replies and {"event", "payload"} events
 //! Test-only command `snapshot {frequency}` reports the speaker's recent tone. Share sound uses
 //! the real playout and capture queue; the "computer" plays a 997 Hz tone, `share_stats` counts.
+//! `speaker_onsets` returns when sound started at the speaker after a silence, in Unix milliseconds.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -18,7 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -43,11 +44,15 @@ const BLOCK: usize = 480;
 const WINDOW: usize = 4096;
 /// The tone the fixture's "computer" plays while a share captures its sound.
 const COMPUTER_TONE: f64 = 997.0;
+/// A burst starts after this many quiet samples, and above this level.
+const ONSET_QUIET: usize = RATE * 60 / 1000;
+const ONSET_LEVEL: f32 = 0.02;
 
 struct ToneIo {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
     computer: ComputerLog,
+    onsets: Arc<Mutex<Vec<f64>>>,
     from_ring: Arc<AtomicU64>,
 }
 
@@ -79,7 +84,9 @@ impl AudioIo for ToneIo {
         let thread = thread::Builder::new().name("native-bridge-audio".into()).spawn(move || {
             let epoch = Instant::now();
             let mut position = 0u64;
+            let mut quiet = 0usize;
             while !thread_stop.load(Ordering::Relaxed) {
+                let block_at = unix_ms();
                 let mut missing = 0;
                 let mut block = Vec::with_capacity(BLOCK);
                 for i in 0..BLOCK {
@@ -97,6 +104,16 @@ impl AudioIo for ToneIo {
                         },
                         mono,
                     ));
+                }
+                for (i, sample) in block.iter().enumerate() {
+                    if sample.abs() < ONSET_LEVEL {
+                        quiet += 1;
+                        continue;
+                    }
+                    if quiet >= ONSET_QUIET {
+                        self.onsets.lock().unwrap().push(block_at + i as f64 * 1000.0 / RATE as f64);
+                    }
+                    quiet = 0;
                 }
                 self.from_ring.fetch_add((BLOCK - missing) as u64, Ordering::Relaxed);
                 if let Some(log) = self.computer.lock().unwrap().as_mut() {
@@ -119,6 +136,10 @@ impl AudioIo for ToneIo {
         })?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
+}
+
+fn unix_ms() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1000.0
 }
 
 /// One tone's amplitude in a block, windowed so that a voice beside it does not leak in.
@@ -160,6 +181,7 @@ struct State {
 
 struct Bridge {
     frequency: f64,
+    onsets: Arc<Mutex<Vec<f64>>>,
     played: Arc<Mutex<VecDeque<f32>>>,
     computer: ComputerLog,
     /// Samples the speaker has taken from the voice ring.
@@ -323,6 +345,16 @@ impl Bridge {
                 self.playout()?.set_gain(slot, run, args["gain"].as_f64().context("gain")? as f32);
                 Ok(Value::Null)
             }
+            "share_playback_hold" => {
+                let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
+                self.playout()?.set_hold(slot, run, number(&args, "ms")? as u32);
+                Ok(Value::Null)
+            }
+            "share_playback_clock" => {
+                let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
+                let clock = self.playout()?.clock(slot, run);
+                Ok(clock.map_or(Value::Null, |clock| json!({ "rtpTime": clock.rtp_time, "unixMs": clock.unix_ms() })))
+            }
             "share_playback_frames" => {
                 let body: Vec<u8> = serde_json::from_value(args["body"].clone())?;
                 let (_, frames) = parse_frames(&body).context("malformed share frames")?;
@@ -338,6 +370,7 @@ impl Bridge {
                     json!({ "frames": stats.frames, "decoded": stats.decoded, "concealed": stats.concealed, "late": stats.late_drops, "backlog": stats.backlog_drops, "input": stats.input_drops, "underruns": stats.ring_underruns }),
                 )
             }
+            "speaker_onsets" => Ok(json!(self.onsets.lock().unwrap().clone())),
             "computer_log_start" => {
                 *self.computer.lock().unwrap() = Some(Vec::new());
                 Ok(Value::Null)
@@ -386,6 +419,7 @@ impl Bridge {
             frequency: self.frequency,
             played: self.played.clone(),
             computer: self.computer.clone(),
+            onsets: self.onsets.clone(),
             from_ring: self.from_ring.clone(),
         });
         let server: IpAddr = "127.0.0.1".parse()?;
@@ -455,6 +489,7 @@ async fn main() -> anyhow::Result<()> {
         frequency,
         played: Arc::default(),
         computer: Arc::default(),
+        onsets: Arc::default(),
         from_ring: Arc::default(),
         state: Mutex::default(),
         capture_clock: Arc::default(),

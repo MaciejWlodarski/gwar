@@ -259,7 +259,7 @@ try {
   server = start("server", process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server"), ["--data-dir", path.join(dataDir, "server"), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"]);
   await waitFor(() => /redeem this one-time admin token in your client: (\S+)/.test(server.output), "server", 60_000);
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(server.output)[1];
-  browser = await chromium.launch({ channel: "chromium", headless: true, args: ["--autoplay-policy=no-user-gesture-required", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`, "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"] });
+  browser = await chromium.launch({ channel: "chromium", headless: true, args: ["--autoplay-policy=no-user-gesture-required", "--disable-audio-output", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`, "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"] });
   writeFileSync(path.join(resultDir, "metadata.json"), JSON.stringify({ browser: browser.version(), platform: process.platform, seconds, uplink, dist }, null, 2));
   const admin = await device(browser, web, ws, "startup-admin");
   const channel = await admin.evaluate(async token => {

@@ -271,6 +271,10 @@ impl Drop for DataDir {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
+    // Logs only on request (`RUST_LOG`), to stderr: stdout is the run's protocol.
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    }
     let mut args = std::env::args().skip(1);
     let usage = "usage: web_latency http://127.0.0.1:PORT OUTPUT_DIR";
     let origin = args.next().context(usage)?;

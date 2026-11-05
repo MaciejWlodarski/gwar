@@ -1122,10 +1122,14 @@ impl StreamTx {
     }
 
     pub(crate) fn create_sr_and_update(&mut self, now: Instant, feedback: &mut VecDeque<Rtcp>) {
-        let sr = self.create_sender_report(now);
+        // Gwar: nothing sent has no RTP time, and a report saying zero stays in a receiver's clock
+        // estimate for its next twenty reports. The SDES below keeps the cadence.
+        if self.current_rtp_time(now).is_some() {
+            let sr = self.create_sender_report(now);
 
-        trace!("Created feedback SR: {:?}", sr);
-        feedback.push_back(Rtcp::SenderReport(sr));
+            trace!("Created feedback SR: {:?}", sr);
+            feedback.push_back(Rtcp::SenderReport(sr));
+        }
 
         if let Some(ds) = self.create_sdes() {
             feedback.push_back(Rtcp::SourceDescription(ds));
@@ -1778,6 +1782,33 @@ mod test {
 
         assert_eq!(snapshot.byte_size, 240);
         assert_eq!(snapshot.packet_count, 1);
+    }
+
+    #[test]
+    fn no_sender_report_says_anything_before_the_first_packet() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        stream.kind = Some(MediaKind::Audio);
+        stream.cname = Some("sound".into());
+        let reported = |feedback: &VecDeque<Rtcp>| feedback.iter().any(|r| matches!(r, Rtcp::SenderReport(_)));
+
+        let mut feedback = VecDeque::new();
+        stream.create_sr_and_update(now, &mut feedback);
+        assert!(!reported(&feedback));
+        assert!(!feedback.is_empty(), "the cadence stays");
+
+        // Written but not sent yet, as when a report falls due right after the first write: the
+        // clock rate comes with the first send, and there is still no RTP time to report.
+        stream.write_rtp(RtpWrite::new(111.into(), 7.into(), 48_000, now, Arc::<[u8]>::from(vec![0x10; 100])));
+        let mut feedback = VecDeque::new();
+        stream.create_sr_and_update(now, &mut feedback);
+        assert!(!reported(&feedback));
+        assert!(!feedback.is_empty(), "the cadence stays");
+
+        stream.clock_rate = Some(Frequency::FORTY_EIGHT_KHZ);
+        let mut feedback = VecDeque::new();
+        stream.create_sr_and_update(now, &mut feedback);
+        assert!(reported(&feedback));
     }
 
     #[test]

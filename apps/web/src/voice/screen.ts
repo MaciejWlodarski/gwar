@@ -8,6 +8,9 @@
  * transport (fresh DTLS and SSRCs), and the watch transport belongs to the session, with
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
+import type { MediaKind } from "./late-frames";
+import type { LateFramesReady, LinkBack } from "./late-frames-worker";
+import type { PictureClock } from "./share-sync";
 import { RtcUplinkObserver, type UplinkStatus } from "./uplink-congestion";
 import type { Av1Capability } from "../proto/Av1Capability";
 import type { H264Capability } from "../proto/H264Capability";
@@ -569,6 +572,8 @@ export class DecodeWatchdog {
   private last: number | null = null;
   private next: number | null = null;
   private reported: number | null = null;
+  /** `lost` restarted this stall: only a frame decoded since lets it do so again. */
+  private forgiven = false;
   /**
    * Reports a decoder that receives packets and decodes nothing for `DECODE_STALL_MS`, then
    * every `DECODE_REPORT_EVERY_MS` for as long as that lasts: until it decodes, packets stop, or
@@ -587,6 +592,7 @@ export class DecodeWatchdog {
    * server ignores costs it a constant-time check.
    */
   observe(now: number, packets: number, frames: number): boolean {
+    if (this.frames !== null && frames > this.frames) this.forgiven = false;
     const decoded = this.frames === null || frames > this.frames;
     const paused = this.packets !== null && packets <= this.packets;
     if (decoded || paused || (this.last !== null && now - this.last > DECODE_POLL_GAP_MS)) {
@@ -600,6 +606,20 @@ export class DecodeWatchdog {
     while (this.next <= now) this.next += DECODE_REPORT_EVERY_MS;
     this.reported = now;
     return true;
+  }
+
+  /**
+   * This viewer's late-frame filter dropped frames the SFU forwarded whole, so the decoder waits
+   * for the keyframe that `screen.stalled` asked for, and the server, which saw nothing dropped,
+   * would take a report of that wait as a decoder that cannot decode. The stall starts again at
+   * the next sample, as after a decode, but once per stall: a filter that keeps dropping (a link
+   * that keeps coming back) cannot hold off a report of a decoder that decodes nothing at all:
+   * it comes as it would have with that first drop the last.
+   */
+  lost(): void {
+    if (this.forgiven) return;
+    this.forgiven = true;
+    this.frames = null;
   }
 }
 
@@ -1584,12 +1604,28 @@ export interface WatchParams {
   /** `screen.watch.offer` with this run: the server's answer. */
   offer(sdp: string, run: number, h264?: H264Capability[], av1?: Av1Capability | null): Promise<string>;
   decodeFailed?(slot: number, share: string, generation: number): void;
+  /** Late frames were dropped: the decoder has nothing to go on until the next keyframe. */
+  frameLost?(slot: number): void;
+  /** No late-frame filter: an earlier transport's worker never ran (`lateFramesFailed`). */
+  skipLateFrames?: boolean;
+  /**
+   * The late-frame worker failed to load or crashed. Only a new transport, without the filter,
+   * plays again: Chromium decodes nothing more on a receiver whose transform was taken off.
+   */
+  lateFramesFailed?(): void;
   state(state: TransportState): void;
   /** A slot's video track arrived (once per slot and transport). */
   track(slot: number, stream: MediaStream): void;
 }
 
 export interface SlotStats { width: number; height: number; fps: number; framesDecoded: number }
+
+/**
+ * How long the late-frame worker has to load before its transforms are taken off. It counts from
+ * the worker's creation, its chunk's download included: on a link that slow the watch plays on
+ * without the filter for the session, as it would where the engine has none (review r2, S21).
+ */
+export const LATE_FRAMES_READY_MS = 2_000;
 
 /**
  * The session's watch transport: `SCREEN_SLOTS` receive-only video m-lines (one on the guest
@@ -1605,6 +1641,12 @@ export class ScreenWatchTransport {
   private pc: RTCPeerConnection | null = null;
   private transceivers: RTCRtpTransceiver[] = [];
   private audioTransceivers: RTCRtpTransceiver[] = [];
+  private heldBefore = new WeakMap<RTCRtpReceiver, { delay: number; emitted: number }>();
+  private lateFrames: Worker | null = null;
+  private lateFramesReady: ReturnType<typeof setTimeout> | null = null;
+  private lateFramesDropped = false;
+  /** The receivers whose frames the late-frame worker reads. */
+  private filtered: RTCRtpReceiver[] = [];
   private streams: MediaStream[] = [];
   private stopWatching: () => void = () => {};
   private closed = false;
@@ -1627,12 +1669,14 @@ export class ScreenWatchTransport {
       if (av1) negotiateDescriptor(transceiver, "recvonly");
       const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null };
       if ("jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = 0; } catch { /* out of range on some engines */ } }
+      this.shedLateFrames(receiver, i, "video");
       this.transceivers.push(transceiver);
       this.streams.push(new MediaStream());
       if (audio) {
         const sound = pc.addTransceiver("audio", { direction: "recvonly" });
         const transform = this.params.soundTransform?.(i);
         if (transform) sound.receiver.transform = transform;
+        else this.shedLateFrames(sound.receiver, i, "audio");
         this.audioTransceivers.push(sound);
       }
     }
@@ -1656,6 +1700,59 @@ export class ScreenWatchTransport {
     if (this.closed) return;
     this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     if (!this.closed && this.params.decodeFailed) this.decodeTimer = setInterval(() => void this.checkDecode(), 1000);
+  }
+
+  /** Late frames go before the receiver sees them, where the engine lets anything sit there. */
+  private shedLateFrames(receiver: RTCRtpReceiver, slot: number, kind: MediaKind): void {
+    if (this.params.skipLateFrames || this.lateFramesDropped || typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return;
+    try {
+      this.lateFrames ??= this.startLateFrames();
+      receiver.transform = new RTCRtpScriptTransform(this.lateFrames, { slot, kind });
+      this.filtered.push(receiver);
+    } catch { /* it plays as it would have */ }
+  }
+
+  /**
+   * A worker that never loads (a missing chunk, a policy, a module error) or crashes leaves every
+   * transform it was given unread, picture and sound alike, with nothing said. So it must say it
+   * loaded within `LATE_FRAMES_READY_MS`, and an error at any time takes the filter off.
+   */
+  private startLateFrames(): Worker {
+    const worker = new Worker(new URL("./late-frames-worker.ts", import.meta.url), { type: "module", name: "gwar-late-frames" });
+    worker.onmessage = (event: MessageEvent<LinkBack | LateFramesReady>) => {
+      if (this.closed || this.lateFrames !== worker) return;
+      if ("ready" in event.data) {
+        if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
+        this.lateFramesReady = null;
+        return;
+      }
+      const { slot, kind } = event.data;
+      // Only the picture's link-back asks for a keyframe and the estimate back.
+      if (kind !== "video") return;
+      this.watchdogs.get(slot)?.watchdog.lost();
+      this.params.frameLost?.(slot);
+    };
+    worker.onerror = () => { if (this.lateFrames === worker) this.dropLateFrames(); };
+    this.lateFramesReady = setTimeout(() => this.dropLateFrames(), LATE_FRAMES_READY_MS);
+    return worker;
+  }
+
+  /**
+   * The filter is off for good, and later transports start without it. Taking a transform off a
+   * live receiver does not bring it back in Chromium: packets keep arriving and no frame reaches
+   * the decoder, whether the worker never loaded or died while pictures flowed (measured with
+   * `SYNC_WORKER_FAIL`, Opus review r2, S18). So the transforms come off in case an engine does
+   * play on, and the owner replaces the transport.
+   */
+  private dropLateFrames(): void {
+    if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
+    this.lateFramesReady = null;
+    this.lateFramesDropped = true;
+    for (const receiver of this.filtered) { try { receiver.transform = null; } catch { /* closed with its transport */ } }
+    this.filtered = [];
+    this.lateFrames?.terminate();
+    this.lateFrames = null;
+    if (!this.closed) this.params.lateFramesFailed?.();
   }
 
   keyframe(slot: number, share: string, generation: number): void {
@@ -1684,6 +1781,35 @@ export class ScreenWatchTransport {
     finally { this.polling = false; }
   }
 
+  /** The picture a slot last handed over, and when: lip-sync reads it. */
+  pictureClock(slot: number): PictureClock | null {
+    const source = this.transceivers[slot]?.receiver.getSynchronizationSources()[0];
+    return source && !this.closed ? { rtpTime: source.rtpTimestamp, unixMs: source.timestamp } : null;
+  }
+
+  /** How long a slot's picture was held since the last look, in milliseconds. */
+  async pictureDelay(slot: number): Promise<number> {
+    const receiver = this.transceivers[slot]?.receiver;
+    let delay = 0;
+    if (!receiver) return delay;
+    (await receiver.getStats()).forEach(s => {
+      if (s.type !== "inbound-rtp") return;
+      const { jitterBufferDelay = 0, jitterBufferEmittedCount = 0 } = s as RTCInboundRtpStreamStats & { jitterBufferDelay?: number; jitterBufferEmittedCount?: number };
+      const last = this.heldBefore.get(receiver) ?? { delay: 0, emitted: 0 };
+      const emitted = jitterBufferEmittedCount - last.emitted;
+      if (emitted <= 0) return;
+      this.heldBefore.set(receiver, { delay: jitterBufferDelay, emitted: jitterBufferEmittedCount });
+      delay = 1_000 * (jitterBufferDelay - last.delay) / emitted;
+    });
+    return delay;
+  }
+
+  /** Holds a slot's picture back, on top of nothing but the receiver's smallest delay. */
+  setPictureWait(slot: number, ms: number): void {
+    const receiver = this.transceivers[slot]?.receiver as (RTCRtpReceiver & { jitterBufferTarget?: number | null }) | undefined;
+    if (receiver && "jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = ms; } catch { /* out of range on some engines */ } }
+  }
+
   /** What one slot decodes, for the stage's quality badge. */
   async stats(slot: number): Promise<SlotStats | null> {
     const receiver = this.transceivers[slot]?.receiver;
@@ -1709,5 +1835,10 @@ export class ScreenWatchTransport {
     this.pc = null;
     this.transceivers = [];
     if (pc) { pc.ontrack = null; pc.onconnectionstatechange = null; pc.close(); }
+    if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
+    this.lateFramesReady = null;
+    this.filtered = [];
+    this.lateFrames?.terminate();
+    this.lateFrames = null;
   }
 }

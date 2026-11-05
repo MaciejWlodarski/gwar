@@ -325,12 +325,20 @@ wire! {
         /// Brings back sound I stopped, on the m-line my share already negotiated.
         #[serde(rename = "screen.audio.resume")]
         ScreenAudioResume { share: String },
+        /// The sound and picture RTP times of one instant of a watched share, as this viewer's
+        /// transport stamps them. Unknown on older servers.
+        #[serde(rename = "screen.audio.sync")]
+        ScreenAudioSync { share: String },
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
         /// Asks for a keyframe of a watched share (throttled).
         #[serde(rename = "screen.keyframe")]
         ScreenKeyframe { share: String },
+        /// A link stall's backlog was dropped here and frames are on time again: the link is back,
+        /// whatever the estimate made of the burst. Asks for a keyframe too.
+        #[serde(rename = "screen.stalled")]
+        ScreenStalled { share: String },
         /// H.264 arrived after a keyframe for four seconds without decode progress.
         #[serde(rename = "screen.decode_failed")]
         ScreenDecodeFailed { share: String, slot: u32, #[serde(deserialize_with = "voice::run")] #[cfg_attr(feature = "ts", ts(type = "number"))] run: u64, generation: u16 },
@@ -651,6 +659,8 @@ wire! {
         ScreenAudioCapabilities { screen_audio: bool },
         ScreenAudioAddCapabilities { screen_audio_add: bool },
         ScreenAudioState { audio: bool },
+        /// `screen.audio.sync`: `known` stays false until both sound and picture were forwarded.
+        ScreenAudioSync { known: bool, audio_rtp: u32, video_rtp: u32 },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.

@@ -6,7 +6,7 @@ import { welcome } from "../net/testing";
 import type { Link } from "../net/connection";
 import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureTabSound, tabSoundSupported, captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, type PublishParams, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
+import { captureTabSound, tabSoundSupported, captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, LATE_FRAMES_READY_MS, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, type PublishParams, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
 
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
@@ -3008,7 +3008,164 @@ describe("AV1", () => {
     expect(decodeFailed).not.toHaveBeenCalled();
     transport.close();
   });
+
+  it("starts a decode stall again when its own late-frame filter dropped frames", async () => {
+    // Early review (#213 on #230): the filter drops a stall's backlog that the SFU forwarded
+    // whole, so the decoder waits for the keyframe `screen.stalled` asked for while packets keep
+    // arriving, and the server, which saw the slot intact, took a report of that wait for a
+    // decoder that cannot decode. Here the decoder stops at 1 s and the filter drops frames at
+    // 3.5 s: no report before 4 s after that.
+    const workers = stubLateFramesWorker();
+    const decodeFailed = vi.fn();
+    const frameLost = vi.fn();
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed, frameLost });
+    await transport.start();
+    workers[0]!.say({ ready: true });
+    const pc = Peer.all[0]!;
+    (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
+    pc.stats = new Map([["codec", { type: "codec", mimeType: "video/H264" }]]);
+    transport.keyframe(0, "A", 1);
+    const reported: number[] = [];
+    decodeFailed.mockImplementation(() => reported.push(Date.now() - start));
+    const start = Date.now();
+    // Polls every second from 1 s, packets always arriving; one frame decoded, then none.
+    for (let at = 500; at <= 12_000; at += 500) {
+      if (at === 3500) workers[0]!.say({ slot: 0, kind: "video" });
+      pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded: 1 });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(Date.now() - start).toBe(at);
+    }
+    expect(frameLost).toHaveBeenCalledWith(0);
+    expect(reported.length).toBeGreaterThan(0);
+    // The first sample after the drop, 4 s on: 8 s, where the stall from the first sample gave 5 s.
+    expect(reported[0]).toBe(8000);
+    transport.close();
+    vi.unstubAllGlobals();
+  });
+
+  it("starts a decode stall again only once until the decoder decodes", async () => {
+    // Opus review r1 (S13): a filter that drops again and again, a link that keeps coming back,
+    // must not hold off a report of a decoder that decodes nothing at all. Drops at 3.5, 6 and
+    // 7.5 s: the report still comes at 8 s, as with the first drop alone.
+    const workers = stubLateFramesWorker();
+    const decodeFailed = vi.fn();
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed, frameLost: () => {} });
+    await transport.start();
+    workers[0]!.say({ ready: true });
+    const pc = Peer.all[0]!;
+    (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
+    pc.stats = new Map([["codec", { type: "codec", mimeType: "video/H264" }]]);
+    transport.keyframe(0, "A", 1);
+    const start = Date.now();
+    const reported: number[] = [];
+    decodeFailed.mockImplementation(() => reported.push(Date.now() - start));
+    for (let at = 500; at <= 12_000; at += 500) {
+      if ([3500, 6000, 7500].includes(at)) workers[0]!.say({ slot: 0, kind: "video" });
+      pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded: 1 });
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    expect(reported[0]).toBe(8000);
+    transport.close();
+    vi.unstubAllGlobals();
+  });
 });
+
+describe("late-frame worker that never runs", () => {
+  // Opus review r1 (S10): a worker that fails to load or crashes reads none of its transforms,
+  // so every slot's picture and sound would stay frozen for the whole transport.
+  const watch = (more: Partial<ConstructorParameters<typeof ScreenWatchTransport>[0]> = {}) =>
+    new ScreenWatchTransport({ run: 1, iceServers: [], audio: async () => true, offer: async () => "answer", state: () => {}, track: () => {}, ...more });
+  const transforms = () => Peer.all[0]!.transceivers.map(t => t.receiver.transform ?? null);
+
+  it("takes every transform off when the worker fails to load", async () => {
+    const workers = stubLateFramesWorker();
+    const lateFramesFailed = vi.fn();
+    const frameLost = vi.fn();
+    const transport = watch({ lateFramesFailed, frameLost });
+    await transport.start();
+    expect(transforms().every(t => t !== null)).toBe(true);
+    workers[0]!.onerror?.(new Event("error"));
+    expect(transforms()).toEqual(transforms().map(() => null));
+    expect(workers[0]!.terminated).toBe(true);
+    expect(lateFramesFailed).toHaveBeenCalledOnce();
+    workers[0]!.say({ slot: 0, kind: "video" });
+    expect(frameLost).not.toHaveBeenCalled();
+    transport.close();
+  });
+
+  it("takes every transform off when the worker never says it loaded", async () => {
+    const workers = stubLateFramesWorker();
+    const lateFramesFailed = vi.fn();
+    const transport = watch({ lateFramesFailed });
+    await transport.start();
+    await vi.advanceTimersByTimeAsync(LATE_FRAMES_READY_MS - 1);
+    expect(transforms().every(t => t !== null)).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(transforms()).toEqual(transforms().map(() => null));
+    expect(lateFramesFailed).toHaveBeenCalledOnce();
+    expect(workers[0]!.terminated).toBe(true);
+    transport.close();
+  });
+
+  it("takes every transform off when a worker that loaded crashes later", async () => {
+    const workers = stubLateFramesWorker();
+    const lateFramesFailed = vi.fn();
+    const transport = watch({ lateFramesFailed });
+    await transport.start();
+    workers[0]!.say({ ready: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(transforms().every(t => t !== null)).toBe(true);
+    workers[0]!.onerror?.(new Event("error"));
+    expect(transforms()).toEqual(transforms().map(() => null));
+    expect(lateFramesFailed).toHaveBeenCalledOnce();
+    transport.close();
+  });
+
+  it("keeps a worker that loaded, and starts none once one failed", async () => {
+    const workers = stubLateFramesWorker();
+    const lateFramesFailed = vi.fn();
+    const frameLost = vi.fn();
+    const transport = watch({ lateFramesFailed, frameLost });
+    await transport.start();
+    workers[0]!.say({ ready: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(transforms().every(t => t !== null)).toBe(true);
+    expect(lateFramesFailed).not.toHaveBeenCalled();
+    // Only the picture's link-back asks for anything; the sound's is a record.
+    workers[0]!.say({ slot: 1, kind: "audio", dropped: 9, at: 0 });
+    expect(frameLost).not.toHaveBeenCalled();
+    workers[0]!.say({ slot: 1, kind: "video", dropped: 9, at: 0 });
+    expect(frameLost).toHaveBeenCalledWith(1);
+    transport.close();
+    const next = watch({ skipLateFrames: true });
+    await next.start();
+    expect(workers).toHaveLength(1);
+    expect(Peer.all[1]!.transceivers.every(t => (t.receiver.transform ?? null) === null)).toBe(true);
+    next.close();
+  });
+});
+
+interface StubWorker {
+  onmessage: ((event: MessageEvent) => void) | null;
+  onerror: ((event: Event) => void) | null;
+  terminated: boolean;
+  say(data: unknown): void;
+}
+
+/** A late-frame worker that only does what a test makes it say. */
+function stubLateFramesWorker(): StubWorker[] {
+  const workers: StubWorker[] = [];
+  vi.stubGlobal("Worker", class implements StubWorker {
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    terminated = false;
+    constructor() { workers.push(this); }
+    say(data: unknown) { this.onmessage?.({ data } as MessageEvent); }
+    terminate() { this.terminated = true; }
+  });
+  vi.stubGlobal("RTCRtpScriptTransform", class {});
+  return workers;
+}
 
 
 it("reports publish congestion from the existing poll, clears on close and ignores late stats", async () => {

@@ -113,6 +113,8 @@ bring it back. Stopping it, a newer start or any of the above clears that. Neith
 | `share_playback_close` | `owner, run, slot` | Stops that slot, unless a newer run has it. The slot remembers `run` after this. |
 | `share_playback_gain` | `owner, run, slot, gain` | 0 to 1, independent of voice volume; ignored for an older run. |
 | `share_playback_frames` | raw body | `owner: u64, run: u64`, then per frame `slot: u8, rtp_time: u32, length: u16, opus`, little-endian. A malformed batch is refused whole. |
+| `share_playback_clock` | `owner, run, slot` | `{ rtpTime, unixMs }`: when a recent sample of that slot reaches the speaker, or null before there is one, for another run, or before the device reports its timing. |
+| `share_playback_hold` | `owner, run, slot, ms` | How long the slot's sound waits for its picture, at most 400. The mixer gets there at 1 %, never by a jump; a new run starts at 0, and an older run is ignored. |
 
 Sound goes only where it was asked for: a frame for a closed slot or an older run is
 dropped, and the webview sends no frame ahead of the slot's volume.

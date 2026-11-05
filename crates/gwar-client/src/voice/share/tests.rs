@@ -184,9 +184,77 @@ fn delay_stays_in_its_bounds_and_follows_late_arrivals() {
     assert_eq!(jitter.delay(), MIN_DELAY);
     jitter.observe(10 * 960, start + Duration::from_millis(200 + 50));
     assert!(jitter.delay() > Duration::from_millis(100));
-    // Late, but not so late that the stream must have started over: see `DISCONTINUITY`.
+    // Late, but not so late that the stream must have started over: see `Jitter::discontinuity`.
     jitter.observe(11 * 960, start + Duration::from_millis(220 + 200));
     assert_eq!(jitter.delay(), MAX_DELAY);
+}
+
+#[test]
+fn a_stall_a_held_queue_rides_out_is_learned_as_jitter() {
+    // With sound held for the picture the queue lasts up to `MAX_HOLD` longer before it runs dry,
+    // so a stall that long is the network's jitter, which the delay must learn, not a new start.
+    assert!(MAX_DISCONTINUITY >= MAX_DELAY + MAX_HOLD);
+    let mut jitter = Jitter::new();
+    jitter.set_hold(MAX_HOLD);
+    assert!(jitter.discontinuity() >= MAX_DELAY + MAX_HOLD);
+    let start = Instant::now();
+    for n in 0..10u32 {
+        jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+    }
+    let before = jitter.delay();
+    jitter.observe(10 * 960, start + Duration::from_millis(200 + 500));
+    assert!(jitter.delay() > before, "a 500 ms stall under a full hold was not learned: {before:?}");
+}
+
+/// A lowered hold is given back slowly: until the queue is down, it still holds the old hold's
+/// sound, so a stall that long is still the network's jitter (Opus review r3, S22).
+#[test]
+fn a_stall_while_a_hold_is_given_back_is_still_jitter() {
+    let start = Instant::now();
+    let steady = |jitter: &mut Jitter| {
+        for n in 0..10u32 {
+            jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+        }
+    };
+    let mut jitter = Jitter::new();
+    jitter.set_hold(Duration::from_millis(300));
+    steady(&mut jitter);
+    jitter.set_hold(Duration::ZERO);
+    assert!(jitter.discontinuity() >= MAX_DELAY + Duration::from_millis(300));
+    jitter.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(jitter.delay(), MAX_DELAY, "a 400 ms stall the old hold rode out was not learned");
+    // Once the queue is down, the hold given back no longer counts.
+    let mut released = Jitter::new();
+    released.set_hold(Duration::from_millis(300));
+    steady(&mut released);
+    released.set_hold(Duration::ZERO);
+    released.started = true;
+    released.speed();
+    assert!(!released.releasing);
+    released.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(released.delay(), MIN_DELAY, "a pause after the release became jitter");
+}
+
+/// With nothing held, a pause past what the delay and concealment cover is a new start: learnt
+/// as jitter, it put share sound 160 ms late for seconds, and the picture waited for it.
+#[test]
+fn with_nothing_held_a_pause_past_the_delay_is_not_jitter() {
+    let mut jitter = Jitter::new();
+    let start = Instant::now();
+    for n in 0..10u32 {
+        jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+    }
+    assert!(jitter.discontinuity() < MAX_DELAY + CONCEAL + Duration::from_millis(1));
+    jitter.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(jitter.delay(), MIN_DELAY, "a 400 ms pause with nothing held became jitter");
+    // The same pause under a hold the queue rode it out with is still jitter.
+    let mut held = Jitter::new();
+    held.set_hold(Duration::from_millis(300));
+    for n in 0..10u32 {
+        held.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+    }
+    held.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(held.delay(), Duration::from_millis(300) + MAX_DELAY);
 }
 
 /// The server keeps share sound's RTP time contiguous across a pause in the sound
@@ -336,7 +404,7 @@ fn the_queue_is_bounded_and_malformed_frames_are_refused() {
     let (mut worker, _bus, playout) = worker();
     playout.open(0, 1, 1.0);
     let mut encoder = encoder();
-    feed(&mut worker, &mut encoder, (0, 1), 0, 40, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (0, 1), 0, MAX_QUEUED as u64 + 8, (440.0, 440.0), Instant::now());
     assert_eq!(worker.streams[0].as_ref().unwrap().jitter.queue.len(), MAX_QUEUED);
     assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), 8);
     let before = worker.counters.late_drops.load(Ordering::Relaxed);
@@ -609,4 +677,200 @@ fn truncated_or_oversized_batches_are_refused_whole() {
     assert!(parse_frames(&cut).is_none());
     assert!(parse_frames(&vec![0; MAX_BATCH + 1]).is_none());
     assert_eq!(parse_frames(&batch(&[])).unwrap().1.len(), 0);
+}
+
+#[test]
+fn the_clock_says_when_a_sample_reaches_the_speaker() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(1, 7, 1.0));
+    worker.apply_controls();
+    assert_eq!(playout.clock(1, 7), None, "nothing has been written yet");
+    let mut encoder = encoder();
+    let at = Instant::now();
+    feed(&mut worker, &mut encoder, (1, 7), 0, 12, (440.0, 440.0), at);
+    worker.produce();
+    assert_eq!(playout.clock(1, 7), None, "no voice pipeline has told where the speaker is");
+
+    // 480 samples stand before the speaker, and the mark's sample is the ring's first.
+    bus.note_output(480);
+    let first = playout.clock(1, 7).unwrap();
+    let (written, rtp_time) = {
+        let marks = playout.marks.lock().unwrap();
+        (marks[1].unwrap().written, marks[1].unwrap().rtp_time)
+    };
+    assert_eq!(written, 0);
+    assert_eq!(first.rtp_time, rtp_time);
+    let output = bus.output.lock().unwrap().unwrap();
+    assert_eq!(first.at, output.at + Duration::from_millis(10));
+
+    // Taking 10 ms from the ring brings a later mark no closer than it was: its position moved too.
+    let mut speakers = [[0f32; 2]; 480];
+    bus.mix(&mut speakers, false);
+    worker.produce();
+    bus.note_output(480);
+    let later = playout.clock(1, 7).unwrap();
+    let output = bus.output.lock().unwrap().unwrap();
+    let ahead = later.at.duration_since(output.at).as_secs_f64() * f64::from(RATE);
+    let held = (playout.marks.lock().unwrap()[1].unwrap().written - 480) as f64;
+    assert!((ahead - 480.0 - held).abs() < 1.0, "{ahead} samples ahead");
+    assert_ne!(later.rtp_time, first.rtp_time);
+}
+
+#[test]
+fn the_clock_belongs_to_one_run_and_one_slot() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    feed(&mut worker, &mut encoder, (0, 7), 0, 12, (440.0, 440.0), Instant::now());
+    worker.produce();
+    bus.note_output(0);
+    assert!(playout.clock(0, 7).is_some());
+    assert_eq!(playout.clock(0, 8), None);
+    assert_eq!(playout.clock(1, 7), None);
+    assert_eq!(playout.clock(SCREEN_SLOTS, 7), None);
+}
+
+#[test]
+fn the_clock_reads_system_time() {
+    let now = Instant::now();
+    let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
+    let ahead = ShareClock { rtp_time: 0, at: now + Duration::from_millis(100) };
+    assert!((ahead.unix_ms() - unix - 100.0).abs() < 50.0);
+}
+
+/// Plays `seconds` of a stream arriving on time.
+fn play_on_time(
+    worker: &mut Worker,
+    bus: &ShareBus,
+    encoder: &mut Encoder,
+    slot: (usize, u64),
+    first: u64,
+    seconds: u64,
+) {
+    let start = Instant::now();
+    for n in 0..seconds * 50 {
+        feed(worker, encoder, slot, first + n, 1, (440.0, 440.0), start + Duration::from_millis(20 * n));
+        drain(worker, bus, 2);
+    }
+}
+
+#[test]
+fn sound_reaches_a_hold_for_the_picture_without_a_jump() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 0, 2);
+    let before = worker.streams[0].as_ref().unwrap().jitter.queued();
+    assert!(playout.set_hold(0, 7, 60));
+
+    // One second at 1 % is 10 ms: the queue may not move faster than that, in either direction.
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 100, 1);
+    let early = worker.streams[0].as_ref().unwrap().jitter.queued();
+    // 10 ms of hold, and one packet of rounding in what is queued (early review S9: 40 ms let
+    // four times the declared rate through).
+    assert!(early <= before + Duration::from_millis(10 + u64::from(FRAME_MS)), "{before:?} to {early:?} in a second");
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 150, 7);
+    let held = worker.streams[0].as_ref().unwrap().jitter.queued();
+    assert!(held >= before + Duration::from_millis(60), "{before:?} to {held:?}");
+    let stats = playout.stats();
+    assert_eq!((stats.late_drops, stats.backlog_drops, stats.concealed), (0, 0, 0));
+
+    assert!(playout.set_hold(0, 7, 0));
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 500, 10);
+    let jitter = &worker.streams[0].as_ref().unwrap().jitter;
+    let (released, delay) = (jitter.queued(), jitter.delay());
+    assert!(released <= delay + DRIFT_MARGIN + Duration::from_millis(20), "{released:?} over {delay:?}");
+    let stats = playout.stats();
+    assert_eq!((stats.late_drops, stats.backlog_drops, stats.concealed), (0, 0, 0));
+}
+
+#[test]
+fn a_hold_given_back_leaves_no_gap_in_the_sound() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 0, 2);
+    assert!(playout.set_hold(0, 7, 120));
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 100, 14);
+    assert!(playout.set_hold(0, 7, 0));
+
+    let start = Instant::now();
+    let mut gaps = 0;
+    for n in 0..14 * 50 {
+        feed(&mut worker, &mut encoder, (0, 7), 800 + n, 1, (440.0, 440.0), start + Duration::from_millis(20 * n));
+        gaps += drain(&mut worker, &bus, 2).0.iter().filter(|sample| **sample == 0.0).count();
+    }
+    assert_eq!(gaps, 0, "samples the mixer left empty with packets queued");
+    assert_eq!(playout.stats().concealed, 0);
+}
+
+#[test]
+fn a_hold_is_bounded_and_a_new_run_starts_without_one() {
+    let (mut worker, _bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    assert!(playout.set_hold(0, 7, 60_000));
+    assert_eq!(playout.hold[0].load(Ordering::Relaxed), MAX_HOLD.as_millis() as u32);
+    // Early review S4: at a full hold the queue's limit sat at the trim's own keep, so a lump
+    // was dropped newest first instead of trimmed oldest first.
+    assert!(
+        MAX_HOLD + MAX_DELAY + BACKLOG_MARGIN + JUMP_HEADROOM
+            <= Duration::from_millis(u64::from(FRAME_MS) * MAX_QUEUED as u64)
+    );
+    assert!(playout.open(0, 8, 1.0));
+    assert_eq!(playout.hold[0].load(Ordering::Relaxed), 0);
+    assert!(!playout.set_hold(0, 7, 100), "an older run has no say");
+    assert_eq!(playout.hold[0].load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_reached_hold_keeps_the_sound_in_tune_under_jitter() {
+    // Opus review r1 (S17): the queue is counted in 20 ms packets, and a dead zone of 10 ms each
+    // side let jitter flip the speed between the full 1 % and none: 17 cents of slow wander on
+    // music. Packets arrive up to 10 ms early or late; once the hold is reached, the speed
+    // stays close to what drift asks for.
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut jitter = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % 21) as i64 - 10
+    };
+    let start = Instant::now();
+    let arrivals: Vec<i64> = (0..30 * 50).map(|n| 40 + 20 * n + jitter()).collect();
+    let mut next = 0usize;
+    let mut speeds = Vec::new();
+    for tick in 0..30 * 100i64 {
+        if tick == 200 {
+            assert!(playout.set_hold(0, 7, 60));
+        }
+        while next < arrivals.len() && arrivals[..=next].iter().max().copied().unwrap() <= 10 * tick {
+            feed(
+                &mut worker,
+                &mut encoder,
+                (0, 7),
+                next as u64,
+                1,
+                (440.0, 440.0),
+                start + Duration::from_millis(10 * tick as u64),
+            );
+            next += 1;
+        }
+        drain(&mut worker, &bus, 1);
+        if tick >= 15 * 100 {
+            speeds.push(worker.streams[0].as_ref().unwrap().speed);
+        }
+    }
+    let (low, high) = speeds.iter().fold((f64::MAX, f64::MIN), |(l, h), s| (l.min(*s), h.max(*s)));
+    // The old all-or-nothing speed spanned 0.9959 to 1.0092 here.
+    assert!(high - low <= HOLD_RATE / 2.0, "speed {low:.4} to {high:.4}");
+    let stats = playout.stats();
+    assert_eq!((stats.late_drops, stats.backlog_drops), (0, 0));
 }

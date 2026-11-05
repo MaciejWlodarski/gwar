@@ -635,7 +635,7 @@ export function ShareAudioPlayback() {
   const me = useSession(s => s.me?.session);
   const heard = watches.filter(w => w.status === "watching" && w.audio === true && shares[w.share]?.client !== me);
   if (controller.screen.usesNativeSound()) return <>{heard.map(w => <NativeShareSound key={w.id} id={w.id} share={w.share} slot={w.slot!} />)}</>;
-  return <>{heard.map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget"} />)}</>;
+  return <>{heard.map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget" || w.soundHeld === true} />)}</>;
 }
 
 /** Desktop app: plays in the native mixer, so there is no element and nothing to unblock. */

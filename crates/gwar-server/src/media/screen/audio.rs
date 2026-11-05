@@ -9,16 +9,20 @@ use super::{
 };
 use std::{
     collections::{HashSet, VecDeque},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use str0m::{
     Rtc,
     format::Codec,
     media::{MediaKind, Mid, Pt},
-    rtp::{RtpPacket, RtpWrite, Ssrc},
+    rtp::{RtpPacket, RtpWrite, Ssrc, rtcp::SenderInfo},
 };
 
 pub(super) const WIRE_BPS: u64 = 128_000;
+const RATE: u32 = 48_000;
+/// A gap in the sound's RTP time this much shorter than the silence it spans was a stop, not
+/// loss; shorter differences are the network's.
+const STOP_GAP: Duration = Duration::from_millis(250);
 
 pub(super) fn publish_section(lines: &[&str]) -> bool {
     lines[0].starts_with("m=audio ")
@@ -40,6 +44,83 @@ pub(super) struct Publisher {
     pt: Pt,
     bytes: Bucket,
     packets: Bucket,
+    pub time: SoundTime,
+}
+
+/// Keeps a share's sound on its publisher's clock across a stop.
+///
+/// A browser's sound RTP time counts the samples it sent, so sound stopped and resumed on the
+/// same sender comes back a frame after where it left off, however long it was silent, and the
+/// publisher's next sender report moves its line by the silence. Forwarded as it is, the line in
+/// the reports a viewer gets moves too: its engine fits a clock estimate to reports from both
+/// lines and holds the picture by their difference until it gives the old ones up, seconds
+/// later. Here the RTP time the viewers get moves on by the silence instead, and until the
+/// publisher reports its new line, its old report places the sound with the same correction.
+#[derive(Default)]
+pub(super) struct SoundTime {
+    /// The publisher's RTP time and arrival of the last packet, and the line of the report
+    /// that came with it.
+    last: Option<(u32, Instant, Option<Line>)>,
+    /// Resumes seen, from `ScreenOrigin::audio_resumes`.
+    resumes: u64,
+    /// Added to every RTP time forwarded: the silences of all stops so far.
+    shift: u32,
+    /// The last stop's silence while the publisher's reports still have the line from before
+    /// it, that line, and when the sound came back.
+    stale: Option<(u32, Line, Instant)>,
+}
+
+/// A sender report's NTP and RTP times.
+type Line = (SystemTime, u32);
+
+/// A publisher reports sound at least this often; a stale line is not kept longer.
+const STALE_FOR: Duration = Duration::from_secs(10);
+
+impl SoundTime {
+    /// The RTP time to forward, and the one that places this packet on the publisher's clock
+    /// with `report`. `resumes` counts the publisher's resumes of stopped sound.
+    pub fn place(&mut self, rtp: u32, arrival: Instant, report: Option<&SenderInfo>, resumes: u64) -> (u32, u32) {
+        let line = report.map(|r| (r.ntp_time, r.rtp_time.numer() as u32));
+        if resumes != self.resumes
+            && let Some((last, at, before)) = self.last
+        {
+            let missing = arrival.saturating_duration_since(at).as_secs_f64() - seconds(rtp.wrapping_sub(last));
+            if missing > STOP_GAP.as_secs_f64() {
+                let missing = (missing * f64::from(RATE)) as u32;
+                self.shift = self.shift.wrapping_add(missing);
+                // A report on a line other than the one before the stop already has the new one.
+                let old = line.filter(|l| before.is_none_or(|b| !moved(*l, b)));
+                // A second stop before the publisher reports again leaves its line two silences
+                // behind: they add up.
+                let earlier = |l: Line| self.stale.filter(|(_, s, _)| !moved(l, *s)).map_or(0, |(m, ..)| m);
+                self.stale = old.map(|l| (earlier(l).wrapping_add(missing), l, arrival));
+            }
+        }
+        self.resumes = resumes;
+        self.last = Some((rtp, arrival, line));
+        // A report sent during the silence is still on the old line; the first that is not has
+        // the new one.
+        if let Some((_, old, since)) = self.stale
+            && (line.is_some_and(|l| moved(l, old)) || arrival.saturating_duration_since(since) >= STALE_FOR)
+        {
+            self.stale = None;
+        }
+        (rtp.wrapping_add(self.shift), rtp.wrapping_add(self.stale.map_or(0, |(missing, ..)| missing)))
+    }
+}
+
+/// Whether two reports put the same RTP time a stop's worth apart.
+fn moved(a: Line, b: Line) -> bool {
+    let ntp = match a.0.duration_since(b.0) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    };
+    (ntp - seconds(a.1.wrapping_sub(b.1))).abs() >= STOP_GAP.as_secs_f64()
+}
+
+/// An RTP time difference, either way, in seconds.
+fn seconds(ticks: u32) -> f64 {
+    f64::from(ticks as i32) / f64::from(RATE)
 }
 
 impl Publisher {
@@ -72,6 +153,7 @@ impl Publisher {
             pt,
             bytes: Bucket::new(WIRE_BPS as f64 / 8.0, 2400.0, now),
             packets: Bucket::new(100.0, 4.0, now),
+            time: SoundTime::default(),
         }))
     }
 
@@ -94,6 +176,8 @@ pub(super) struct Slot {
     next: u64,
     ticks: u32,
     pending: VecDeque<Queued>,
+    /// RTP time and publisher wallclock of the last packet written.
+    last_written: Option<(u32, Instant)>,
 }
 
 impl Slot {
@@ -103,30 +187,42 @@ impl Slot {
             s.set_unpaced(true);
             *s.ssrc()
         });
-        Self { mid, pt, ssrc, source: None, publication: None, next: 0, ticks: 0, pending: VecDeque::new() }
+        Self {
+            mid,
+            pt,
+            ssrc,
+            source: None,
+            publication: None,
+            next: 0,
+            ticks: 0,
+            pending: VecDeque::new(),
+            last_written: None,
+        }
     }
 
     pub fn clear(&mut self, rtc: &mut Rtc) {
         self.source = None;
         self.publication = None;
         self.pending.clear();
+        self.last_written = None;
         wipe(rtc, self.mid);
     }
 
-    pub fn queue(&mut self, packet: &RtpPacket, publication: u64, wallclock: Instant) {
+    /// `rtp` is the packet's RTP time on the share's own timeline (`SoundTime::place`).
+    pub fn queue(&mut self, packet: &RtpPacket, rtp: u32, publication: u64, wallclock: Instant) {
         let Some(pt) = self.pt else { return };
         let source = *packet.seq_no;
         if self.publication != Some(publication) || self.source.is_none_or(|(ssrc, ..)| ssrc != packet.header.ssrc) {
             self.pending.clear();
             self.publication = Some(publication);
-            self.source = Some((packet.header.ssrc, source, self.next, packet.header.timestamp, self.ticks));
+            self.source = Some((packet.header.ssrc, source, self.next, rtp, self.ticks));
         }
         let (_, first, out, clock, start) = self.source.unwrap();
         if source < first {
             return;
         }
         let sequence = out + source - first;
-        let ticks = start.wrapping_add(packet.header.timestamp.wrapping_sub(clock));
+        let ticks = start.wrapping_add(rtp.wrapping_sub(clock));
         if sequence >= self.next {
             self.next = sequence + 1;
             self.ticks = ticks.wrapping_add(960);
@@ -163,12 +259,40 @@ impl Slot {
             if let Some(stream) = rtc.direct_api().stream_tx_by_mid(self.mid, None) {
                 self.ssrc = *stream.ssrc();
                 stream.set_unpaced(true);
+                self.last_written = Some((packet.timestamp, packet.wallclock));
                 stream.write_rtp(
                     RtpWrite::new(packet.pt, packet.out.into(), packet.timestamp, packet.wallclock, packet.payload)
                         .marker(packet.marker),
                 );
             }
         }
+    }
+}
+
+/// Further apart than this, the last sound and picture are not of the same stretch of a share.
+const MAX_ASSOCIATED_GAP: Duration = Duration::from_secs(2);
+const VIDEO_RATE: f64 = 90_000.0;
+
+/// Sound and picture RTP times of one instant. Both wallclocks come from the publisher's common
+/// clock, so the sender reports' association survives this SFU's queues and each slot's own
+/// timestamps. A viewer whose sound does not reach its webview's engine cannot get it elsewhere.
+fn associate_pair(video: (u32, Instant), audio: (u32, Instant)) -> Option<(u32, u32)> {
+    let (later, earlier, sign) = if audio.1 >= video.1 { (audio.1, video.1, 1.0) } else { (video.1, audio.1, -1.0) };
+    let gap = later.duration_since(earlier);
+    if gap > MAX_ASSOCIATED_GAP {
+        return None;
+    }
+    let ticks = (sign * gap.as_secs_f64() * VIDEO_RATE).round() as i64;
+    Some((audio.0, video.0.wrapping_add(ticks as u32)))
+}
+
+/// Publishes each watched slot's association to the signalling side.
+pub(super) fn associate(w: &Watcher) {
+    for (slot, sound) in w.slots.iter().zip(&w.audio) {
+        let (Some(grant), Some(video), Some(audio)) = (&slot.grant, slot.last_written, sound.last_written) else {
+            continue;
+        };
+        grant.set_sound_clock(associate_pair(video, audio));
     }
 }
 
@@ -196,6 +320,110 @@ mod tests {
         publish_ssrcs, watch_offer,
     };
     use std::time::Duration;
+
+    /// The publisher's report: its clock at `at`, and the RTP time it gives that instant.
+    fn report(at: Duration, rtp: u32) -> SenderInfo {
+        SenderInfo {
+            ssrc: 1.into(),
+            ntp_time: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000) + at,
+            rtp_time: str0m::media::MediaTime::new(u64::from(rtp), str0m::media::Frequency::FORTY_EIGHT_KHZ),
+            sender_packet_count: 1,
+            sender_octet_count: 1,
+        }
+    }
+
+    #[test]
+    fn sound_resumed_after_a_stop_keeps_one_clock_for_its_viewers() {
+        // Sound for 2 s, stopped for 5 s, then back on the same sender with the RTP time a frame
+        // on. The publisher reports its old line through the silence and its new one some time
+        // after the sound is back, or before the server lets the sound through again.
+        for (frames_from, new_line_at) in [(7_000, 8_500), (6_800, 6_900)] {
+            let start = Instant::now();
+            let path = Duration::from_millis(30);
+            let (mut time, mut clock) = (SoundTime::default(), super::super::clock::Clock::default());
+            let (mut rtp, mut seen) = (7_000u32, Vec::new());
+            // Where the RTP time is when frames start again: 2 s of them were sent.
+            let back = 7_000 + 2 * 48_000;
+            for ms in (0..12_000u64).step_by(20) {
+                if (2_000..frames_from).contains(&ms) {
+                    continue;
+                }
+                let line = if ms >= new_line_at {
+                    report(Duration::from_millis(new_line_at), back + ((new_line_at - frames_from) * 48) as u32)
+                } else if ms >= 4_000 {
+                    // Sent during the silence, on the old line.
+                    report(Duration::from_secs(4), 7_000 + 4 * 48_000)
+                } else {
+                    report(Duration::ZERO, 7_000)
+                };
+                // The server lets sound through again at 7 s.
+                if !(2_000..7_000).contains(&ms) {
+                    let arrival = start + Duration::from_millis(ms) + path;
+                    let (out, placed) = time.place(rtp, arrival, Some(&line), u64::from(ms >= 7_000));
+                    seen.push((ms, out, clock.map(placed, arrival, Some(line), 48_000)));
+                }
+                rtp = rtp.wrapping_add(960);
+            }
+            let (first, out, wall) = seen[0];
+            for &(ms, o, w) in &seen {
+                let sent = Duration::from_millis(ms - first);
+                let forwarded = f64::from(o.wrapping_sub(out)) / 48_000.0;
+                assert!(
+                    (forwarded - sent.as_secs_f64()).abs() < 0.001,
+                    "{frames_from}/{new_line_at}: {ms} ms forwarded as {forwarded:.3} s"
+                );
+                let placed = (w - wall).as_secs_f64() - sent.as_secs_f64();
+                assert!(
+                    placed.abs() < 0.001,
+                    "{frames_from}/{new_line_at}: {ms} ms placed {placed:.3} s off its clock"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_stops_before_the_next_report_place_sound_by_both_silences() {
+        // Early review S5: sound 0–1 s, 2–3 s and from 4 s, stopped twice within one report
+        // period, and the publisher's reports still on the line from before the first stop. The
+        // stale correction kept only the second silence and placed sound a second early.
+        let start = Instant::now();
+        let path = Duration::from_millis(30);
+        let (mut time, mut clock) = (SoundTime::default(), super::super::clock::Clock::default());
+        let line = report(Duration::ZERO, 7_000);
+        let (mut rtp, mut seen) = (7_000u32, Vec::new());
+        for ms in (0..8_000u64).step_by(20) {
+            if (1_000..2_000).contains(&ms) || (3_000..4_000).contains(&ms) {
+                continue;
+            }
+            let arrival = start + Duration::from_millis(ms) + path;
+            let resumes = u64::from(ms >= 2_000) + u64::from(ms >= 4_000);
+            let (_, placed) = time.place(rtp, arrival, Some(&line), resumes);
+            seen.push((ms, clock.map(placed, arrival, Some(line), 48_000)));
+            rtp = rtp.wrapping_add(960);
+        }
+        let (first, wall) = seen[0];
+        for &(ms, w) in &seen {
+            let off = (w - wall).as_secs_f64() - Duration::from_millis(ms - first).as_secs_f64();
+            assert!(off.abs() < 0.001, "{ms} ms placed {off:.3} s off its clock");
+        }
+    }
+
+    #[test]
+    fn sound_that_only_arrives_late_keeps_its_rtp_time() {
+        // A stall on the way in, with no resume: the sound was sent all along.
+        let start = Instant::now();
+        let mut time = SoundTime::default();
+        for n in 0..200u32 {
+            let late = if (50..100).contains(&n) {
+                Duration::from_millis(3_000 - 20 * u64::from(n - 50))
+            } else {
+                Duration::ZERO
+            };
+            let rtp = n * 960;
+            let arrival = start + Duration::from_millis(20 * u64::from(n)) + late;
+            assert_eq!(time.place(rtp, arrival, Some(&report(Duration::ZERO, 0)), 0), (rtp, rtp));
+        }
+    }
 
     #[test]
     fn combined_production_audio_and_video_release_keeps_its_allocation() {
@@ -460,5 +688,26 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    #[test]
+    fn the_association_is_one_instant_on_the_pictures_clock() {
+        let at = Instant::now();
+        let later = at + Duration::from_millis(20);
+        // Sound 20 ms after the picture: the picture's time moves on by those 20 ms.
+        assert_eq!(associate_pair((1_000, at), (500, later)), Some((500, 2_800)));
+        assert_eq!(associate_pair((1_000, later), (500, at)), Some((500, 1_000u32.wrapping_sub(1_800))));
+        assert_eq!(associate_pair((u32::MAX, at), (7, later)), Some((7, 1_799)));
+    }
+
+    #[test]
+    fn sound_and_picture_of_different_stretches_are_not_associated() {
+        let at = Instant::now();
+        assert_eq!(associate_pair((1, at), (2, at + Duration::from_secs(3))), None);
     }
 }

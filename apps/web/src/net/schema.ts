@@ -218,9 +218,10 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "screen.audio.add.capabilities": shape({ screen_audio_add: bool }),
   "screen.audio.add": shape({ sdp: str(65536) }),
   "screen.audio.resume": shape({ audio: bool }),
+  "screen.audio.sync": shape({ known: bool, audio_rtp: int(4294967295), video_rtp: int(4294967295) }),
   "screen.capabilities": shape({ screen_h264: bool }),
   "screen.av1.capabilities": shape({ screen_av1: bool }),
-  "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty, "screen.decode_failed": empty,
+  "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty, "screen.stalled": empty, "screen.decode_failed": empty,
   "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),
   "owner.transfer": empty, "managers.update": empty,
 };

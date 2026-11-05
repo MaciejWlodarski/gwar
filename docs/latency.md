@@ -1808,19 +1808,33 @@ two-second ramp, and five phases through the probe interval. Four seeds produce
 2,560 cases. The [baseline fixture](../crates/gwar-server/src/media/screen/drop-baseline.csv)
 pins main `1099a681`; the restored main code is checked against every stored
 result. It is a measured simulator baseline, not an analytical safety bound.
-Changes may improve either metric but may not exceed the pinned value.
+Changes may improve either metric. The gate is statistical, because the
+per-case results are chaotic: on a full link a few bytes more or fewer on the
+wire move where a 10 ms sample falls, and a case can then take another path.
+Nine behaviour-neutral controls on main (CNAME 4, 8, 12 or 16 bytes longer, or
+cut to 16, 12, 8 or 1 bytes, or an extra 26-byte SDES NOTE) moved single cases
+by up to 4,270 ms above capacity and 920 ms of voice queue, in both directions.
+So `drop_sweep_stays_within_mains_noise` runs all 2,560 cases (one thread per
+seed, part of the ordinary test run) and requires, per metric, that the sum,
+the 90th and 99th percentile and the worst of the per-case deltas stay within
+the worst of those controls:
 
-The ordinary `drop_matrix_matches_main_baseline` test runs 80 representative
-cases in CI, including the burst/cross-traffic combinations that broke earlier
-designs. It compares against stored main results rather than comparing the same
-current implementation with itself. The full sweep and jitter report are manual:
+| Metric | Sum | p90 | p99 | Worst case |
+| --- | ---: | ---: | ---: | ---: |
+| Above capacity | +9,620 ms | 10 ms | 950 ms | 4,270 ms |
+| Voice queue | 0 ms (every control was better) | 10 ms | 180 ms | 920 ms |
+
+#213 (sender reports left out until a stream has an RTP time) gave above
+capacity −13,820 / 10 / 790 / 4,000 ms and voice −11,080 / 10 / 130 / 460 ms.
+Without that patch the sweep matches main in every case. A real estimator
+regression shows up as a worse total or tail than every neutral control.
 
 ```sh
-CARGO_BUILD_JOBS=4 nice -n 10 cargo test --release -p gwar-server --lib drop_sweep -- --ignored --nocapture
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-server --lib drop_sweep_stays_within_mains_noise -- --nocapture
 CARGO_BUILD_JOBS=4 nice -n 10 cargo test --release -p gwar-server --lib jitter_matrix -- --ignored --nocapture
 ```
 
-`SWEEP_SEEDS=1` selects a quick drop run; omit it for all four seeds. A baseline
+`SWEEP_SEEDS=1` selects a quick drop run that prints its cases but is not judged. A baseline
 update requires an explicit new source pin and review of every changed metric.
 The BWE crate is excluded from workspace tests, so CI separately runs:
 

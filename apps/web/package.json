@@ -33,6 +33,7 @@
     "e2e:dm": "node --test e2e/processes.test.mjs && node e2e/dm.mjs",
     "test:latency": "node --test e2e/latency-markers.test.mjs",
     "test:screen-startup": "node --test e2e/screen-startup-judge.test.mjs",
+    "test:share-sync": "node --test e2e/share-sync-judge.test.mjs",
     "latency": "node e2e/latency.mjs"
   },
   "dependencies": {

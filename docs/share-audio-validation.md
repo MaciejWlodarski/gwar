@@ -990,7 +990,7 @@ encoding paths did not change, and two runs per side cannot say whether this mea
 ### Not measured here
 
 Windows capture and WebView2 exclusion, Windows 10 builds, the macOS permission flow in a real
-app, physical AEC on speakers, lip-sync, paired mouth-to-ear, real stereo output, a real app
+app, physical AEC on speakers, paired mouth-to-ear, real stereo output, a real app
 hidden for minutes, a real stall or sleep and wake in the app (pause and resume are tested on the
 shell's state and on the webview's reader, not end to end in a real webview), and whether
 ScreenCaptureKit or process loopback survive a real sleep: if the OS ends the stream, computer
@@ -2353,3 +2353,133 @@ CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p g
 CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib recorded_speech_is_not_held_after_stereo -- --ignored --nocapture --test-threads=1
 CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib four_shares_leave_the_voice_pipeline_on_time -- --ignored --nocapture --test-threads=1
 ```
+
+## Lip-sync
+
+`apps/web/e2e/share-sync.mjs` shares a real tab whose barcode changes at the same instant as a 997 Hz
+burst, once a second, on busy content at about 5 Mb/s. A burst's sound is four 40 ms pulses, and the
+gaps between them, 110 to 230 ms in five steps, carry three base-5 digits, 125 numbers in all. Each
+viewer records when it presents each number and when its pulses come out, and sound is paired with
+its picture by that number, so a whole-second error stays visible for 125 s. A number that fits two
+bursts, or a burst that lost a pulse, gives no row. An offset is positive when the sound lags. The
+target is −45 ms to +125 ms, ITU-R BT.1359's detectability range.
+
+Base main `0a2f9054` (with #221 and #230), #213 at `7ec8e3e5`, macOS 27.0 on an Apple M5, Chromium
+as the sharer and as both viewers. The desktop viewer is `native_bridge`: the real mixer and voice
+pipeline, with a virtual speaker, on a Chromium page. Every local run was silent, under a guard on
+the speakers.
+
+"Sync off" (`SYNC_OFF=1`) is main's playback on this build: main's `jitterBufferTarget = 0` goes
+through and no other value does, the mixer gets no hold, the late-frame filter is refused, which also
+means no `screen.stalled`, and held sound is released in the grant's own dispatch. A run fails unless
+it saw a filter refused and a hold released.
+
+"Settled" is every second after the first 12 of a viewer's record. Each cell covers eight runs of the
+same 30 or 45 s, sync on and off alternating run by run, in both orders of the two viewers. No run
+was void (load or sleep). A cell gives the bursts in range, then the median, p5 and p95 of the settled
+bursts.
+
+| Link in front of the viewers | Viewer | Off, first 12 s | Off, settled | On, first 12 s | On, settled |
+| --- | --- | --- | --- | --- | --- |
+| None, 45 s | Desktop | 84/104 | 233/251; +78 (+39…+126) | **75/104** | 253/253; +56 (+21…+84) |
+| None, 45 s | Browser | 97/101 | 253/253; +17 (−24…+57) | **90/103** | **251/253**; +29 (−11…+60) |
+| 20 ms ± 5 ms, 45 s | Desktop | 79/99 | 201/237; +66 (−196…+116) | **66/100** | 253/254; +46 (−8…+85) |
+| 20 ms ± 5 ms, 45 s | Browser | 49/103 | 252/254; +29 (−17…+61) | 51/102 | **224/251**; +14 (−94…+54) |
+| 20 ms ± 10 ms, 45 s | Desktop | 65/100 | 182/225; +43 (−233…+100) | **44/100** | **115/193**; +13 (−250…+112) |
+| 20 ms ± 10 ms, 45 s | Browser | 34/104 | 148/199; +13 (−262…+62) | **12/101** | 184/214; +6 (−83…+46) |
+| 2 s stall at 14 s, 45 s | Desktop | 73/81 | 120/212; +77 (−636…+208) | **58/81** | 231/240; +29 (−29…+67) |
+| 2 s stall at 14 s, 45 s | Browser | 73/90 | 2/166; −167 (−461…−35) | **59/83** | 189/251; −18 (−104…+87) |
+| 270 ms stall every 10 s, 45 s | Desktop | 48/97 | 22/172; +200 (−37…+275) | 61/96 | 135/163; +34 (−30…+166) |
+| 270 ms stall every 10 s, 45 s | Browser | 43/100 | 178/236; +64 (−43…+178) | 62/100 | 158/206; +35 (−100…+152) |
+| Sound stopped 5 s and returned, 30 s | Desktop | 54/63 | 233/233; +40 (+13…+75) | **50/61** | 231/231; +32 (+4…+65) |
+| Sound stopped 5 s and returned, 30 s | Browser | 60/63 | 242/244; +17 (−16…+50) | **53/62** | 240/241; +17 (−16…+54) |
+
+After the sound came back, in range: desktop 231/231 off, 230/230 on; browser 235/236 off, 234/234
+on. Before `audio::SoundTime` the browser gave 8/84 with sync and 35/84 without.
+
+**Where sync is worse than sync off** (bold above):
+
+- **The first 12 s, on almost every row and both viewers**, by 4 to 22 bursts of about 100; only
+  the 270 ms stalls row and the browser at ±5 ms are equal or better. What acts in these seconds is
+  the start hold (sound silent until the picture is on screen) and the late-frame filter; the waits
+  start only after ten looks.
+- **Settled at ±10 ms on the desktop**, 115/193 against 182/225. Half of the runs in both arms have
+  half the bursts (16 to 18 of about 32) with sound up to 780 ms ahead, a picture that stood still or
+  lost its frames: two runs off, four on. The other runs are alike. Eight runs cannot tell those two
+  counts apart, and the cause is not known.
+- **Settled at ±5 ms on the browser**, 224/251 against 252/254, with p5 at −94 ms: sound ahead.
+- **Settled with no link on the browser**, 251/253 against 253/253.
+
+The analysis below was measured on the build before the rebase (main `1099a681` with #221), against
+main `31ab5683`; the table above replaces its numbers.
+
+- **A 2 s stall.** Counting from the first picture after it, in the five bursts from 3 to 8 s:
+
+  | | Sync off | Sync on |
+  | --- | --- | --- |
+  | Desktop, bursts in range | 1/23 | 34/37 |
+  | Desktop, runs with all in range | 0 of 8 | 6 of 8 |
+  | Browser, bursts in range | 0/5 | 30/36 |
+  | Browser, runs with all in range | 0 of 8 | 3 of 8 |
+  | Worst offset | +5614 ms | +286 ms |
+  | Picture stopped again for 5 s or more | 8 of 16 viewers | 0 of 16 |
+
+  Without sync the browser's sound stays seconds behind. The mixer conceals 5 to 14 blocks and drops
+  about 70 late ones in a stall: the gap is the stall, and sound comes back already on time.
+- **What sync still costs on a clean link.** Nothing is out of range, but on the desktop with no link
+  it moves sound from +81 ms to +60 ms, because main's mixer sits near the range's upper half. The
+  picture only starts waiting 45 ms past the aim, so this is the small waits a noisy lag still starts.
+
+**The three limits on sync came from measuring against true sender reports.** With those fixed, the
+engine holds a start and a jittery link better than a wait does, so:
+
+- A picture wait starts after ten looks, not two: at ±5 ms and two looks, 269/279 and 22/75 in the first
+  12 s on the browser, against 282/282 and 56/75 without sync.
+- The filter acts only after arrivals stopped for 200 ms. Before that it took a queue for a stall: at
+  ±10 ms the desktop was 121/141 with the filter alone and 137/140 with the waits alone, in four runs.
+- A wait starts only 45 ms past the aim. Without that the desktop at ±5 ms was 261/281.
+
+**Sync aims 40 ms late, not at zero.** Zero sits 45 ms from the edge sound must not pass, so a link's
+noise keeps crossing it, while +40 ms is the middle of the range.
+
+Chromium's own NetEq drains a stall's backlog in a sawtooth. It does that with sync off as well, and
+it is why a browser's sound takes a few seconds longer to come down than its picture.
+
+Sound also waited in the browser in an earlier build. It raised a browser's delay to 200–490 ms at
+±10 ms, with the share in range no better, because the engine's own sync then pulled the two up in
+turns. So the browser's sound is left to the engine.
+
+### Latency, startup and voice
+
+Added latency is on the desktop picture only: a median of 102 ms against 76 ms with no link in front,
+to meet sound at 159 ms against 156 ms, and 135 against 108 ms at ±5 ms. The browser is unchanged, at
+86 against 87 ms and 128 against 128 ms. After a stall the desktop's sound stays near 340 ms for
+10–15 s and the picture waits with it.
+
+`pnpm --filter web e2e:screen-startup`, H.264 on busy 60 fps, three repeats of 30 s, twice for each
+of main's bundle and this branch's, alternately, on this branch's server. Every run passed the gate.
+
+| Median of six | Main | This branch |
+| --- | --- | --- |
+| Stable bitrate (s) | 1.58 | 1.30 |
+| First at target (s) | 1.61 | 1.54 |
+| Decoded fps | 59.7 | 59.85 |
+
+Those are from before the late-frame filter. On the build with it, which runs it on every video
+receiver, two more passes gave 1.53 s to stable bitrate and to first at target, and 60 fps. They were
+not repeated after the sender report change; CI's `browser-screen-startup` gate covers that. That
+share has no sound, so the controller never runs in it. With sound, it waits ten looks after the first
+picture, and the sound hold only silences, so neither can delay the first frame.
+
+Voice is unchanged. `voice_alone_fingerprint` is still `c2d868db7d8d0eeb`, and
+`four_shares_leave_the_voice_pipeline_on_time` passes in release. The mixer's new read path runs only
+for an open share. Its ring missed a block in 1 of 40 desktop viewers with sync and 2 of 40 without.
+
+### Not measured here
+
+WebKit, whether as a browser viewer or as the macOS app's page: it opened the Mac's speakers even
+for a desktop viewer, so the two attempts here were stopped by the guard within 0.25 s, with no
+result. The `browser-share-sync` CI job measures both on Linux, as a diagnostic. WebKit's API was
+probed here (`jitterBufferTarget`, synchronization sources in Unix time), but the targets above
+are not shown for it. A native sharer's computer sound was not measured either, nor a real app
+on real speakers.

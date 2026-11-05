@@ -1929,11 +1929,13 @@ impl Core {
             }
             Request::ScreenAudioAdd { share, sdp } => return self.screen_audio_add(session, id, share, sdp),
             Request::ScreenAudioResume { share } => self.screen_audio_resume(session, &share),
+            Request::ScreenAudioSync { share } => self.screen_audio_sync(session, &share),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
             Request::ScreenDecodeFailed { share, slot, run, generation } => {
                 self.screen_decode_failed(session, &share, slot, run, generation)
             }
             Request::ScreenKeyframe { share } => self.screen_keyframe(session, &share),
+            Request::ScreenStalled { share } => self.screen_stalled(session, &share),
             Request::ScreenStop { share } => self.screen_stop(session, &share),
             Request::ScreenWatch { share } => self.screen_watch(session, &share),
             Request::ScreenUnwatch { share } => self.screen_unwatch(session, &share),

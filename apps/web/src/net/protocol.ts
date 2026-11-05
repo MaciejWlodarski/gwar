@@ -41,6 +41,7 @@ export interface ResponseMap {
   "screen.audio.add.capabilities": { screen_audio_add: boolean };
   "screen.audio.add": { sdp: string };
   "screen.audio.resume": { audio: boolean };
+  "screen.audio.sync": { known: boolean; audio_rtp: number; video_rtp: number };
   "screen.capabilities": { screen_h264: boolean };
   "screen.av1.capabilities": { screen_av1: boolean };
   "mls.device.publish": Empty;
@@ -126,6 +127,7 @@ export interface ResponseMap {
   "screen.watch.offer": { sdp: string };
   "screen.focus": Empty;
   "screen.keyframe": Empty;
+  "screen.stalled": Empty;
   "screen.decode_failed": Empty;
   "owner.chain": { genesis: string; links: import("../proto/OwnerLinkStatement").OwnerLinkStatement[]; next: number | null };
   "owner.transfer": Empty;

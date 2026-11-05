@@ -371,18 +371,140 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   reports success once it is in force. Playback is not tied to one voice run: a voice
   reconnect replaces the pipeline reading the ring, not the streams.
 - A lost frame is concealed up to 100 ms. Sound that arrives after the queue ran dry still
-  plays, which leaves the queue the cushion the next lump needs. A queue that stayed over
+  plays, which leaves the queue the cushion the next lump needs. An arrival is learnt as the
+  network's jitter while it is no later than the queue could ride out (the delay and any hold
+  for the picture, or a hold still being given back) plus the concealment; anything later is a pause in the sound and starts a
+  new stretch, so a pause never leaves the sound late. A queue that stayed over
   its limit (the delay plus 80 ms) for half a second is a stall's backlog: the excess is
   dropped rather than played late. So after a stall, sound can trail by up to 640 ms for half
-  a second.
+  a second. A stream queues at most 48 packets, 960 ms: a full hold, the longest delay and the
+  margin take 640 ms, and the rest takes a lump, so the trim, not the newest packets, decides
+  what goes.
+
+### Lip-sync
+
+The desktop app lines a share's picture and sound up once a second. Voice is never involved, and a
+share without sound never comes through here. `apps/web/src/voice/share-sync.ts` holds the decisions.
+A browser leaves it to its engine, which plays both and lines them up itself: a second controller on
+the same pair, moving the picture on one noisy look, only disturbed it. In a
+browser a stall's part is the late-frame filter's, and a new watch's start is the sound hold's.
+
+Both sides are read where they come out: the picture from the video receiver's synchronization
+source, and the sound from the mixer, which reports when a recent sample reaches the speaker
+(`share_playback_clock`). The SFU rewrites
+RTP times per viewer, so only it can relate them: `screen.audio.sync` returns one audio and one
+video RTP time of the same instant for the viewer's slot, taken from the sender reports' shared
+wallclock, or `known: false` until it has them. A viewer asks at each look.
+
+**Sync aims 40 ms late**, the middle of the range nobody notices, 45 ms ahead to 125 ms behind. Aimed
+at zero, a link's ordinary noise keeps crossing the edge sound must not lead past. Every wait below
+is measured from that aim.
+
+**The picture waits.** Sound carries speech, and a picture a few tens of milliseconds later is the
+smaller loss. `jitterBufferTarget` is a minimum, so a wait starts from the delay the receiver
+already has. Each move goes by the median of the last three looks (fewer just after a start or a
+break, but never one alone after a break), since one look can be off by a packet of sound or a
+held-up frame. The first move goes the
+whole way, since nobody has seen the picture settle; later ones move at most 40 ms at half the
+error, and nothing moves for less than 10 ms. How long the receiver held the picture is asked at
+every look, settling ones too, so the first move reads the last second and not the stream's start. A wait starts only
+when sound is 45 ms past the aim, short of the range's edge: below that it would only add latency and
+push sound towards the edge it must not lead past. A picture that
+keeps agreeing gives 5 ms a second back, because the webview's own sync pulls each side up to the
+other and a lag alone would never show that a wait is no longer needed.
+
+**Sound waits too**, for a picture that is late with nothing left to give, for a lead over 25 ms, in
+steps. Sound leaves the webview, so its own sync has none to work with.
+The mixer plays it up to 1 % slower, 10 ms a second and at most 400 ms in all; when the wait
+falls it plays up to 1 % faster until the queue is back. Within 30 ms of its aim the speed is in
+proportion, and it changes over 500 ms: the queue counts whole 20 ms packets that jitter moves, so
+an all-or-nothing speed wandered by the whole 1 %, 17 cents on music (0.9959 to 1.0092 under
+±10 ms; now 0.9986 to 1.0019). With no wait the mixer picks its speed as before, smoothed the same. While sound is not ahead it keeps
+giving a wait back.
+
+A watch settles for ten looks before anything moves, per slot: its keyframes and buffers are still
+landing, and the engine's own sync gets there by itself. A paused picture moves nothing, so
+the waits are still there for the resume, and the next look corrects what the pause changed. Muting
+and deafening release both waits, since nothing heard is left to line up with, and sound coming back
+starts over like a new watch. A server without the query answers `bad_request` once and the viewer does not ask
+again; a question lost to a timeout is asked again at the next look, and muting releases the waits
+either way. After five looks in a row with no line between the clocks (unknown or unanswered) or no
+sound to place, the waits are a guess: the slot gives them back and settles again once it can
+measure. A still picture keeps its wait. A webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
+still hold sound.
+
+**A new watch starts together.** Its sound is silent until its first picture is on screen, so
+nobody hears a share they cannot see yet, and nothing about the first frame changes. A picture that
+is 1.5 s late stops holding the sound back, because sound matters more. Past that moment the
+picture can still run 300–700 ms behind for a few seconds, while the sharer's encoder and uplink
+ramp; that is the first viewer of a new share only, and sound does not wait for it, because the
+picture catches up by itself and sound held for it would then lag.
+
+Stopping sound and bringing it back is the case this does not cover. The publisher's RTP time stays
+behind its clock by the length of the stop, so for 10–20 s the engine holds the picture 300–470 ms
+late, with or without this, and sound leads by that much.
+
+What this cannot fix is a picture that is not arriving: on a link jittery enough to collapse the
+estimate it can stop altogether, and sound then leads whatever is done here. The numbers are in
+[share-audio-validation.md](share-audio-validation.md#lip-sync).
+
+### After a link stall
+
+When a link stops for a while and comes back, everything it held arrives at once. A receiver that
+takes that backlog plays seconds behind and unlearns it slowly: the SFU's queue is clear within
+about 3 s, but 500–1600 ms stays in the viewer's jitter buffer for 7–10 s. The estimate falls with
+it, to 3–4 Mb/s from tens, and at that rate a keyframe misses its deadline. Two such keyframes
+paused the picture for more than 10 s, on a link that was back and proven seconds before.
+
+So a viewer drops the backlog before its receiver sees it (`apps/web/src/voice/late-frames.ts`).
+`RTCRtpScriptTransform` runs on each received frame and works out how much longer it took than the
+quickest of the last few seconds, by the media's own clock. It only acts after arrivals stopped for
+200 ms: frames that are late without that are a queue, which the receiver drains by itself. A
+frame over 500 ms late goes, picture or sound alike: shed alone, sound ran ahead of a picture still
+playing its backlog, and a browser does not line them up again (270 ms stalls in a browser: 75 % of
+bursts in range without sync, 70 % with a 200 ms threshold for sound). In the desktop app sound
+leaves for the mixer, which drops a backlog itself, and the picture's wait lines the two up. Keyframes are always kept, and a run that opens with one is a resumed slot's first
+picture, held up by its own size, not a backlog. Nothing is shed for more than a second in a row: a
+link that stays that slow is the link now, and it sets the new measure. Without script transforms a
+viewer plays the backlog, as before. The filter never stops a frame on its own failure: if it
+throws, every later frame passes, and if the stream fails, what still flows is piped through
+unfiltered, so a slot can never freeze on it. A worker that never runs would leave every transform
+unread, picture and sound alike: it has to say it loaded within 2 s, and if it does not, or fails
+at any time, every receiver's transform comes off and the session's later transports go without
+the filter. The 2 s count the worker's download, so on a link that slow the session simply plays
+without the filter. Taking the transforms off is not enough: Chromium decodes nothing more on a
+receiver whose transform was taken off, whether the worker never loaded or died while pictures
+flowed (packets keep arriving, no frame reaches the decoder). So a failed worker also replaces the
+watch transport with one without the filter, at once and with no notice, as after a transport
+failure. CI's share-sync job breaks the worker on purpose, at load and while pictures flow, and
+checks that every viewer's picture, and a browser viewer's sound, play on.
+
+The first frame of a backlog proves the link is back, so that is when the viewer sends
+`screen.stalled`, and again at the first frame in time, because frames were dropped since any
+keyframe in between. The SFU asks for a keyframe and puts the estimate back towards what the watched
+shares need with room for a keyframe, never past what the link carried in the last 15 s, the
+server's budget, or 1.5 times the estimate it finds. It does that at most once in 10 s on a viewer's
+word, and not for a paused slot. The estimator then proves or lowers it as usual: a fall after the
+restore is the link's answer. The viewer's word says a backlog arrived, not what the link carries
+now, so the reach is bounded for a link that came back slower. In the simulator, a 2 s stall that
+left the link at a quarter cost voice 1.37 s more of 50 ms queue with an unbounded restore and a
+second one within a second, and 0.12 s more at 1.5 times; told with the backlog's first frame,
+before feedback lowered the estimate, the SFU restores nothing and voice pays nothing more. A
+restore does not stop a new viewer following its ramping share up: the catch-up goes on, held
+against the restored estimate. Dropping frames the SFU forwarded whole also restarts the slot's
+decode watchdog, once until it decodes again, so the keyframe wait is never reported as a decoder
+that cannot decode, and a filter that keeps dropping cannot hold a real failure's report off.
+
+The picture has just jumped, so one more move goes unseen: after the backlog lands, the first look
+that finds the two sides over 45 ms apart moves the picture the whole way, once, while sound is
+free to come down at its own pace. Sound is only ever dropped before its decoder, which conceals
+the gap as it would a lost packet.
 
 ### Not included
 
 - **The sharer's own echo.** Sound the sharer's speakers play can reach their microphone.
   Feeding the captured sound to the canceller ([native-media.md](native-media.md#echo-and-the-sharers-microphone))
   is not done yet; headphones avoid it.
-- **Lip-sync is not actively corrected.** Sound runs behind the picture by the jitter queue and
-  rings, by estimate at most 100–120 ms. It has not been measured.
 - Mobile clients and the browser are unchanged.
 
 Validation is in [share-audio-validation.md](share-audio-validation.md#pr-2-desktop-app).
