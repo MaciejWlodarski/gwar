@@ -85,6 +85,8 @@ export function makePlan({ rows, arms, runs, viewers, engine, seconds, net, shar
   if (seconds !== "" && seconds !== undefined && !(Number(seconds) >= 10 && Number(seconds) <= 300)) fail("seconds must be 10 to 300");
   seed = String(seed ?? "") === "" ? 1 : Number(seed);
   if (!Number.isSafeInteger(seed)) fail("seed must be an integer");
+  ref = checkRef(ref);
+  if (!/^[0-9a-f]{40}$/.test(String(sha ?? ""))) fail(`the ref's commit ${JSON.stringify(sha)} is not a full SHA`);
 
   const random = rng(seed);
   const blocks = [];
@@ -112,12 +114,25 @@ export function makePlan({ rows, arms, runs, viewers, engine, seconds, net, shar
   const count = Math.min(shards, dealt.length);
   const shardList = Array.from({ length: count }, () => []);
   dealt.forEach((block, i) => shardList[i % count].push(block));
+  const timeouts = shardTimeouts(shardList.map(list => list.flatMap(block => block.runs)));
+  if (timeouts.job > MAX_JOB_MINUTES) fail(`the longest shard needs a ${timeouts.job} min job, over ${MAX_JOB_MINUTES} (GitHub stops jobs at 360): fewer runs or rows, or more shards`);
   return {
-    seed, ref, sha, engine, viewers, arms, baseline: arms[0],
+    seed, ref, sha, engine, viewers, arms, baseline: arms[0], timeouts,
     rows: rows.map(row => ({ row, net: row === "custom" ? net : ROWS[row].net, label: row === "custom" ? "Custom" : ROWS[row].label })),
     runsPerArm: runs,
     shards: shardList.map((list, shard) => ({ shard, runs: list.flatMap(block => block.runs) })),
   };
+}
+
+/**
+ * A run is its watch plus under a minute of build, joins and teardown; five more minutes of slack
+ * per run. The measuring step gets that, the job 15 minutes more for its setup.
+ */
+export const MAX_JOB_MINUTES = 345;
+export function shardTimeouts(shards) {
+  const longest = Math.max(...shards.map(runs => runs.reduce((s, run) => s + run.seconds + 60 + 300, 0)));
+  const step = Math.ceil(longest / 60) + 5;
+  return { step, job: step + 15 };
 }
 
 /** Each pair of a viewer's record, put in its window: `first` before 12 s from the watch's start. */
@@ -138,60 +153,58 @@ export const percentile = (values, share) => {
 };
 
 /** Pooled share in range of runs given as [inRange, total], each run weighted by its bursts. */
-const pooled = runs => {
-  let hit = 0, all = 0;
-  for (const [h, n] of runs) { hit += h; all += n; }
-  return all ? hit / all : NaN;
-};
-
 /**
- * Arm B against arm A over runs, never over bursts: bursts of one run share its start, its
- * runner and its link, so they are not independent. `runs` are [inRange, total] per run.
- * The bootstrap resamples whole runs within each arm (95% interval of the difference in pooled
- * share); the permutation test shuffles the arm labels of the runs' own shares (two-sided).
+ * Arm B against the baseline, paired by block: each block ran both arms once, back to back on one
+ * runner, so its difference (B's share in range minus the baseline's, each run's own share) leaves
+ * that runner's speed and load out. Bursts are never the unit: those of one run share its start,
+ * its runner and its link. The estimate is the mean of the blocks' differences; the interval
+ * resamples blocks (bootstrap, 95%); p is a two-sided sign-flip test over blocks, exact up to 16
+ * blocks and sampled above (then never below 1 / (draws + 1)).
  */
-export function compareRuns(a, b, { seed = 1, draws = 10_000 } = {}) {
-  a = a.filter(([, n]) => n > 0);
-  b = b.filter(([, n]) => n > 0);
-  const result = { runsA: a.length, runsB: b.length, diff: pooled(b) - pooled(a), low: null, high: null, p: null };
-  if (a.length < 2 || b.length < 2) return result;
-  const random = rng(seed);
-  const pick = runs => Array.from(runs, () => runs[Math.floor(random() * runs.length)]);
-  const diffs = [];
-  for (let i = 0; i < draws; i++) {
-    const d = pooled(pick(b)) - pooled(pick(a));
-    if (!Number.isNaN(d)) diffs.push(d);
-  }
-  result.low = percentile(diffs, 0.025);
-  result.high = percentile(diffs, 0.975);
-
-  const shares = [...a, ...b].map(([h, n]) => h / n);
+export function comparePaired(diffs, { seed = 1, draws = 10_000 } = {}) {
+  const n = diffs.length;
   const mean = values => values.reduce((s, v) => s + v, 0) / values.length;
-  const observed = Math.abs(mean(shares.slice(a.length)) - mean(shares.slice(0, a.length)));
-  const at = (indexes, share) => indexes.map(i => share[i]);
-  let extreme = 0, total = 0;
-  const all = shares.map((_, i) => i);
-  const combos = binomial(all.length, a.length);
-  const test = pickA => {
-    const inA = new Set(pickA);
-    const d = Math.abs(mean(at(all.filter(i => !inA.has(i)), shares)) - mean(at(pickA, shares)));
-    total++;
-    if (d >= observed - 1e-12) extreme++;
-  };
-  if (combos <= 20_000) for (const pickA of combinations(all, a.length)) test(pickA);
-  else for (let i = 0; i < draws; i++) test(shuffle(all, random).slice(0, a.length));
-  result.p = extreme / total;
-  result.exact = combos <= 20_000;
+  const result = { pairs: n, diff: n ? mean(diffs) : null, low: null, high: null, p: null, exact: null, floor: n ? 2 / 2 ** n : null };
+  if (n < 2) return result;
+  const random = rng(seed);
+  const means = Array.from({ length: draws }, () => mean(Array.from(diffs, () => diffs[Math.floor(random() * n)])));
+  result.low = percentile(means, 0.025);
+  result.high = percentile(means, 0.975);
+  const observed = Math.abs(result.diff) - 1e-12;
+  const flipped = sign => Math.abs(mean(diffs.map((d, i) => (sign(i) ? -d : d))));
+  if (n <= 16) {
+    let extreme = 0;
+    for (let mask = 0; mask < 2 ** n; mask++) if (flipped(i => (mask >> i) & 1) >= observed) extreme++;
+    result.p = extreme / 2 ** n;
+    result.exact = true;
+  } else {
+    let extreme = 0;
+    for (let i = 0; i < draws; i++) if (flipped(() => random() < 0.5) >= observed) extreme++;
+    result.p = (extreme + 1) / (draws + 1);
+    result.exact = false;
+    result.floor = 1 / (draws + 1);
+  }
   return result;
 }
 
-function binomial(n, k) {
-  let out = 1;
-  for (let i = 1; i <= k; i++) out = (out * (n - k + i)) / i;
-  return Math.round(out);
+/** Holm's step-down adjustment of p-values (nulls stay null), in the input's order. */
+export function holm(ps) {
+  const order = ps.map((p, i) => [p, i]).filter(([p]) => p !== null).sort((a, b) => a[0] - b[0]);
+  const m = order.length;
+  const out = ps.map(() => null);
+  let running = 0;
+  order.forEach(([p, i], rank) => {
+    running = Math.max(running, Math.min(1, (m - rank) * p));
+    out[i] = running;
+  });
+  return out;
 }
 
-function* combinations(items, k, from = 0, chosen = []) {
-  if (chosen.length === k) { yield chosen; return; }
-  for (let i = from; i <= items.length - (k - chosen.length); i++) yield* combinations(items, k, i + 1, [...chosen, items[i]]);
+/** A branch, tag or SHA that is safe in a shell, an output file and a checkout; never a PR ref. */
+export function checkRef(ref) {
+  const value = String(ref ?? "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value) || value.includes("..") || value.endsWith(".lock") || value.endsWith("/"))
+    throw new Error(`ref ${JSON.stringify(value)} is not a plain branch, tag or SHA`);
+  if (/^(refs\/)?pull\//.test(value)) throw new Error("pull request refs are not measured here: their code would run with this repository's caches (docs/timing-runs.md)");
+  return value;
 }

@@ -5,9 +5,16 @@ the "Lip-sync" section of [share-audio-validation.md](share-audio-validation.md)
 GitHub's hosted Ubuntu runners, many at a time, instead of one after another on a Mac. It is manual
 only: it never runs on a push or a pull request and cancels nothing in `ci.yml`.
 
-The measured code comes from the `ref` input; the workflow's own scripts (`scripts/timing/`) come
-from the commit it is dispatched from. So a branch whose lip-sync kit has not merged yet can be
-measured from `main`'s workflow.
+The measured code comes from the `ref` input, resolved once to one commit that every job checks
+out; the workflow's own scripts (`scripts/timing/`) come from the commit it is dispatched from. So a
+branch whose lip-sync kit has not merged yet can be measured from `main`'s workflow.
+
+**Measure trusted refs only**: this repository's own branches, tags and commits, never a fork's
+pull request or anything not yet read. A dispatch from `main` builds and runs the measured code
+(its `build.rs` files, `pnpm install`, its scripts) with `main`'s cache scope, where this workflow
+saves its Rust and wasm caches; later timing dispatches restore them. ci.yml never reads those
+entries (they have their own prefixes), but a hostile ref could still poison the next dispatch's
+build. `pull/…` refs are refused.
 
 ## Running it
 
@@ -23,7 +30,7 @@ The table is the run's job summary (the `aggregate` job). Each shard's artifact
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `ref` | (required) | Branch, tag or SHA measured. It must contain `apps/web/e2e/share-sync.mjs`. |
+| `ref` | (required) | Branch, tag or SHA measured (letters, digits, `._/-`; no `..`; no `pull/`). It must contain `apps/web/e2e/share-sync.mjs`. |
 | `rows` | `j10` | Comma list of rows, below. |
 | `arms` | `off,on` | Comma list of arms, below. The first is the baseline every other arm is compared with. |
 | `runs` | `8` | Runs per arm per row. |
@@ -56,22 +63,25 @@ Arms: `off` (`SYNC_OFF=1`, main's playback), `on`, `nofilter` (`SYNC_NOFILTER=1`
 
 ## What it does
 
-1. `plan` checks the inputs and writes the plan: for every row and repetition one block that holds
+1. `plan` resolves `ref` to its commit, checks the inputs and writes the plan: for every row and repetition one block that holds
    each arm once, in a seeded random order; the next repetition runs the reverse order, so every arm
    runs as often first as last. With two viewers their order flips every two repetitions. Blocks are
    dealt whole to the shards, so the arms of a block share one runner and its load at that time.
 2. `native` builds `web_latency` (server, relay and network emulator) and `native_bridge` once.
-   `wasm` takes the web app's two wasm packages from the measured commit's own CI run while it still
-   has them (7 days), else from this workflow's cache or ci.yml's, else builds them as ci.yml does.
+   `wasm` takes the web app's two wasm packages from the measured commit's own CI *push* run (so a
+   commit on `main`) while it still has them (7 days), else from this workflow's cache or ci.yml's
+   (exact keys from `scripts/ci/wasm-key.py`, never a prefix), else builds them as ci.yml does. A
+   pull request's CI run is never used: it builds the merge commit, not the measured one.
 3. `measure`, one job per shard, runs its runs in order, as ci.yml's `browser-share-sync` does:
    PulseAudio with a null sink as the only output (nothing is audible), `SYNC_FAKE_TAB=1` (Linux
    Chromium captures a tab's picture but not its sound). Around every run it records the runner's
    CPU model and count, the 1-minute load before, after and its peak (sampled every 2 s), and the
    run's busy, I/O-wait and steal share of CPU time from `/proc/stat`.
-4. `aggregate` builds the table from every shard's records, even when a shard failed.
+4. `aggregate` builds the table from every shard's records, even when a shard failed. It fails,
+   with a warning on top of the table, when the runs did not all measure the planned commit.
 
 A run is **invalid**, kept with its reasons and left out of the table, when share-sync failed or
-timed out, when the 1-minute load peaked above 2 per CPU (`TIMING_MAX_LOAD_PER_CPU`; a valid run peaks
+timed out, when its report was unreadable, when it checked out another commit than the plan's, when the 1-minute load peaked above 2 per CPU (`TIMING_MAX_LOAD_PER_CPU`; a valid run peaks
 near 1 per CPU), when the
 hypervisor took over 5% of the CPU time (`TIMING_MAX_STEAL`), or when the relay could not send
 datagrams. The "Invalid and missing runs" table lists them.
@@ -90,7 +100,8 @@ as long as 20 jobs can start at once.
 
 Per row, one line per viewer and arm:
 
-- **Valid runs**: valid of reported.
+- **Valid runs**: valid of reported. When a viewer's watch was never seen granted, its start is its
+  first picture, and the cell says in how many runs.
 - **First 12 s**: bursts in range of paired bursts, over every valid run, for the bursts drawn in
   the first 12 s after the viewer's watch started (when it was granted; else its first picture).
   In range is −45 to +125 ms, from the measured ref's `share-sync-judge.mjs`.
@@ -99,14 +110,28 @@ Per row, one line per viewer and arm:
 - **Per-run** columns: each valid run's share in range, sorted, so one bad run cannot hide in a
   pooled count.
 
-Below each row, every arm against the baseline, per viewer and window, **over runs, not bursts**:
-the bursts of one run share its start, its runner and its link, so they are not independent, and a
-test over bursts would call nearly any difference significant. Δ is the difference of the pooled
-shares in range in percentage points; the interval is a bootstrap that resamples whole runs within
-each arm; p is a permutation test on the runs' own shares (exact up to 20,000 arrangements). "Better"
-or "worse" needs the interval to exclude zero and p < 0.05. With 2 runs per arm the smallest
-possible p is 0.33, so a small dispatch shows that the workflow works, not a difference; 8 runs per
-arm can show a clear one.
+Below each row, every arm against the baseline, per viewer and window, **paired by block, never
+over bursts**. A block is one repetition of a row: the baseline and the other arm ran back to back
+on one runner. The bursts of one run share its start, its runner and its link, so they are not
+independent, and a test over bursts would call nearly any difference significant; pairing the
+two arms of a block also leaves out how fast or busy that runner was.
+
+- **Blocks**: blocks where both runs are valid and paired bursts in that window.
+- **Δ pp**: the mean over blocks of (the arm's run's share in range − the baseline run's), in
+  percentage points. Each run counts once, however many bursts it paired; the pooled counts
+  above can differ from it.
+- **95% interval**: a bootstrap that resamples blocks.
+- **p**: a two-sided sign-flip test over blocks, exact up to 16 blocks (sampled above, then never
+  below 1 / 10,001).
+- **Holm p**: p adjusted by Holm's method over **every** comparison of the dispatch (all rows,
+  viewers, windows and arms), so asking more questions does not make a chance difference look real.
+- **Reading**: "better" or "worse" needs Holm p < 0.05 and an interval that excludes zero.
+
+With n blocks the smallest possible p is 2 / 2^n, and with k comparisons Holm needs 0.05 / k for the
+strongest. So 8 runs per arm (p ≥ 0.0078) can show a difference among at most 6 comparisons, 10 runs
+(p ≥ 0.002) among 25, 12 runs among 100. Two viewers, two windows and one arm against the baseline
+are 4 comparisons per row. The summary states both numbers for its dispatch, and the reading says
+when there were too few blocks to show anything.
 
 The "Runner load by arm" table should show the same load for every arm; if it does not, distrust
 the comparison.

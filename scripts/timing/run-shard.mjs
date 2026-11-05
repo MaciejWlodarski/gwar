@@ -111,6 +111,7 @@ async function measure(run, index) {
     cpu = { busy: Number((1 - (d("idle") + d("iowait")) / total).toFixed(3)), steal: Number((d("steal") / total).toFixed(4)), iowait: Number((d("iowait") / total).toFixed(4)) };
   }
 
+  if (sha !== plan.sha) reasons.push(`checked out ${sha}, but the plan measures ${plan.sha}`);
   if (timedOut) reasons.push(`timed out after ${deadline / 1000} s`);
   else if (exit !== 0) reasons.push(`share-sync failed (exit ${exit ?? signal})`);
   if (loadMax > maxLoadPerCpu * runner.nproc) reasons.push(`load ${loadMax.toFixed(1)} above ${maxLoadPerCpu} per CPU (${runner.nproc} CPUs)`);
@@ -124,18 +125,23 @@ async function measure(run, index) {
     limits, leftBefore: left.length, valid: true, reasons, viewers: {},
   };
   if (existsSync(reportPath)) {
-    const raw = readFileSync(reportPath);
-    writeFileSync(path.join(outDir, "raw", `${run.id}.json.gz`), gzipSync(raw));
-    const report = JSON.parse(raw);
-    record.relay = report.relay ? { sendErrors: report.relay.downlink_send_errors ?? null } : null;
-    if (record.relay?.sendErrors) reasons.push(`relay could not send ${record.relay.sendErrors} datagrams`);
-    for (const [kind, viewer] of Object.entries(report.viewers ?? {})) {
-      if (viewer.pictureOnly) { record.viewers[kind] = { pictureOnly: true }; continue; }
-      // The watch's start: when it was granted, else its first picture, else its first pair.
-      const [t0, t0From] = viewer.granted ? [viewer.granted, "granted"]
-        : viewer.presented?.length ? [viewer.presented[0].at, "first picture"]
-        : [viewer.pairs?.[0]?.at ?? 0, "first pair"];
-      record.viewers[kind] = { t0, t0From, summary: viewer.summary, pairs: (viewer.pairs ?? []).map(({ burst, at, offsetMs }) => ({ burst, at, offsetMs })) };
+    try {
+      const raw = readFileSync(reportPath);
+      writeFileSync(path.join(outDir, "raw", `${run.id}.json.gz`), gzipSync(raw));
+      const report = JSON.parse(raw);
+      record.relay = report.relay ? { sendErrors: report.relay.downlink_send_errors ?? null } : null;
+      if (record.relay?.sendErrors) reasons.push(`relay could not send ${record.relay.sendErrors} datagrams`);
+      for (const [kind, viewer] of Object.entries(report.viewers ?? {})) {
+        if (viewer.pictureOnly) { record.viewers[kind] = { pictureOnly: true }; continue; }
+        // The watch's start: when it was granted, else its first picture, else its first pair.
+        const [t0, t0From] = viewer.granted ? [viewer.granted, "granted"]
+          : viewer.presented?.length ? [viewer.presented[0].at, "first picture"]
+          : [viewer.pairs?.[0]?.at ?? 0, "first pair"];
+        record.viewers[kind] = { t0, t0From, summary: viewer.summary, pairs: (viewer.pairs ?? []).map(({ burst, at, offsetMs }) => ({ burst, at, offsetMs })) };
+      }
+    } catch (error) {
+      reasons.push(`unreadable report: ${String(error.message ?? error).slice(0, 200)}`);
+      record.viewers = {};
     }
     rmSync(reportPath, { force: true });
   } else if (!reasons.length) reasons.push("no report");
@@ -146,4 +152,18 @@ async function measure(run, index) {
 }
 
 console.log(`shard ${shard.shard}: ${shard.runs.length} runs on ${runner.name}, ${runner.nproc} × ${runner.cpu}, ${runner.memoryGiB} GiB`);
-for (const [index, run] of shard.runs.entries()) await measure(run, index);
+for (const [index, run] of shard.runs.entries()) {
+  // One run's surprise never costs the shard its other runs.
+  try {
+    await measure(run, index);
+  } catch (error) {
+    console.log(`${run.id}: INVALID (the harness failed: ${error.message ?? error})`);
+    writeFileSync(path.join(outDir, "records", `${run.id}.json`), JSON.stringify({
+      id: run.id, row: run.row, arm: run.arm, rep: run.rep, shard: shard.shard, position: index, net: run.net, seconds: run.seconds,
+      viewerOrder: run.viewers, engine: plan.engine, ref: plan.ref, sha, seed: plan.seed, startedAt: new Date().toISOString(), wallMs: 0,
+      runner, load: { before: [], after: [], max1: null }, cpu: null, limits, valid: false,
+      reasons: [`the harness failed: ${String(error.message ?? error).slice(0, 200)}`], viewers: {},
+    }));
+    killLeftovers();
+  }
+}

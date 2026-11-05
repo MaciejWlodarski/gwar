@@ -73,6 +73,18 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_INCREMENTAL: "0"
+  # The dispatch's inputs, read only by plan.mjs (which checks every one) and the ref's resolution.
+  TIMING_REF: ${{ inputs.ref }}
+  TIMING_ROWS: ${{ inputs.rows }}
+  TIMING_ARMS: ${{ inputs.arms }}
+  TIMING_RUNS: ${{ inputs.runs }}
+  TIMING_VIEWERS: ${{ inputs.viewers }}
+  TIMING_ENGINE: ${{ inputs.engine }}
+  TIMING_SECONDS: ${{ inputs.seconds }}
+  TIMING_NET: ${{ inputs.net }}
+  TIMING_SHARDS: ${{ inputs.shards }}
+  TIMING_PROFILE: ${{ inputs.profile }}
+  TIMING_SEED: ${{ inputs.seed || github.run_id }}
 
 jobs:
   plan:
@@ -80,8 +92,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      timeout: ${{ steps.plan.outputs.timeout }}
-      ref: ${{ steps.plan.outputs.ref }}
+      job_timeout: ${{ steps.plan.outputs.job_timeout }}
+      step_timeout: ${{ steps.plan.outputs.step_timeout }}
+      sha: ${{ steps.plan.outputs.sha }}
       profile: ${{ steps.plan.outputs.profile }}
       engine: ${{ steps.plan.outputs.engine }}
     steps:
@@ -96,29 +109,24 @@ jobs:
       - name: Timing scripts' own tests
         timeout-minutes: 2
         run: node --test scripts/timing/timing.test.mjs
+      # Once, here: every later job checks out this commit, so a push to the ref mid-dispatch
+      # changes nothing that is measured.
+      - name: Resolve the ref to one commit
+        id: resolve
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node --input-type=module -e 'import { checkRef } from "./scripts/timing/lib.mjs"; checkRef(process.env.TIMING_REF);'
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TIMING_REF" -q .sha)
+          echo "$TIMING_REF is $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Plan the interleaved runs
         id: plan
         timeout-minutes: 2
         env:
-          TIMING_REF: ${{ inputs.ref }}
-          TIMING_ROWS: ${{ inputs.rows }}
-          TIMING_ARMS: ${{ inputs.arms }}
-          TIMING_RUNS: ${{ inputs.runs }}
-          TIMING_VIEWERS: ${{ inputs.viewers }}
-          TIMING_ENGINE: ${{ inputs.engine }}
-          TIMING_SECONDS: ${{ inputs.seconds }}
-          TIMING_NET: ${{ inputs.net }}
-          TIMING_SHARDS: ${{ inputs.shards }}
-          TIMING_PROFILE: ${{ inputs.profile }}
-          TIMING_SEED: ${{ inputs.seed || github.run_id }}
-        run: |
-          node scripts/timing/plan.mjs "$RUNNER_TEMP/timing/plan.json"
-          case "$TIMING_PROFILE" in release|debug) ;; *) echo "profile must be release or debug" >&2; exit 1 ;; esac
-          {
-            echo "ref=$TIMING_REF"
-            echo "profile=$TIMING_PROFILE"
-            echo "engine=$TIMING_ENGINE"
-          } >> "$GITHUB_OUTPUT"
+          TIMING_SHA: ${{ steps.resolve.outputs.sha }}
+        run: node scripts/timing/plan.mjs "$RUNNER_TEMP/timing/plan.json"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         timeout-minutes: 5
         with:
@@ -136,7 +144,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
         with:
-          ref: ${{ needs.plan.outputs.ref }}
+          ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         timeout-minutes: 5
@@ -169,8 +177,9 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # The web app's two wasm packages: from the measured commit's own CI run when it still has them,
-  # else from this workflow's cache, else built as ci.yml builds them.
+  # The web app's two wasm packages: from the measured commit's own CI push run (main) when it
+  # still has them, else from this workflow's cache or ci.yml's (exact keys only), else built as
+  # ci.yml builds them.
   wasm:
     needs: plan
     runs-on: ubuntu-24.04
@@ -182,7 +191,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
         with:
-          ref: ${{ needs.plan.outputs.ref }}
+          ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
       - name: The commit's CI artifacts
         id: ci
@@ -191,7 +200,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha=$(git rev-parse HEAD)
-          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$sha" --limit 10 --json databaseId -q '.[].databaseId'); do
+          # Push runs only (main's): a pull request's run builds its merge commit, not this one.
+          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push --commit "$sha" --limit 10 --json databaseId -q '.[].databaseId'); do
             rm -rf crates/gwar-mls-wasm/pkg crates/gwar-denoise-wasm/pkg
             if gh run download "$run" --repo "$GITHUB_REPOSITORY" -n mls-wasm -D crates/gwar-mls-wasm/pkg \
               && gh run download "$run" --repo "$GITHUB_REPOSITORY" -n denoise-wasm -D crates/gwar-denoise-wasm/pkg; then
@@ -222,12 +232,17 @@ jobs:
         if: steps.ci.outputs.found != 'true'
         id: keys
         timeout-minutes: 5
-        # ci.yml's exact keys, which this workflow only reads; it saves under its own prefix.
+        # ci.yml's exact keys: read here, never written; this workflow saves under its own prefix.
         run: |
           for kind in mls denoise; do
-            echo "$kind=$(GITHUB_OUTPUT=/dev/null python3 scripts/ci/wasm-key.py "$kind" | tail -n 1)" >> "$GITHUB_OUTPUT"
+            key=$(GITHUB_OUTPUT=/dev/null python3 scripts/ci/wasm-key.py "$kind" | tail -n 1)
+            if [[ ! $key =~ ^wasm-pkg-v1-[A-Za-z0-9-]+-$kind-[0-9a-f]{64}$ ]]; then
+              echo "wasm-key.py gave no usable $kind key: '$key'" >&2
+              exit 1
+            fi
+            echo "$kind=$key" >> "$GITHUB_OUTPUT"
           done
-      - name: Restore finished mls wasm
+      - name: Restore this workflow's mls wasm
         if: steps.ci.outputs.found != 'true'
         id: mls
         timeout-minutes: 5
@@ -235,8 +250,15 @@ jobs:
         with:
           path: crates/gwar-mls-wasm/pkg/
           key: timing-${{ steps.keys.outputs.mls }}
-          restore-keys: ${{ steps.keys.outputs.mls }}
-      - name: Restore finished denoise wasm
+      - name: Restore ci.yml's mls wasm
+        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-hit != 'true'
+        id: mls-ci
+        timeout-minutes: 5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/gwar-mls-wasm/pkg/
+          key: ${{ steps.keys.outputs.mls }}
+      - name: Restore this workflow's denoise wasm
         if: steps.ci.outputs.found != 'true'
         id: denoise
         timeout-minutes: 5
@@ -244,9 +266,16 @@ jobs:
         with:
           path: crates/gwar-denoise-wasm/pkg/
           key: timing-${{ steps.keys.outputs.denoise }}
-          restore-keys: ${{ steps.keys.outputs.denoise }}
+      - name: Restore ci.yml's denoise wasm
+        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-hit != 'true'
+        id: denoise-ci
+        timeout-minutes: 5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: crates/gwar-denoise-wasm/pkg/
+          key: ${{ steps.keys.outputs.denoise }}
       - name: Build mls wasm
-        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-matched-key == ''
+        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-hit != 'true' && steps.mls-ci.outputs.cache-hit != 'true'
         timeout-minutes: 25
         env:
           WASM_OPT: .build-tools/node_modules/.bin/wasm-opt
@@ -256,7 +285,7 @@ jobs:
           npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
           scripts/mls-wasm/build.sh
       - name: Build denoise wasm
-        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-matched-key == ''
+        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-hit != 'true' && steps.denoise-ci.outputs.cache-hit != 'true'
         timeout-minutes: 20
         env:
           WASM_OPT: .build-tools/node_modules/.bin/wasm-opt
@@ -264,14 +293,14 @@ jobs:
           [ -x "$WASM_OPT" ] || npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
           scripts/denoise-wasm/build.sh
       - name: Save mls wasm
-        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-matched-key == ''
+        if: steps.ci.outputs.found != 'true' && steps.mls.outputs.cache-hit != 'true' && steps.mls-ci.outputs.cache-hit != 'true'
         timeout-minutes: 5
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: crates/gwar-mls-wasm/pkg/
           key: timing-${{ steps.keys.outputs.mls }}
       - name: Save denoise wasm
-        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-matched-key == ''
+        if: steps.ci.outputs.found != 'true' && steps.denoise.outputs.cache-hit != 'true' && steps.denoise-ci.outputs.cache-hit != 'true'
         timeout-minutes: 5
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -291,7 +320,7 @@ jobs:
   measure:
     needs: [plan, native, wasm]
     runs-on: ubuntu-24.04
-    timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.job_timeout) }}
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -300,7 +329,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
         with:
-          ref: ${{ needs.plan.outputs.ref }}
+          ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
       # This workflow's scripts, beside the measured tree and outside its pnpm workspace.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -347,7 +376,7 @@ jobs:
           browsers=(chromium); if [ "$ENGINE" = webkit ]; then browsers+=(webkit); fi
           pnpm --filter web exec playwright install "${browsers[@]}"
       - name: Measure this shard's runs
-        timeout-minutes: ${{ fromJSON(needs.plan.outputs.timeout) }}
+        timeout-minutes: ${{ fromJSON(needs.plan.outputs.step_timeout) }}
         env:
           SYNC_FIXTURE: ${{ github.workspace }}/target/timing/web_latency
           NATIVE_BRIDGE_BIN: ${{ github.workspace }}/target/timing/native_bridge

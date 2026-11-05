@@ -11,6 +11,8 @@ import { makePlan } from "./lib.mjs";
 const env = process.env;
 const out = process.argv[2];
 if (!out) throw new Error("usage: plan.mjs PLAN.json");
+const profile = env.TIMING_PROFILE;
+if (!["release", "debug"].includes(profile)) throw new Error("profile must be release or debug");
 const plan = makePlan({
   ref: env.TIMING_REF,
   sha: env.TIMING_SHA,
@@ -29,9 +31,14 @@ writeFileSync(out, JSON.stringify(plan, null, 1));
 const runs = plan.shards.reduce((n, shard) => n + shard.runs.length, 0);
 console.log(`seed ${plan.seed}: ${runs} runs in ${plan.shards.length} shards`);
 for (const shard of plan.shards) console.log(`shard ${shard.shard}: ${shard.runs.map(run => run.id).join(" ")}`);
-// A run is its watch plus about two minutes of build, joins and teardown; a shard also sets up
-// for about 15 minutes at worst (apt, browsers, pnpm). Five more minutes per run of slack.
-const longest = Math.max(...plan.shards.map(shard => shard.runs.reduce((s, run) => s + run.seconds + 120 + 300, 0)));
-const timeout = Math.min(350, Math.ceil(longest / 60) + 20);
-console.log(`longest shard: about ${Math.round(Math.max(...plan.shards.map(s => s.runs.reduce((t, run) => t + run.seconds + 120, 0))) / 60)} min of runs; job timeout ${timeout} min`);
-if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `matrix=${JSON.stringify({ shard: plan.shards.map(s => s.shard) })}\ntimeout=${timeout}\n`);
+console.log(`job timeout ${plan.timeouts.job} min, measuring step ${plan.timeouts.step} min`);
+// Every value below was checked by makePlan (or here), so none can break a line of the output file.
+if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, [
+  `matrix=${JSON.stringify({ shard: plan.shards.map(s => s.shard) })}`,
+  `job_timeout=${plan.timeouts.job}`,
+  `step_timeout=${plan.timeouts.step}`,
+  `sha=${plan.sha}`,
+  `engine=${plan.engine}`,
+  `profile=${profile}`,
+  "",
+].join("\n"));
