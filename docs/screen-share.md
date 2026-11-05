@@ -398,7 +398,7 @@ decode stays for browser compatibility.
     about 17.6 s, unless a healthy viewer's slot went whole more than 6.5 s after
     the failing viewer's, in which case 11.1 s after that. Only healthy viewers
     whole within 7 s of the report count, so viewers joining or rewatching the
-    share cannot postpone it: at most 18 s after the report is taken.
+    share cannot postpone it: within about 18.1 s after the report is taken.
 
   Compared with main, a decoder that goes more than 4 s without a frame while
   packets arrive is reported on each such stall, at most once per 5 s; main
