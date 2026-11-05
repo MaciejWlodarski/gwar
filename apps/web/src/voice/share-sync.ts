@@ -41,6 +41,12 @@ const START_WAIT_MS = 45;
  * the engine's own sync gets there by itself: a wait raised in them only made the start later.
  */
 export const SETTLING_LOOKS = 10;
+/**
+ * Each move goes by the median of this many last looks (fewer just after a start or a break): one
+ * look can be off by a packet's worth of sound or a frame held up, and a single noisy sample
+ * moved the picture the whole way (Opus review r1, S12).
+ */
+const AGREE_LOOKS = 3;
 /** Looks after a break: the backlog lands in the first, and the others may move the whole way, once. */
 const BREAK_LOOKS = 4;
 /** A gap smaller than this after a break is not worth the one move: sound may still land. */
@@ -126,7 +132,8 @@ export interface PictureSyncLink {
   now(): number;
 }
 
-interface SlotState { share: string; waits: Waits; looks: number; breakLooks?: number; blind?: number }
+interface SlotState { share: string; waits: Waits; looks: number; breakLooks?: number; blind?: number; lags?: number[] }
+const median = (values: number[]) => { const sorted = [...values].sort((a, b) => a - b); const mid = sorted.length >> 1; return sorted.length % 2 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2; };
 const NO_WAIT: Waits = { picture: 0, sound: 0 };
 const same = (a: Waits, b: Waits) => a.picture === b.picture && a.sound === b.sound;
 
@@ -164,7 +171,8 @@ export class PictureSync {
   /** The picture just came back from a break: it has jumped already, so one more move goes unseen. */
   linkBack(slot: number): void {
     const state = this.states.get(slot);
-    if (state) this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS });
+    // The looks before it measured a link that is gone.
+    if (state) this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS, lags: [] });
   }
 
   private async look({ share, slot, heard, paused }: SyncSlot): Promise<void> {
@@ -188,18 +196,24 @@ export class PictureSync {
     if (!picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS || this.releases !== releases) return;
     const found = this.states.get(slot);
     if (found?.blind) this.states.set(slot, { ...found, blind: 0 });
-    const seen = this.states.get(slot) ?? start;
-    if (seen.looks < SETTLING_LOOKS) { this.states.set(slot, { ...seen, looks: seen.looks + 1 }); return; }
-    if (seen.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...seen, breakLooks: BREAK_LOOKS - 1 }); return; }
-    const lag = soundLagMs(association, sound, picture) - SOUND_AIM_MS;
+    const measured = soundLagMs(association, sound, picture) - SOUND_AIM_MS;
+    // Asked at every look, settling ones too, so the first move reads the last second's hold and
+    // not an average over the stream's start, keyframes and all (Opus review r1, S11).
     const shown = await this.link.shown(slot).catch(() => 0);
     if (this.releases !== releases) return;
     // Whatever else happened while the receiver answered, such as a break, stands.
-    const state = this.states.get(slot) ?? seen;
+    const state = this.states.get(slot) ?? start;
+    if (state.looks < SETTLING_LOOKS) {
+      this.states.set(slot, { ...state, looks: state.looks + 1, lags: [...state.lags ?? [], measured].slice(-AGREE_LOOKS) });
+      return;
+    }
+    // The backlog lands in this look: what it measures is neither the old link nor the new.
     if (state.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS - 1 }); return; }
+    const lags = [...state.lags ?? [], measured].slice(-AGREE_LOOKS);
+    const lag = median(lags);
     const breakLooks = state.breakLooks ?? 0;
     const whole = state.looks === SETTLING_LOOKS || (breakLooks > 0 && Math.abs(lag) > BREAK_MOVE_MS);
-    this.set(slot, state, { ...state, waits: nextWaits(state.waits, lag, whole, shown, this.link.soundWaits), looks: state.looks + 1, breakLooks: whole ? 0 : Math.max(0, breakLooks - 1) });
+    this.set(slot, state, { ...state, lags, waits: nextWaits(state.waits, lag, whole, shown, this.link.soundWaits), looks: state.looks + 1, breakLooks: whole ? 0 : Math.max(0, breakLooks - 1) });
   }
 
   /** A look found nothing to measure by; after `BLIND_LOOKS` of them, the waits go. */

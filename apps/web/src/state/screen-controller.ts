@@ -1073,16 +1073,19 @@ export class ScreenController {
         if (this.transport !== transport) return enabled;
         const receiver = link ? new ShareSoundReceiver(link, run) : null;
         if (receiver) this.receiver = receiver;
-        if (enabled) this.pictureSync = new PictureSync({
+        // Only where sound leaves the webview: a browser's own sync lines its picture and sound up,
+        // and a second controller on the same pair, waiting on one noisy look, only disturbed it
+        // (Opus review r1, S12). There the late-frame filter does a stall's part.
+        if (receiver) this.pictureSync = new PictureSync({
           association: share => conn.request("screen.audio.sync", { share }, { timeoutMs: 1_000 }),
-          sound: async slot => receiver ? receiver.clock(slot) : transport.soundClock(slot),
+          sound: async slot => receiver.clock(slot),
           picture: slot => transport.pictureClock(slot),
           shown: slot => transport.pictureDelay(slot),
           wait: (slot, waits) => {
             transport.setPictureWait(slot, waits.picture);
-            receiver?.hold(slot, waits.sound);
+            receiver.hold(slot, waits.sound);
           },
-          soundWaits: receiver !== null,
+          soundWaits: true,
           now: () => Date.now(),
         });
         this.watchAudio = enabled;

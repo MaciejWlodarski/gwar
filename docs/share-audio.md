@@ -374,12 +374,15 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
 
 ### Lip-sync
 
-A viewer lines a share's picture and sound up once a second. Voice is never involved, and a share
-without sound never comes through here. `apps/web/src/voice/share-sync.ts` holds the decisions.
+The desktop app lines a share's picture and sound up once a second. Voice is never involved, and a
+share without sound never comes through here. `apps/web/src/voice/share-sync.ts` holds the decisions.
+A browser leaves it to its engine, which plays both and lines them up itself: a second controller on
+the same pair, moving the picture on one noisy look, only disturbed it. In a
+browser a stall's part is the late-frame filter's, and a new watch's start is the sound hold's.
 
 Both sides are read where they come out: the picture from the video receiver's synchronization
-source, and the sound from the audio receiver's in a browser or from the mixer in the desktop app,
-which reports when a recent sample reaches the speaker (`share_playback_clock`). The SFU rewrites
+source, and the sound from the mixer, which reports when a recent sample reaches the speaker
+(`share_playback_clock`). The SFU rewrites
 RTP times per viewer, so only it can relate them: `screen.audio.sync` returns one audio and one
 video RTP time of the same instant for the viewer's slot, taken from the sender reports' shared
 wallclock, or `known: false` until it has them. A viewer asks at each look.
@@ -390,21 +393,24 @@ is measured from that aim.
 
 **The picture waits.** Sound carries speech, and a picture a few tens of milliseconds later is the
 smaller loss. `jitterBufferTarget` is a minimum, so a wait starts from the delay the receiver
-already has. The first look moves the whole way, since nobody has seen the picture settle; later
-ones move at most 40 ms at half the error, and nothing moves for less than 10 ms. A wait starts only
+already has. Each move goes by the median of the last three looks (fewer just after a start or a
+break), since one look can be off by a packet of sound or a held-up frame. The first move goes the
+whole way, since nobody has seen the picture settle; later ones move at most 40 ms at half the
+error, and nothing moves for less than 10 ms. How long the receiver held the picture is asked at
+every look, settling ones too, so the first move reads the last second and not the stream's start. A wait starts only
 when sound is 45 ms past the aim, short of the range's edge: below that it would only add latency and
 push sound towards the edge it must not lead past. A picture that
-keeps agreeing gives 5 ms a second back, because a browser's own sync pulls each side up to the
+keeps agreeing gives 5 ms a second back, because the webview's own sync pulls each side up to the
 other and a lag alone would never show that a wait is no longer needed.
 
-**Sound waits only in the desktop app**, for a picture that is late with nothing left to give, for
-a lead over 25 ms, in steps. Sound leaves the webview there, so its own sync has none to work with.
+**Sound waits too**, for a picture that is late with nothing left to give, for a lead over 25 ms, in
+steps. Sound leaves the webview, so its own sync has none to work with.
 The mixer plays it up to 1 % slower, 10 ms a second and at most 400 ms in all; when the wait
 falls it plays up to 1 % faster until the queue is back. Within 30 ms of its aim the speed is in
 proportion, and it changes over 500 ms: the queue counts whole 20 ms packets that jitter moves, so
 an all-or-nothing speed wandered by the whole 1 %, 17 cents on music (0.9959 to 1.0092 under
-±10 ms; now 0.9986 to 1.0019). With no wait the mixer picks its speed as before, smoothed the same. While sound is not ahead it keeps giving a wait back. In a browser
-the engine's own sync moves sound; a second controller on the same pair only drove both up.
+±10 ms; now 0.9986 to 1.0019). With no wait the mixer picks its speed as before, smoothed the same. While sound is not ahead it keeps
+giving a wait back.
 
 A watch settles for ten looks before anything moves, per slot: its keyframes and buffers are still
 landing, and the engine's own sync gets there by itself. A paused picture moves nothing, so

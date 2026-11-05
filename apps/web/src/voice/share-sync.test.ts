@@ -129,15 +129,17 @@ describe("PictureSync", () => {
     link.sound.mockResolvedValue(sound);
     link.picture.mockReturnValue(picture);
     link.now = () => picture.unixMs + 20;
+    // One look apart from the two before it moves by their median, gently (review r1, S12).
     await sync.tick([slot]);
-    expect(waits.at(-1)).toEqual(at(100));
+    expect(waits.at(-1)).toEqual(at(85));
     sync.linkBack(1);
     await sync.tick([slot]);
-    expect(waits.at(-1)).toEqual(at(100));
+    expect(waits.at(-1)).toEqual(at(85));
+    // After the break only its own looks count: the whole way, then gently.
     await sync.tick([slot]);
-    expect(waits.at(-1)).toEqual(at(400));
+    expect(waits.at(-1)).toEqual(at(385));
     await sync.tick([slot]);
-    expect(waits.at(-1)).toEqual(at(440));
+    expect(waits.at(-1)).toEqual(at(425));
   });
 
   it("keeps its one move after a break for the gap that opens when the sound lands", async () => {
@@ -156,8 +158,9 @@ describe("PictureSync", () => {
     link.picture.mockReturnValue(picture);
     link.now = () => picture.unixMs + 20;
     const before = waits.at(-1)?.[1] as Waits;
+    // The move goes by the median of the looks since the break: 20 and 250.
     await sync.tick([slot]);
-    expect(waits.at(-1)).toEqual(at(before.picture + 250));
+    expect(waits.at(-1)).toEqual(at(before.picture + 135));
   });
 
   it("drops a stale wait at once after a break, when the picture is the late one", async () => {
@@ -201,7 +204,8 @@ describe("PictureSync", () => {
     let shown!: (ms: number) => void;
     link.shown.mockImplementationOnce(() => new Promise<number>(resolve => { shown = resolve; }));
     const look = sync.tick([slot]);
-    await vi.waitFor(() => expect(link.shown).toHaveBeenCalled());
+    // Settling looks ask too (review r1, S11).
+    await vi.waitFor(() => expect(link.shown).toHaveBeenCalledTimes(SETTLING_LOOKS + 1));
     sync.release(1);
     shown(30);
     await look;
@@ -234,13 +238,34 @@ describe("PictureSync", () => {
     let shown!: (ms: number) => void;
     link.shown.mockImplementationOnce(() => new Promise<number>(resolve => { shown = resolve; }));
     const look = sync.tick([slot]);
-    await vi.waitFor(() => expect(link.shown).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(link.shown).toHaveBeenCalledTimes(SETTLING_LOOKS + 2));
     sync.linkBack(1);
     shown(30);
     await look;
     const before = waits.at(-1)![1].picture;
     await sync.tick([slot]);
     expect(waits.at(-1)![1].picture).toBe(before + 300);
+  });
+
+  it("asks how long the picture is held at every look, settling ones too", async () => {
+    // Opus review r1 (S11): the first move read the receiver's average over the stream's whole
+    // start, keyframes and all, since nothing had asked before it.
+    const { sync, link } = fixture(80);
+    await settle(sync);
+    expect(link.shown).toHaveBeenCalledTimes(SETTLING_LOOKS);
+  });
+
+  it("does not move on one noisy look", async () => {
+    // Opus review r1 (S12): a single look past where a wait starts moved the picture the whole way.
+    const { sync, waits, link } = fixture(0);
+    await settle(sync);
+    await sync.tick([slot]);
+    const { sound, picture } = pair(150 + SOUND_AIM_MS);
+    link.sound.mockResolvedValueOnce(sound);
+    link.picture.mockReturnValueOnce(picture);
+    await sync.tick([slot]);
+    await sync.tick([slot]);
+    expect(waits).toEqual([]);
   });
 
   it("makes a late joiner's picture wait at once, then corrects gently", async () => {

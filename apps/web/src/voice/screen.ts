@@ -10,7 +10,7 @@
  */
 import type { MediaKind } from "./late-frames";
 import type { LateFramesReady, LinkBack } from "./late-frames-worker";
-import type { PictureClock, SoundClock } from "./share-sync";
+import type { PictureClock } from "./share-sync";
 import { RtcUplinkObserver, type UplinkStatus } from "./uplink-congestion";
 import type { Av1Capability } from "../proto/Av1Capability";
 import type { H264Capability } from "../proto/H264Capability";
@@ -1771,12 +1771,6 @@ export class ScreenWatchTransport {
   /** The picture a slot last handed over, and when: lip-sync reads it. */
   pictureClock(slot: number): PictureClock | null {
     const source = this.transceivers[slot]?.receiver.getSynchronizationSources()[0];
-    return source && !this.closed ? { rtpTime: source.rtpTimestamp, unixMs: source.timestamp } : null;
-  }
-
-  /** The sound a slot last played, and when, where the webview plays it. */
-  soundClock(slot: number): SoundClock | null {
-    const source = this.audioTransceivers[slot]?.receiver.getSynchronizationSources()[0];
     return source && !this.closed ? { rtpTime: source.rtpTimestamp, unixMs: source.timestamp } : null;
   }
 
