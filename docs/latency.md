@@ -1721,6 +1721,9 @@ a sleep/wake in `pmset -g log` makes the run void and requires a repeat. Timing
 runs must not overlap another worker's runs. A shared prebuilt web bundle can
 serve both arms, keeping repeated web builds outside the timing window.
 
+The lip-sync A/B runs (`share-sync.mjs`) with these rows can also run on hosted
+runners, sharded and interleaved: [timing-runs.md](timing-runs.md).
+
 ### Historical browser measurements: withdrawn estimator filter
 
 The original worker reported four 45 s browser runs per row, main to the withdrawn
