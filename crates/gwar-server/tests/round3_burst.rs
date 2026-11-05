@@ -176,8 +176,17 @@ async fn four_unknown_or_large_sources_deliver_within_30s_over_srtp() {
             "every share delivers a whole keyframe within 30 s: completed {complete:?}, packets per response {received:?}, requests at {times:?} ms"
         );
         assert!(seeds.iter().all(|&n| n <= 1), "a share asks once for its first keyframe: {seeds:?}");
+        // Requests the viewer's token bucket paid for can never exceed it, so this guards only the
+        // SFU paths that ask a publisher for a keyframe without a token (ingress waiting for one,
+        // ingress overflow, codec change, failed H.264 check). A storm through the bucket itself
+        // is held to the budget by the SFU's own unit tests.
         let viewer_requests: u64 = requests.iter().sum::<u64>() - seeds.iter().sum::<u64>();
-        let last = times.iter().flatten().max().copied().unwrap_or(0) as f64 / 1000.0;
+        let last = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| s.publisher(&shares[i]).request_times.lock().unwrap().clone())
+            .map(|at| at.saturating_duration_since(start).as_secs_f64())
+            .fold(0.0, f64::max);
         let budget = VIEWER_KEYFRAMES_BURST + VIEWER_KEYFRAMES_PER_SECOND * last;
         assert!(
             viewer_requests as f64 <= budget,
