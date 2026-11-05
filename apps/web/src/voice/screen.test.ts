@@ -444,33 +444,148 @@ describe("verified H.264 decode capability and progress", () => {
     await Promise.resolve();
     expect(caps).toEqual([]);
   });
-  it("keeps replacement retries within the server corroboration window despite timer rounding", async () => {
-    const { DecodeWatchdog } = await import("./screen");
-    // Both first reports follow replacement before the server's 10 s viewer/share
-    // throttle expires. Each watchdog has only one retry left to corroborate the
-    // other. Rounding the 4 s observation AND another 6 s from its callback can
-    // put those retries over the server's 2 s isolation window apart.
+  it("keeps each viewer's reports anchored to its stall despite timer rounding", async () => {
+    const { DecodeWatchdog, DECODE_POLL_GAP_MS } = await import("./screen");
+    // Two viewers stalled on the same replacement keyframe. Rounding each report from the
+    // previous report's callback would add up to a poll per report; anchored to the stall,
+    // their reports stay within one poll gap of each other at every step.
     const polls = [
       // Observed milliseconds after the replacement keyframe in a failing
-      // macOS Chromium/WebKit fixed-canvas gate (e8fb01e3).
-      [693, 1699, 2703, 3707, 4709, 5715, 6718, 7725, 8726, 9732, 10735, 11737, 12743],
-      [824, 1823, 2824, 3823, 4823, 5824, 6823, 7824, 8823, 9823, 10825, 11823, 12826],
+      // macOS Chromium/WebKit fixed-canvas gate (e8fb01e3), extended at the same period.
+      [693, 1699, 2703, 3707, 4709, 5715, 6718, 7725, 8726, 9732, 10735, 11737, 12743, 13745, 14748, 15750, 16753],
+      [824, 1823, 2824, 3823, 4823, 5824, 6823, 7824, 8823, 9823, 10825, 11823, 12826, 13824, 14826, 15825, 16826],
     ];
-    const reports = polls.map(times => {
+    const [a, b] = polls.map(times => {
       const watchdog = new DecodeWatchdog();
       return times.filter((now, index) => watchdog.observe(now, index * 100, 0));
     });
-    expect(reports.every(times => times.length === 2 && times[0]! < 10_000)).toBe(true);
-    const retries = reports.map(times => times[1]!);
-    expect(retries.every(now => now >= 10_000)).toBe(true);
-    expect(Math.max(...retries) - Math.min(...retries)).toBeLessThan(2000);
+    expect(a).toEqual([4709, 9732, 14_748]);
+    expect(b).toEqual([5824, 10_825, 14_826]);
+    for (let k = 0; k < a!.length; k++) expect(Math.abs(a![k]! - b![k]!)).toBeLessThan(DECODE_POLL_GAP_MS);
   });
-  it("reports persistent zero decode under traffic, with bounded retries and no network-gap false failure", async () => {
-    const { DecodeWatchdog } = await import("./screen");
+
+  /** The server's view of one slot: whole from `whole` on, it takes a report its window into that. */
+  const takes = (whole: number | null, at: number, window: number) => whole !== null && at - whole >= window;
+
+  it("reports a decoder that never decodes until the server takes it, whatever the SFU dropped unseen", async () => {
+    const { DecodeWatchdog, DECODE_STALL_MS } = await import("./screen");
+    // Review repro, at the 5 s spacing: the slot is whole from 0.5 s, the SFU drops at 8.9 s and
+    // the replacement keyframe is whole at 10.5 s. The gap's 64 lost packets are balanced by 64
+    // duplicates, so the viewer sees neither a loss nor an empty poll. Three reports in a row are
+    // ignored: too soon after 0.5 s, during the drop, and too soon after 10.5 s.
     const watchdog = new DecodeWatchdog();
+    const reports: number[] = [];
+    for (let now = 0; now <= 60_000; now += 1000) if (watchdog.observe(now, now / 10, 0)) reports.push(now);
+    const whole = (at: number) => (at < 8900 ? 500 : at < 10_500 ? null : 10_500);
+    expect(reports.slice(0, 4)).toEqual([4000, 9000, 14_000, 19_000]);
+    expect(reports.find(at => takes(whole(at), at, DECODE_STALL_MS))).toBe(19_000);
+  });
+
+  it("gets a report taken within one stall, one report period and a poll of the stream becoming whole, for any unseen drop schedule", async () => {
+    const { DecodeWatchdog, DECODE_STALL_MS, DECODE_REPORT_EVERY_MS } = await import("./screen");
+    // Bound: the server's window (the watchdog's stall, 4 s), at most one report period (5 s) to
+    // the next deadline, and at most one poll to send it. Nothing in the stats tells the viewer
+    // about the SFU's drops.
+    let seed = 7;
+    const random = () => (seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31) / 2 ** 31;
+    for (let schedule = 0; schedule < 500; schedule++) {
+      // SFU drops, each answered by a replacement keyframe whole 0.1 to 2 s later, and
+      // bandwidth pauses that stop the packets for 1 to 5 s; the stream is whole after the last.
+      type Event = { at: number; whole: number; pause: number };
+      const events: Event[] = [];
+      for (let at = random() * 5000; at < 60_000; at += 2000 + random() * 15_000) {
+        const pause = random() < 0.3 ? 1000 + random() * 4000 : 0;
+        events.push({ at, pause, whole: at + pause + 100 + random() * 1900 });
+      }
+      const whole = (t: number) => {
+        let since: number | null = 0;
+        for (const e of events) if (t >= e.at) since = t >= e.whole ? e.whole : null;
+        return since;
+      };
+      const watchdog = new DecodeWatchdog();
+      const period = 990 + random() * 20, phase = random() * 1000;
+      const reports: number[] = [];
+      let packets = 0;
+      for (let now = phase; now <= 120_000; now += period) {
+        if (!events.some(e => now >= e.at && now < e.at + e.pause)) packets += 100;
+        if (watchdog.observe(now, packets, 0)) reports.push(now);
+      }
+      const last = events.at(-1)!.whole;
+      const taken = reports.find(at => takes(whole(at), at, DECODE_STALL_MS));
+      const bound = last + DECODE_STALL_MS + DECODE_REPORT_EVERY_MS + period;
+      expect(taken !== undefined && taken <= bound, `${JSON.stringify(events)}: ${reports.map(Math.round)}`).toBe(true);
+      // One report per period; two in a row, across stalls too, never closer than a period less a poll.
+      for (let k = 1; k < reports.length; k++) expect(reports[k]! - reports[k - 1]!).toBeGreaterThan(DECODE_REPORT_EVERY_MS - period);
+    }
+  });
+
+  it("matches the report schedules the server's corroboration test replays", async () => {
+    // crates/gwar-server/src/media/screen/decode_reports.json holds this watchdog's report
+    // times for a viewer whose decoder never decodes, for each poll period and delay of its
+    // first sample after the keyframe notification. The SFU replays every pair of them against
+    // its corroboration window, and checks the header's constants against the ones it derives
+    // the window from. Regenerate with UPDATE_DECODE_REPORTS=1 after changing the watchdog's
+    // timing.
+    const { DecodeWatchdog, DECODE_STALL_MS, DECODE_REPORT_EVERY_MS, DECODE_POLL_GAP_MS } = await import("./screen");
+    const { readFileSync, writeFileSync } = await import("node:fs");
+    const path = new URL("../../../../crates/gwar-server/src/media/screen/decode_reports.json", import.meta.url);
+    const lines: string[] = [];
+    for (const period of [1000, 1270, 1500]) {
+      for (let delay = 0; delay <= 3000; delay += 50) {
+        const watchdog = new DecodeWatchdog();
+        const reports: number[] = [];
+        for (let n = 0; delay + n * period <= 40_000; n++) if (watchdog.observe(delay + n * period, n * 100, 0)) reports.push(delay + n * period);
+        lines.push(JSON.stringify({ period, delay, reports }));
+      }
+    }
+    const header = JSON.stringify({ stall: DECODE_STALL_MS, every: DECODE_REPORT_EVERY_MS, gap: DECODE_POLL_GAP_MS }).slice(0, -1);
+    const json = `${header},"schedules":[\n${lines.join(",\n")}\n]}\n`;
+    if (process.env.UPDATE_DECODE_REPORTS) writeFileSync(path, json);
+    expect(readFileSync(path, "utf8")).toBe(json);
+  });
+  it("reports a stalled decoder at most once per 5 s, and a decoding one or a hidden tab never", async () => {
+    const { DecodeWatchdog, DECODE_REPORT_EVERY_MS } = await import("./screen");
+    expect(DECODE_REPORT_EVERY_MS).toBe(5000);
+    const stalled = new DecodeWatchdog();
     const reports = [];
-    for (let n = 0; n <= 20; n++) if (watchdog.observe(n * 1000, n * 100, 0)) reports.push(n);
-    expect(reports).toEqual([4, 10]);
+    for (let n = 0; n <= 600; n++) if (stalled.observe(n * 1000, n * 100, 0)) reports.push(n);
+    // 4 s, then every 5 s: 120 reports in 10 minutes, never more than one per 5 s.
+    expect(reports).toEqual(Array.from({ length: 120 }, (_, k) => 4 + 5 * k));
+    // A clean stream that decodes never reports.
+    const clean = new DecodeWatchdog();
+    for (let n = 0; n <= 600; n++) expect(clean.observe(n * 1000, n * 100, n)).toBe(false);
+    // A slow decoder that never goes 4 s without a frame never reports, as on main.
+    const slow = new DecodeWatchdog();
+    for (let n = 0; n <= 600; n++) expect(slow.observe(n * 1000, n * 100, Math.floor(n / 3.9))).toBe(false);
+    // A hidden tab whose polls come more than 1.5 s apart never reports, as on main.
+    const hidden = new DecodeWatchdog();
+    for (let n = 0; n <= 300; n++) expect(hidden.observe(n * 2000, n * 100, 0)).toBe(false);
+    // Decoding resumes: no report while it decodes, and a new stall starts its own 4 s.
+    const resumed = new DecodeWatchdog();
+    const again = [];
+    for (let n = 0; n <= 40; n++) if (resumed.observe(n * 1000, n * 100, n >= 10 && n < 20 ? n : n < 10 ? 0 : 19)) again.push(n);
+    expect(again).toEqual([4, 9, 23, 28, 33, 38]);
+  });
+  it("reports a decoder slower than one frame per 4 s on each stall, at most once per 5 s", async () => {
+    const { DecodeWatchdog, DECODE_STALL_MS, DECODE_REPORT_EVERY_MS } = await import("./screen");
+    // Unlike main, which stops after two reports per generation: a frame every 6 s is a 4 s stall
+    // every time, and the server takes the reports once the slot is whole for its window.
+    const watchdog = new DecodeWatchdog();
+    const reports: number[] = [];
+    let decodedAt = 0;
+    for (let n = 0; n <= 120; n++) {
+      const frames = Math.floor(n / 6);
+      if (n > 0 && n % 6 === 0) decodedAt = n * 1000;
+      if (watchdog.observe(n * 1000, n * 100, frames)) {
+        expect(n * 1000 - decodedAt).toBeGreaterThanOrEqual(DECODE_STALL_MS);
+        reports.push(n * 1000);
+      }
+    }
+    expect(reports.length).toBe(20);
+    for (let k = 1; k < reports.length; k++) expect(reports[k]! - reports[k - 1]!).toBeGreaterThanOrEqual(DECODE_REPORT_EVERY_MS);
+  });
+  it("reports no network gap as a decode failure", async () => {
+    const { DecodeWatchdog } = await import("./screen");
     const decoding = new DecodeWatchdog(), starved = new DecodeWatchdog();
     for (let n = 0; n < 20; n++) {
       expect(decoding.observe(n * 1000, n * 100, n)).toBe(false);
@@ -2869,6 +2984,28 @@ describe("AV1", () => {
       await vi.advanceTimersByTimeAsync(1000);
     }
     expect(decodeFailed).toHaveBeenCalledWith(0, "A", 1);
+    transport.close();
+  });
+
+  it("never reports a decoder that decoded just before its first sample", async () => {
+    // Review repro: the keyframe notification arrives at 0, frames decode at 900 and 4800 ms,
+    // and stats are sampled every second from 1000 ms with packets arriving. The decoder never
+    // went 4 s without a frame. Taking the first sample for a stall that began at the
+    // notification reported it at 4000 ms, and the server, with the slot whole, would have
+    // isolated a healthy viewer.
+    const decodeFailed = vi.fn();
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed });
+    await transport.start();
+    const pc = Peer.all[0]!;
+    (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
+    pc.stats = new Map([["codec", { type: "codec", mimeType: "video/H264" }]]);
+    transport.keyframe(0, "A", 1);
+    for (let at = 1000; at <= 8000; at += 1000) {
+      const framesDecoded = [900, 4800].filter(decoded => decoded <= at).length;
+      pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded });
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(decodeFailed).not.toHaveBeenCalled();
     transport.close();
   });
 });

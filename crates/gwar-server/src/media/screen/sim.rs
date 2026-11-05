@@ -379,7 +379,7 @@ impl Sim {
         }
         let slot = self.shares.len();
         let origin = ScreenOrigin::new(1 + slot as SessionId, name.into(), 1, false, false, cap);
-        origin.measured(meter.rate(self.now));
+        origin.measured(meter.rate(self.now), meter.young(self.now), meter.ramping(self.now));
         let grant = WatchGrant::new(origin.clone());
         assign(&mut self.w, slot, grant, slot as u64 + 1, self.now);
         self.shares.push(Share {
@@ -531,7 +531,7 @@ impl Sim {
                     .iter_mut()
                     .map(|s| {
                         let rate = s.meter.rate(now);
-                        s.origin.measured(rate);
+                        s.origin.measured(rate, s.meter.young(now), s.meter.ramping(now));
                         (s.origin.share.clone(), rate)
                     })
                     .collect();
@@ -1963,6 +1963,67 @@ mod tests {
         seqs.sort_unstable();
         seqs.dedup();
         assert_eq!(seqs.last().unwrap() - seqs[0] + 1, seqs.len() as u64, "no gap at the viewer: {context}");
+    }
+
+    /// The first viewer of a share that just started, on a fast link with ordinary jitter: the
+    /// share has no measured rate yet when it joins. Once it has one, the viewer's start must
+    /// carry it, or the SFU evicts its frames and asks for a keyframe every 500 ms for seconds
+    /// (3 to 11 s here before), and each keyframe fails in turn.
+    #[test]
+    fn the_first_viewer_of_a_share_that_just_started_gets_it_whole_within_two_seconds() {
+        for seed in [1u64, 2, 3, 42] {
+            let mut sim = Sim::with_seed(None, seed);
+            sim.server_interval = 5 * MS;
+            sim.up.delay = Duration::ZERO;
+            sim.down.delay = 20 * MS;
+            sim.down.jitter = 5 * MS;
+            sim.down.keep_order = true;
+            sim.down.jitter_seed = seed;
+            sim.watch("busy", 4_000_000, 60, 150_000, None);
+            sim.run(2 * SECOND);
+            let start = sim.w.egress.counters;
+            sim.run(10 * SECOND);
+            let context = format!("seed {seed} at 2 s {start:?}: {}", summary(&sim));
+            let c = sim.w.egress.counters;
+            assert!(start.failed_keyframes <= 2, "{context}");
+            assert_eq!(
+                (c.evicted, c.rejected, c.failed_keyframes),
+                (start.evicted, start.rejected, start.failed_keyframes),
+                "{context}"
+            );
+            assert!(sim.changes.is_empty(), "{context}");
+        }
+    }
+
+    /// The first viewer of a share whose encoder is still ramping up, as a browser's does for
+    /// several seconds: it joins two seconds in, at what the share sent then, and the share
+    /// triples over the next five. The viewer's start must follow the share up while its link
+    /// carries it. Before, it stayed where it joined and grew by probing only: 433 packets evicted
+    /// on a clean link, 1902 and 1975 on a ±5 ms one. A clean link now costs one keyframe's
+    /// packets once at most, as the share's average trails its encoder. Seeds 3 and 42 of the
+    /// jittery link are left out: there the estimator itself backs off below the share, as it
+    /// does below a steady one, and following the share does not change that.
+    #[test]
+    fn the_first_viewer_of_a_ramping_share_follows_it_up() {
+        for (jitter, seed) in [(0, 1u64), (0, 2), (5, 1), (5, 2)] {
+            let mut sim = Sim::with_seed(None, seed);
+            sim.server_interval = 5 * MS;
+            sim.up.delay = Duration::ZERO;
+            sim.down.delay = 20 * MS;
+            sim.down.jitter = jitter * MS;
+            sim.down.keep_order = true;
+            sim.down.jitter_seed = seed;
+            let share = sim.join("ramping", 1_300_000, 60, 60_000, 8_000_000);
+            for step in 1..=10u64 {
+                sim.run(500 * MS);
+                sim.shares[share].bitrate = 1_300_000 + 270_000 * step;
+            }
+            sim.run(7 * SECOND);
+            let c = sim.w.egress.counters;
+            let context = format!("jitter {jitter} ms, seed {seed}: {}", summary(&sim));
+            assert!(c.failed_keyframes == 0 && c.evicted <= 100, "{context}");
+            assert!(sim.changes.is_empty(), "{context}");
+        }
     }
 
     #[test]

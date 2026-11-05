@@ -138,6 +138,13 @@ impl Queued {
         self
     }
 
+    /// Part of a keyframe, as `Egress::admit` marks it.
+    #[cfg(test)]
+    pub fn keyed(mut self) -> Self {
+        self.key = true;
+        self
+    }
+
     pub fn key_frame(&self) -> Option<u32> {
         self.key.then_some(self.frame)
     }
@@ -151,7 +158,8 @@ impl Queued {
 /// A share's rates, measured on what passed its ingress.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct ShareRate {
-    /// Over the last `AVERAGE_WINDOW`, bits per second.
+    /// Over the last `AVERAGE_WINDOW`, bits per second; over the share's life, at least
+    /// `YOUNGEST_AVERAGE`, while it is younger than that.
     pub average: f64,
     /// The last whole keyframe, bytes.
     pub last_keyframe: usize,
@@ -175,12 +183,22 @@ pub struct ShareMeter {
     last_keyframe: usize,
     /// Whole delta frames over the last `AVERAGE_WINDOW`, each smaller than every one before it.
     deltas: VecDeque<(Instant, usize)>,
+    /// The first packet ever: a share younger than `AVERAGE_WINDOW` has not filled it yet.
+    first: Option<Instant>,
 }
+
+/// A share is averaged over at least this much of its life, so its first keyframe alone is not
+/// taken for its rate.
+const YOUNGEST_AVERAGE: Duration = Duration::from_secs(1);
+/// A browser's encoder takes seconds to reach a share's rate: 1-2 Mb/s in its first second and
+/// several times that five seconds later are common. A share is taken to ramp this long.
+pub const ENCODER_RAMP: Duration = Duration::from_secs(10);
 
 impl ShareMeter {
     /// One forwarded packet; a late repair of an older frame counts towards the average only.
     pub fn record(&mut self, source: u64, timestamp: u32, size: usize, keyframe: bool, now: Instant) {
         let size = size + ORIGINAL_OVERHEAD;
+        self.first.get_or_insert(now);
         let newest = self.highest.is_none_or(|highest| source > highest);
         if newest {
             self.highest = Some(source);
@@ -226,6 +244,16 @@ impl ShareMeter {
         }
     }
 
+    /// It has sent for less than `AVERAGE_WINDOW`, or not at all: its average is still filling.
+    pub fn young(&self, now: Instant) -> bool {
+        self.first.is_none_or(|first| now.saturating_duration_since(first) < AVERAGE_WINDOW)
+    }
+
+    /// It has sent for less than `ENCODER_RAMP`, or not at all: its rate may still be growing.
+    pub fn ramping(&self, now: Instant) -> bool {
+        self.first.is_none_or(|first| now.saturating_duration_since(first) < ENCODER_RAMP)
+    }
+
     pub fn rate(&mut self, now: Instant) -> ShareRate {
         self.expire(now);
         // A keyframe still arriving counts as soon as it outgrows the last whole one.
@@ -234,8 +262,13 @@ impl ShareMeter {
             _ => 0,
         };
         let last_keyframe = self.last_keyframe.max(current);
+        // A share that started within the window is averaged over its life, or a viewer joining
+        // it in its first two seconds would start from a fraction of what it sends.
+        let window = self.first.map_or(AVERAGE_WINDOW, |first| {
+            now.saturating_duration_since(first).clamp(YOUNGEST_AVERAGE, AVERAGE_WINDOW)
+        });
         ShareRate {
-            average: self.bytes as f64 * 8.0 / AVERAGE_WINDOW.as_secs_f64(),
+            average: self.bytes as f64 * 8.0 / window.as_secs_f64(),
             last_keyframe,
             largest_keyframe: self.keyframes.iter().map(|(_, size)| *size).max().unwrap_or(0).max(last_keyframe),
             largest_delta: self.deltas.front().map_or(0, |(_, size)| *size),
@@ -1707,13 +1740,37 @@ mod tests {
             (rate.last_keyframe, rate.largest_keyframe),
             (100 * (1000 + ORIGINAL_OVERHEAD), 100 * (1000 + ORIGINAL_OVERHEAD))
         );
-        assert_eq!(rate.average, (101_500 + 102 * ORIGINAL_OVERHEAD) as f64 * 8.0 / 2.0);
+        // 20 ms into the share: averaged over `YOUNGEST_AVERAGE`, not the whole window.
+        assert_eq!(rate.average, (101_500 + 102 * ORIGINAL_OVERHEAD) as f64 * 8.0 / 1.0);
         assert_eq!(meter.rate(now + Duration::from_secs(3)).average, 0.0);
         assert_eq!(
             meter.rate(now + Duration::from_secs(31)).largest_keyframe,
             100 * (1000 + ORIGINAL_OVERHEAD),
             "the last one stays"
         );
+    }
+
+    #[test]
+    fn a_share_that_just_started_is_measured_at_its_own_rate() {
+        // 4 Mb/s at 60 fps, in 1000-byte packets: a viewer joining a second into the share
+        // must not start from half of it, as if the share had sent nothing the second before.
+        let now = Instant::now();
+        let mut meter = ShareMeter::default();
+        let frame_bytes: usize = 4_000_000 / 8 / 60;
+        let mut source = 0;
+        for f in 0..120u32 {
+            let at = now + Duration::from_secs(1) * f / 60;
+            for n in 0..frame_bytes.div_ceil(1000) {
+                meter.record(source, f, 1000, f == 0 && n == 0, at);
+                source += 1;
+            }
+            let elapsed = at - now;
+            if elapsed >= Duration::from_secs(1) {
+                let wire = 4_000_000.0 * (1000 + ORIGINAL_OVERHEAD) as f64 / 1000.0;
+                let average = meter.rate(at).average;
+                assert!(average >= 0.9 * wire && average <= 1.1 * wire, "{average} at {elapsed:?}");
+            }
+        }
     }
 
     #[test]

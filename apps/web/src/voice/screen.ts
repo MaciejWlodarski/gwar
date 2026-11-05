@@ -555,30 +555,51 @@ export async function probeH264(): Promise<H264Capability[]> {
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
 }
 
-/** At most two reports per server-fenced generation; network gaps restart the four-second clock. */
+/** A decoder that receives packets and decodes nothing this long is reported (the SFU's
+ * `DECODE_WINDOW`). */
+export const DECODE_STALL_MS = 4000;
+/** Spacing of a stalled decoder's later reports (the SFU's `CLIENT_REPORT_EVERY_MS`). */
+export const DECODE_REPORT_EVERY_MS = 5000;
+/** A longer gap between stats samples restarts the stall (the SFU's `CLIENT_POLL_GAP_MS`). */
+export const DECODE_POLL_GAP_MS = 1500;
+
 export class DecodeWatchdog {
-  private since: number | null = null;
   private frames: number | null = null;
   private packets: number | null = null;
   private last: number | null = null;
-  private reports = 0;
-  private retryAt: number | null = null;
+  private next: number | null = null;
+  private reported: number | null = null;
+  /**
+   * Reports a decoder that receives packets and decodes nothing for `DECODE_STALL_MS`, then
+   * every `DECODE_REPORT_EVERY_MS` for as long as that lasts: until it decodes, packets stop, or
+   * the slot's generation changes (the server isolated the viewer or fell back). There is no
+   * budget. The server takes a report only once the SFU has forwarded the slot whole for the
+   * watchdog's window, since its own drops starve a decoder like a codec it cannot decode, and
+   * the viewer cannot see those drops: lost packets can be balanced by duplicates. So the
+   * watchdog keeps reporting, and the first report past the server's window is taken. Deadlines
+   * run from the stall, each report sent on the first poll at or after its deadline, so a
+   * stalled decoder reports at least once in any `DECODE_REPORT_EVERY_MS` plus
+   * `DECODE_POLL_GAP_MS` (a longer gap restarts the stall), and two reports are never closer
+   * than `DECODE_REPORT_EVERY_MS` less one poll gap. The SFU sizes its corroboration window and
+   * its report throttle from these constants: keep them in step. The stall starts at this
+   * watchdog's own first sample, since frames decoded before it are unknown. A new stall never
+   * brings the next report closer than `DECODE_REPORT_EVERY_MS` to the last one. A report the
+   * server ignores costs it a constant-time check.
+   */
   observe(now: number, packets: number, frames: number): boolean {
-    if (this.reports >= 2) return false;
-    if (this.frames === null || frames > this.frames || packets <= (this.packets ?? packets) || (this.last !== null && now - this.last > 1500)) this.since = now;
+    const decoded = this.frames === null || frames > this.frames;
+    const paused = this.packets !== null && packets <= this.packets;
+    if (decoded || paused || (this.last !== null && now - this.last > DECODE_POLL_GAP_MS)) {
+      this.next = Math.max(now + DECODE_STALL_MS, (this.reported ?? -Infinity) + DECODE_REPORT_EVERY_MS);
+    }
     this.frames = frames;
     const flowing = this.packets !== null && packets > this.packets;
     this.packets = packets; this.last = now;
-    if (flowing && this.since !== null && now - this.since >= 4000 && (this.retryAt === null || now >= this.retryAt)) {
-      this.reports++;
-      // Anchor the retry to the observed stall, not the rounded first callback.
-      // Polling can round both 4 s and another 6 s up by a tick, separating
-      // replacement retries beyond the server's 2 s corroboration window.
-      // 10 s also outlasts its viewer/share throttle from the previous generation.
-      this.retryAt = this.since + 10_000;
-      return true;
-    }
-    return false;
+    if (!flowing || this.next === null || now < this.next) return false;
+    // Anchored to the stall, not to this rounded callback: one report per step, with no drift.
+    while (this.next <= now) this.next += DECODE_REPORT_EVERY_MS;
+    this.reported = now;
+    return true;
   }
 }
 
