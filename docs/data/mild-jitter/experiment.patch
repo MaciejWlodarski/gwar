@@ -1,0 +1,313 @@
+diff --git a/crates/gwar-server/src/media/screen/egress.rs b/crates/gwar-server/src/media/screen/egress.rs
+index b4dc4281..43aefb2b 100644
+--- a/crates/gwar-server/src/media/screen/egress.rs
++++ b/crates/gwar-server/src/media/screen/egress.rs
+@@ -1270,6 +1270,7 @@ impl Egress {
+         if watched.is_empty() {
+             return None;
+         }
++        let lane_caps = caps;
+         let caps: f64 = watched.iter().map(|&l| caps.get(l).copied().unwrap_or(0) as f64).sum();
+         let keyframe = watched
+             .iter()
+@@ -1278,6 +1279,17 @@ impl Egress {
+             .unwrap_or(0)
+             .max(KEYFRAME_FLOOR);
+         let target = caps * DESIRED_HEADROOM + keyframe as f64 * 8.0 / DEADLINE.as_secs_f64();
++        // EXPERIMENT (variant 3): probe only for what the watched shares need now.
++        #[cfg(test)]
++        if std::env::var("GWAR_BWE_VARIANT").as_deref() == Ok("3") {
++            let need: f64 = watched
++                .iter()
++                .map(|&l| {
++                    rates.get(l).map_or(0, |r| start_estimate(*r, lane_caps.get(l).copied().unwrap_or(0))) as f64
++                })
++                .sum();
++            return Some(target.min(PROBE_REACH * self.estimate).min(need) as u64);
++        }
+         Some(target.min(PROBE_REACH * self.estimate) as u64)
+     }
+ 
+diff --git a/vendor/str0m/src/bwe/delay/rate_control.rs b/vendor/str0m/src/bwe/delay/rate_control.rs
+index a94d070e..5998e672 100644
+--- a/vendor/str0m/src/bwe/delay/rate_control.rs
++++ b/vendor/str0m/src/bwe/delay/rate_control.rs
+@@ -266,6 +266,15 @@ impl RateControl {
+         // it immediately.
+         self.state = State::Hold;
+         log_rate_control_state!(self.state as i8);
++        let before = self.estimated_bitrate;
++        crate::_gwar_sim::trace(now, || {
++            format!(
++                "DECREASE observed={} before={} after={}",
++                observed_bitrate.as_u64(),
++                before.as_u64(),
++                new_estimate.as_u64()
++            )
++        });
+         self.update_estimate(new_estimate, now);
+     }
+ 
+diff --git a/vendor/str0m/src/bwe/delay/trendline.rs b/vendor/str0m/src/bwe/delay/trendline.rs
+index cf9cc57e..2e08d8b8 100644
+--- a/vendor/str0m/src/bwe/delay/trendline.rs
++++ b/vendor/str0m/src/bwe/delay/trendline.rs
+@@ -217,6 +217,16 @@ impl TrendlineEstimator {
+             {
+                 self.overuse = None;
+ 
++                let (threshold, n, prev) = (self.delay_threshold, self.num_delay_variations, self.previous_trend);
++                let span = self.history.back().map_or(0.0, |b| b.remote_recv_time_ms)
++                    - self.history.front().map_or(0.0, |f| f.remote_recv_time_ms);
++                let ys: Vec<String> = self.history.iter().map(|t| format!("{:.1}", t.smoothed_delay_ms)).collect();
++                crate::_gwar_sim::trace(now, || {
++                    format!(
++                        "OVERUSE trend={trend:.5} prev={prev:.5} modified={modified_trend:.2} threshold={threshold:.2} n={n} span_ms={span:.0} send_delta={:?} arrival_delta={:?} ys={}",
++                        variation.send_delta, variation.arrival_delta, ys.join("/")
++                    )
++                });
+                 self.update_hypothesis(BandwidthUsage::Overuse);
+             }
+         } else if modified_trend < -self.delay_threshold {
+diff --git a/vendor/str0m/src/bwe/mod.rs b/vendor/str0m/src/bwe/mod.rs
+index b4c19c67..e2a09f03 100644
+--- a/vendor/str0m/src/bwe/mod.rs
++++ b/vendor/str0m/src/bwe/mod.rs
+@@ -238,6 +238,14 @@ impl SendSideBandwidthEstimator {
+             } else {
+                 bitrate
+             };
++            crate::_gwar_sim::trace(now, || {
++                format!(
++                    "PROBE bitrate={} saturated={saturated} applied={} prev={:?}",
++                    bitrate.as_u64(),
++                    delay_probe.as_u64(),
++                    previous_estimate.map(|b| b.as_u64())
++                )
++            });
+             latest_probe_result = Some(delay_probe);
+             latest_probe_capacity = Some(bitrate);
+         }
+@@ -265,6 +273,16 @@ impl SendSideBandwidthEstimator {
+ 
+         let acked_bitrate = self.acked_bitrate_estimator.current_estimate();
+ 
++        // EXPERIMENT (variant 1): libwebrtc's LimitProbesLowerThanThroughputEstimate. A probe
++        // lowers the estimate at most to min(delay estimate, 0.85 × acknowledged bitrate).
++        if crate::_gwar_sim::variant() == 1
++            && let (Some(probe), Some(acked), Some(delay)) =
++                (latest_probe_result, acked_bitrate, previous_delay_estimate)
++        {
++            let limit = delay.min(acked * 0.85);
++            latest_probe_result = Some(probe.max(limit));
++            latest_probe_capacity = latest_probe_capacity.map(|c| c.max(limit));
++        }
+         // Use the latest probe result from this update, if any
+         let probe_result = latest_probe_result;
+ 
+@@ -319,6 +337,16 @@ impl SendSideBandwidthEstimator {
+             }
+         }
+ 
++        crate::_gwar_sim::trace(now, || {
++            format!(
++                "EST delay={} loss={:?} state={:?} final={:?} acked={:?} lossfrac={loss:.3}",
++                delay_estimate.as_u64(),
++                self.loss_controller.loss_based_result().bandwidth_estimate.map(|b| b.as_u64()),
++                self.loss_controller.loss_based_result().state,
++                self.last_estimate().map(|b| b.as_u64()),
++                acked_bitrate.map(|b| b.as_u64())
++            )
++        });
+         // Feed the (possibly combined) estimate into subcomponents wanting it.
+         self.propagate_estimate();
+     }
+diff --git a/vendor/str0m/src/bwe/probe/control.rs b/vendor/str0m/src/bwe/probe/control.rs
+index 51ec1cd0..f4c6aeef 100644
+--- a/vendor/str0m/src/bwe/probe/control.rs
++++ b/vendor/str0m/src/bwe/probe/control.rs
+@@ -357,6 +357,11 @@ impl ProbeControl {
+             return false;
+         }
+ 
++        // EXPERIMENT (variant 3): nothing to discover once the estimate carries desired.
++        if crate::_gwar_sim::variant() == 3 && desired <= estimate {
++            return false;
++        }
++
+         let scale = self.last_cause.probe_scale(&self.config);
+         let target = estimate * scale;
+ 
+@@ -431,6 +436,11 @@ impl ProbeControl {
+             return false;
+         }
+ 
++        // EXPERIMENT (variant 3): nothing to discover once the estimate carries desired.
++        if crate::_gwar_sim::variant() == 3 && self.last_estimate.is_some_and(|e| desired <= e) {
++            return false;
++        }
++
+         // Periodic ALR probe at 2× desired (capped by queue_probe to 2× desired anyway).
+         // Using desired rather than estimate allows discovering higher capacity when
+         // the app wants more bandwidth than currently estimated.
+diff --git a/vendor/str0m/src/bwe/probe/estimator.rs b/vendor/str0m/src/bwe/probe/estimator.rs
+index c49c576b..f0147aa1 100644
+--- a/vendor/str0m/src/bwe/probe/estimator.rs
++++ b/vendor/str0m/src/bwe/probe/estimator.rs
+@@ -86,6 +86,7 @@ struct ProbeEstimatorState {
+     /// Number of packets included in this probe (received packets only).
+     packet_count: usize,
+     send_times: BTreeSet<Instant>,
++    packets: Vec<(Instant, Instant, usize)>,
+ }
+ 
+ impl ProbeEstimator {
+@@ -249,6 +250,7 @@ impl ProbeEstimatorState {
+             total_bytes: DataSize::ZERO,
+             packet_count: 0,
+             send_times: BTreeSet::new(),
++            packets: Vec::new(),
+         }
+     }
+ 
+@@ -287,6 +289,8 @@ impl ProbeEstimatorState {
+ 
+         self.total_bytes += packet_size;
+         self.packet_count += 1;
++        self.packets
++            .push((send_time, recv_time, packet_size.as_bytes_usize()));
+ 
+         true
+     }
+@@ -394,6 +398,11 @@ impl ProbeEstimatorState {
+ 
+         let recv_rate = recv_size / recv_interval;
+         let send_rate = send_size / send_interval;
++        let (recv_rate, send_rate) = if crate::_gwar_sim::variant() == 2 {
++            group_rates(&self.packets, first_send).unwrap_or((recv_rate, send_rate))
++        } else {
++            (recv_rate, send_rate)
++        };
+ 
+         // WebRTC validation: reject if receive/send ratio is too high.
+         let ratio = recv_rate.as_f64() / send_rate.as_f64();
+@@ -413,6 +422,32 @@ impl ProbeEstimatorState {
+         if saturated {
+             estimate = recv_rate * TARGET_UTILIZATION_FRACTION;
+         }
++        crate::_gwar_sim::trace(first_send, || {
++            let mut pkts: Vec<String> = self
++                .packets
++                .iter()
++                .map(|(s, r, b)| {
++                    format!(
++                        "{:.1}:{:.1}:{}",
++                        s.saturating_duration_since(first_send).as_secs_f64() * 1e3,
++                        r.saturating_duration_since(first_recv).as_secs_f64() * 1e3,
++                        b
++                    )
++                })
++                .collect();
++            pkts.sort();
++            format!(
++                "PCALC target={} n={} bytes={} send_ms={:.2} recv_ms={:.2} send={} recv={} sat={saturated} pkts={}",
++                self.config.target_bitrate().as_u64(),
++                self.packet_count,
++                self.total_bytes.as_bytes_usize(),
++                send_interval.as_secs_f64() * 1e3,
++                recv_interval.as_secs_f64() * 1e3,
++                send_rate.as_u64(),
++                recv_rate.as_u64(),
++                pkts.join(" ")
++            )
++        });
+ 
+         ProbeResult::Estimate(estimate, saturated)
+     }
+@@ -422,6 +457,28 @@ impl ProbeEstimatorState {
+     }
+ }
+ 
++/// EXPERIMENT (variant 2): rates measured from the end of the first send burst to the end of
++/// the last, over the bytes sent after the first burst. Exact for a backlogged bottleneck,
++/// and both ends are the last arrival of a burst, so FIFO jitter biases neither.
++fn group_rates(p: &[(Instant, Instant, usize)], first_send: Instant) -> Option<(Bitrate, Bitrate)> {
++    let edge = first_send + Duration::from_millis(1);
++    let g1_send = p.iter().filter(|x| x.0 <= edge).map(|x| x.0).max()?;
++    let g1_recv = p.iter().filter(|x| x.0 <= edge).map(|x| x.1).max()?;
++    let rest: Vec<_> = p.iter().filter(|x| x.0 > edge).collect();
++    if rest.len() < 2 {
++        return None;
++    }
++    let bytes = DataSize::bytes(rest.iter().map(|x| x.2 as i64).sum());
++    let last_send = rest.iter().map(|x| x.0).max()?;
++    let last_recv = rest.iter().map(|x| x.1).max()?;
++    let si = last_send.checked_duration_since(g1_send)?;
++    let ri = last_recv.checked_duration_since(g1_recv)?;
++    if si.is_zero() || ri.is_zero() {
++        return None;
++    }
++    Some((bytes / ri, bytes / si))
++}
++
+ /// Result of a probe cluster estimation.
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ enum ProbeResult {
+diff --git a/vendor/str0m/src/lib.rs b/vendor/str0m/src/lib.rs
+index 58b72648..4487111f 100644
+--- a/vendor/str0m/src/lib.rs
++++ b/vendor/str0m/src/lib.rs
+@@ -2278,6 +2278,52 @@ pub mod _gwar_sim {
+     /// The RNG and clock are thread-local; production crypto randomness is unchanged.
+     pub fn start(seed: u64) -> std::time::Instant {
+         fastrand::seed(seed);
+-        crate::util::simulation_start()
++        let origin = crate::util::simulation_start();
++        ORIGIN.set(Some(origin));
++        origin
++    }
++
++    thread_local! {
++        static ORIGIN: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
++        static TRACE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
++    }
++
++    /// TEMPORARY investigation hook: start recording BWE decisions on this thread.
++    pub fn trace_on() {
++        TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
++    }
++
++    /// TEMPORARY investigation hook: the origin trace times count from.
++    pub fn origin() -> std::time::Instant {
++        ORIGIN.get().expect("start was called")
++    }
++
++    /// TEMPORARY investigation hook: the recorded BWE decisions.
++    pub fn trace_take() -> Vec<String> {
++        TRACE.with(|t| t.borrow_mut().take().unwrap_or_default())
++    }
++
++    /// TEMPORARY experiment selector, from `GWAR_BWE_VARIANT` (0: main).
++    pub(crate) fn variant() -> u32 {
++        static VARIANT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++        *VARIANT.get_or_init(|| std::env::var("GWAR_BWE_VARIANT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
++    }
++
++    pub(crate) fn trace(now: std::time::Instant, f: impl FnOnce() -> String) {
++        TRACE.with(|t| {
++            if let Some(v) = t.borrow_mut().as_mut() {
++                let ms = ORIGIN.get().map_or(0, |o| now.saturating_duration_since(o).as_millis());
++                v.push(format!("{ms} {}", f()));
++            }
++        });
++    }
++}
++
++#[cfg(not(feature = "_gwar_sim"))]
++#[allow(unused)]
++pub(crate) mod _gwar_sim {
++    pub(crate) fn trace(_now: std::time::Instant, _f: impl FnOnce() -> String) {}
++    pub(crate) fn variant() -> u32 {
++        0
+     }
+ }

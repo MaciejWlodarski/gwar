@@ -2174,6 +2174,8 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   keyframe, once) and 8–1034 (up to 9). What jitter still costs is the
   estimator's own back-off below the share's rate, which a steady 4 Mb/s share
   meets too (111 and 548 packets evicted on two of five seeds).
+  [screen-mild-jitter.md](screen-mild-jitter.md) traces that back-off to misread
+  probes.
 
   The start moves only ceilings: the SFU still forwards no more than the share
   sends, probes stay within the extras reserve, and nothing a client sends
@@ -2591,6 +2593,11 @@ The [latency guide](latency.md#screen-share-jitter-known-limitation-and-rejected
 records all rejected approaches, the historical browser table, the jitter
 simulation table, censored waits and reproduction commands. No picture-freeze
 fix or production voice improvement is claimed by this PR.
+
+Milder jitter, ±5 ms, still lowers a steady share's estimate below the share's rate
+through the same probe misreading, without a freeze. Delay-gradient overuse plays no
+part. [screen-mild-jitter.md](screen-mild-jitter.md) records the mechanism and three
+designs that failed the voice gate.
 
 ### Cost on the deployment VM
 
