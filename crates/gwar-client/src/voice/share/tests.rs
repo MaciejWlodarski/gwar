@@ -184,7 +184,7 @@ fn delay_stays_in_its_bounds_and_follows_late_arrivals() {
     assert_eq!(jitter.delay(), MIN_DELAY);
     jitter.observe(10 * 960, start + Duration::from_millis(200 + 50));
     assert!(jitter.delay() > Duration::from_millis(100));
-    // Late, but not so late that the stream must have started over: see `DISCONTINUITY`.
+    // Late, but not so late that the stream must have started over: see `Jitter::discontinuity`.
     jitter.observe(11 * 960, start + Duration::from_millis(220 + 200));
     assert_eq!(jitter.delay(), MAX_DELAY);
 }
@@ -193,9 +193,10 @@ fn delay_stays_in_its_bounds_and_follows_late_arrivals() {
 fn a_stall_a_held_queue_rides_out_is_learned_as_jitter() {
     // With sound held for the picture the queue lasts up to `MAX_HOLD` longer before it runs dry,
     // so a stall that long is the network's jitter, which the delay must learn, not a new start.
-    assert!(DISCONTINUITY >= MAX_DELAY + MAX_HOLD);
+    assert!(MAX_DISCONTINUITY >= MAX_DELAY + MAX_HOLD);
     let mut jitter = Jitter::new();
     jitter.set_hold(MAX_HOLD);
+    assert!(jitter.discontinuity() >= MAX_DELAY + MAX_HOLD);
     let start = Instant::now();
     for n in 0..10u32 {
         jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
@@ -203,6 +204,28 @@ fn a_stall_a_held_queue_rides_out_is_learned_as_jitter() {
     let before = jitter.delay();
     jitter.observe(10 * 960, start + Duration::from_millis(200 + 500));
     assert!(jitter.delay() > before, "a 500 ms stall under a full hold was not learned: {before:?}");
+}
+
+/// With nothing held, a pause past what the delay and concealment cover is a new start: learnt
+/// as jitter, it put share sound 160 ms late for seconds, and the picture waited for it.
+#[test]
+fn with_nothing_held_a_pause_past_the_delay_is_not_jitter() {
+    let mut jitter = Jitter::new();
+    let start = Instant::now();
+    for n in 0..10u32 {
+        jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+    }
+    assert!(jitter.discontinuity() < MAX_DELAY + CONCEAL + Duration::from_millis(1));
+    jitter.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(jitter.delay(), MIN_DELAY, "a 400 ms pause with nothing held became jitter");
+    // The same pause under a hold the queue rode it out with is still jitter.
+    let mut held = Jitter::new();
+    held.set_hold(Duration::from_millis(300));
+    for n in 0..10u32 {
+        held.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+    }
+    held.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(held.delay(), Duration::from_millis(300) + MAX_DELAY);
 }
 
 /// The server keeps share sound's RTP time contiguous across a pause in the sound

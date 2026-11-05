@@ -75,15 +75,17 @@ const BACKLOG_MARGIN: Duration = Duration::from_millis(80);
 const BACKLOG_WATCH: usize = (RATE / 2) as usize; // 500 ms
 /// A stream that has nothing for this long stops concealing and starts over.
 const CONCEAL_LIMIT: u32 = 5;
-/// An arrival this much later than its RTP time says cannot be jitter: the queue ran dry and the
-/// stream started over long before. The server keeps share sound's RTP time contiguous across a
-/// pause in the sound, so the first packet after one arrives seconds "late". Sound held for the
-/// picture (up to `MAX_HOLD`) makes the queue last that much longer, so a stall it rides out is
-/// still jitter the delay has to learn, never taken for a new start.
-const DISCONTINUITY: Duration = Duration::from_millis(
-    MAX_DELAY.as_millis() as u64 + MAX_HOLD.as_millis() as u64 + (CONCEAL_LIMIT * FRAME_MS) as u64,
-);
-const _: () = assert!(DISCONTINUITY.as_millis() >= MAX_DELAY.as_millis() + MAX_HOLD.as_millis());
+/// An arrival later than its RTP time says by more than [`Jitter::discontinuity`] cannot be
+/// jitter: the queue ran dry and the stream started over long before. The server keeps share
+/// sound's RTP time contiguous across a pause in the sound, so the first packet after one arrives
+/// seconds "late". Sound held for the picture makes the queue last that much longer, so a stall it
+/// rides out is still jitter the delay has to learn, never taken for a new start; with nothing
+/// held, a pause past the delay and concealment is a new start (Opus review r2, S20). This is the
+/// most it can be, under a full hold.
+const MAX_DISCONTINUITY: Duration =
+    Duration::from_millis(MAX_DELAY.as_millis() as u64 + MAX_HOLD.as_millis() as u64 + CONCEAL.as_millis() as u64);
+const CONCEAL: Duration = Duration::from_millis((CONCEAL_LIMIT * FRAME_MS) as u64);
+const _: () = assert!(MAX_DISCONTINUITY.as_millis() >= MAX_DELAY.as_millis() + MAX_HOLD.as_millis());
 
 /// Frames wait here while the share thread runs; a full queue drops share sound only.
 const INPUT_QUEUE: usize = 256;
@@ -484,6 +486,12 @@ impl Jitter {
             )
     }
 
+    /// How late an arrival can be and still be jitter: what the queue rides out before it runs
+    /// dry, and the concealment after that.
+    fn discontinuity(&self) -> Duration {
+        (MAX_DELAY + self.hold + CONCEAL).min(MAX_DISCONTINUITY)
+    }
+
     fn set_hold(&mut self, hold: Duration) {
         self.releasing |= hold < self.hold;
         self.hold = hold;
@@ -509,7 +517,7 @@ impl Jitter {
         {
             let sent = f64::from(ahead(rtp_time, time)) / f64::from(RATE);
             let error = (now.saturating_duration_since(at).as_secs_f64() - sent).abs();
-            if error <= DISCONTINUITY.as_secs_f64() {
+            if error <= self.discontinuity().as_secs_f64() {
                 self.deviation = error.max(self.deviation * 0.995);
             }
         }
@@ -551,7 +559,7 @@ impl Jitter {
     }
 
     /// After the stream ran dry. The last arrival stays: a network stall that ran the queue dry is
-    /// what the delay has to learn, and a pause in the sound is [`DISCONTINUITY`]'s.
+    /// what the delay has to learn, and a pause in the sound is [`Jitter::discontinuity`]'s.
     fn restart(&mut self) {
         self.started = false;
         self.next = None;
