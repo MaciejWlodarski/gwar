@@ -891,6 +891,59 @@ mod tests {
         assert!(hurt <= 700 * MS, "{hurt:?}: {}", summary(&sim));
     }
 
+    /// A 2 s stall that leaves the link 4x slower: the viewer's filter drops the backlog and
+    /// says the link is back, so the server restores its estimate on a link that cannot carry it.
+    fn stall_then_slower(restore: bool, seed: u64) -> (Duration, Duration, u64) {
+        let mut sim = Sim::with_seed(Some(20_000_000), seed);
+        sim.voice = true;
+        sim.server_interval = 5 * MS;
+        sim.join("share", 5_000_000, 30, 150_000, 8_000_000);
+        sim.run(23 * SECOND);
+        // The stall: nothing arrives for 2 s, then what was sent comes at once, as a link that
+        // buffered it delivers it; from then on the link carries a quarter of what it did.
+        sim.down.epoch = sim.now;
+        sim.down.aggregate = 2 * SECOND;
+        sim.run(2 * SECOND - DELAY);
+        sim.down.aggregate = Duration::ZERO;
+        sim.run(DELAY);
+        sim.down.rate = Some(5_000_000);
+        let back = sim.now;
+        // The viewer's word reaches the server once the burst's feedback has brought the
+        // estimate down, the case a restore is for.
+        while sim.w.egress.estimate() > 8_000_000 && sim.now - back < 5 * SECOND {
+            sim.run(20 * MS);
+        }
+        let told = (sim.now - back, sim.w.egress.estimate());
+        if restore {
+            sim.w.link_back = true;
+        }
+        let mut restored = 0;
+        for _ in 0..50 {
+            sim.run(20 * MS);
+            restored = restored.max(sim.w.egress.estimate());
+        }
+        sim.run(7 * SECOND);
+        let (hurt, worst) = voice_hurt(&sim, back, sim.now);
+        println!("  restore {restore}: told at {:?} with {}, then up to {restored}", told.0, told.1);
+        (hurt, worst, restored)
+    }
+
+    #[test]
+    fn a_restore_after_a_stall_on_a_slower_link_keeps_voice_as_without_it() {
+        // Early review S3: no simulation set `link_back`, so the drop sweep never measured the
+        // restore. Voice may not pay for it beyond what the stall alone costs.
+        for seed in 1..=4 {
+            let (plain, plain_worst, told_at) = stall_then_slower(false, seed);
+            let told_estimate = |_| told_at;
+            let (hurt, worst, restored) = stall_then_slower(true, seed);
+            println!(
+                "seed {seed}: voice hurt {plain:?} (worst {plain_worst:?}) without the restore, {hurt:?} (worst {worst:?}) with it, restored to {restored}"
+            );
+            assert!(restored > told_estimate(seed), "seed {seed}: the case did not restore");
+            assert!(hurt <= plain + 300 * MS, "seed {seed}: {hurt:?} against {plain:?}");
+        }
+    }
+
     /// How a link's capacity falls: at once from `from` to `to`, or over 2 s.
     #[derive(Clone, Copy, Debug)]
     pub struct LinkDrop {

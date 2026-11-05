@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RequestError } from "../net/connection";
-import { MAX_WAIT_MS, nextWaits, PictureSync, SETTLING_LOOKS, SOUND_AIM_MS, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
+import { BLIND_LOOKS, MAX_WAIT_MS, nextWaits, PictureSync, SETTLING_LOOKS, SOUND_AIM_MS, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
 
 const association = { known: true, audio_rtp: 48_000, video_rtp: 90_000 };
 /** A picture and a sound of the same instant of the share, `lag` ms apart at the output. */
@@ -320,6 +320,44 @@ describe("PictureSync", () => {
     await sync.tick([slot]);
     expect(link.association).toHaveBeenCalledTimes(SETTLING_LOOKS + 2);
     expect(waits.at(-1)).toEqual(at(110));
+  });
+
+  it("gives its waits back once the clocks cannot be lined up for a while, and starts over", async () => {
+    // Early review S7: with the server's line unknown or unanswered, the picture kept its wait
+    // (up to a second) while sound played, so a still screen's next slide came that late.
+    for (const lose of ["unknown", "timeout", "silent"] as const) {
+      const { sync, link, waits } = fixture();
+      await settle(sync);
+      await sync.tick([slot]);
+      expect(waits.at(-1)).toEqual(at(110));
+      if (lose === "unknown") link.association.mockResolvedValue({ known: false, audio_rtp: 0, video_rtp: 0 });
+      if (lose === "timeout") link.association.mockRejectedValue(new Error("request timed out"));
+      if (lose === "silent") link.sound.mockResolvedValue(null as never);
+      for (let i = 1; i < BLIND_LOOKS; i++) await sync.tick([slot]);
+      expect(waits.at(-1), lose).toEqual(at(110));
+      await sync.tick([slot]);
+      expect(waits.at(-1), lose).toEqual([1, { picture: 0, sound: 0 }]);
+      // Back to measuring: it settles again before it moves anything.
+      link.association.mockResolvedValue(association);
+      link.sound.mockResolvedValue(pair(80 + SOUND_AIM_MS).sound);
+      await settle(sync);
+      await sync.tick([slot]);
+      expect(waits.at(-1), lose).toEqual(at(110));
+    }
+  });
+
+  it("one look without an answer between good ones keeps the wait", async () => {
+    const { sync, link, waits } = fixture();
+    await settle(sync);
+    await sync.tick([slot]);
+    for (let round = 0; round < 3; round++) {
+      for (let i = 1; i < BLIND_LOOKS; i++) {
+        link.association.mockRejectedValueOnce(new Error("request timed out"));
+        await sync.tick([slot]);
+      }
+      await sync.tick([slot]);
+    }
+    expect(waits.some(([, w]) => w.picture === 0)).toBe(false);
   });
 
   it("a wait is released on mute after a question that got no answer", async () => {

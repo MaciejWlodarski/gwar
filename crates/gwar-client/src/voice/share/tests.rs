@@ -284,7 +284,7 @@ fn the_queue_is_bounded_and_malformed_frames_are_refused() {
     let (mut worker, _bus, playout) = worker();
     playout.open(0, 1, 1.0);
     let mut encoder = encoder();
-    feed(&mut worker, &mut encoder, (0, 1), 0, 40, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (0, 1), 0, MAX_QUEUED as u64 + 8, (440.0, 440.0), Instant::now());
     assert_eq!(worker.streams[0].as_ref().unwrap().jitter.queue.len(), MAX_QUEUED);
     assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), 8);
     let before = worker.counters.late_drops.load(Ordering::Relaxed);
@@ -601,7 +601,9 @@ fn sound_reaches_a_hold_for_the_picture_without_a_jump() {
     // One second at 1 % is 10 ms: the queue may not move faster than that, in either direction.
     play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 100, 1);
     let early = worker.streams[0].as_ref().unwrap().jitter.queued();
-    assert!(early <= before + Duration::from_millis(40), "{before:?} to {early:?} in a second");
+    // 10 ms of hold, and one packet of rounding in what is queued (early review S9: 40 ms let
+    // four times the declared rate through).
+    assert!(early <= before + Duration::from_millis(10 + u64::from(FRAME_MS)), "{before:?} to {early:?} in a second");
     play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 150, 7);
     let held = worker.streams[0].as_ref().unwrap().jitter.queued();
     assert!(held >= before + Duration::from_millis(60), "{before:?} to {held:?}");
@@ -645,7 +647,12 @@ fn a_hold_is_bounded_and_a_new_run_starts_without_one() {
     worker.apply_controls();
     assert!(playout.set_hold(0, 7, 60_000));
     assert_eq!(playout.hold[0].load(Ordering::Relaxed), MAX_HOLD.as_millis() as u32);
-    assert!(MAX_HOLD + MAX_DELAY < Duration::from_millis(u64::from(FRAME_MS) * MAX_QUEUED as u64));
+    // Early review S4: at a full hold the queue's limit sat at the trim's own keep, so a lump
+    // was dropped newest first instead of trimmed oldest first.
+    assert!(
+        MAX_HOLD + MAX_DELAY + BACKLOG_MARGIN + JUMP_HEADROOM
+            <= Duration::from_millis(u64::from(FRAME_MS) * MAX_QUEUED as u64)
+    );
     assert!(playout.open(0, 8, 1.0));
     assert_eq!(playout.hold[0].load(Ordering::Relaxed), 0);
     assert!(!playout.set_hold(0, 7, 100), "an older run has no say");

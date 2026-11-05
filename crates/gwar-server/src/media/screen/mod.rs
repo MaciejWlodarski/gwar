@@ -136,8 +136,13 @@ const ALLOCATION_TICK: Duration = Duration::from_millis(100);
 const PEAK_MEMORY: Duration = Duration::from_secs(15);
 /// A viewer's word that its link is back moves its estimate at most this often.
 const RESTORE_EVERY: Duration = Duration::from_secs(10);
-/// The burst's own feedback can land after the viewer's word: one more fall this soon is undone.
-const RESTORE_HOLD: Duration = Duration::from_secs(1);
+/// A restore goes at most this far above the estimate it finds. The viewer's word says a backlog
+/// arrived, not what the link carries now, and a link that came back slower pays for the rest
+/// with voice: unbounded, with one more restore when the burst's feedback brought it down again
+/// within a second, voice met 50 ms of queue 1.37 s longer than without any restore; at 1.5x,
+/// 0.12 s (`a_restore_after_a_stall_on_a_slower_link_keeps_voice_as_without_it`). A fall after a
+/// restore is the link's answer.
+const RESTORE_REACH: f64 = 1.5;
 /// A viewer whose every slot is paused, at least one for bandwidth, retries its most important
 /// one this long after the pause; a retry that was inconclusive is followed this long after it
 /// started. The continuous-fit resume may come first. A viewer's own Try again waits as long
@@ -868,12 +873,10 @@ struct Attempt {
     counted: bool,
 }
 
-/// The last estimate put back on a viewer's word that its link had returned.
+/// When an estimate was last put back on a viewer's word that its link had returned.
 #[derive(Clone, Copy)]
 struct Restored {
     at: Instant,
-    target: u64,
-    held: bool,
 }
 
 /// A viewer's start following its ramping share (`CATCH_UP_STEP`), as of the last start.
@@ -927,12 +930,12 @@ struct Watcher {
     /// The session's connection, which keys what its next transport remembers.
     connection: u64,
     remembered: Option<u64>,
-    /// The server-wide budget: no optimistic start goes above it.
     /// The highest recent estimate, and when, for `link_back`.
     peak: (u64, Instant),
     /// The viewer dropped a stall's backlog and is receiving on time: a burst, not a slower link.
     link_back: bool,
     restored: Option<Restored>,
+    /// The server-wide budget: no optimistic start or restore goes above it.
     ceiling: u64,
     /// The next automatic retry of a fully paused viewer, the retries that failed since media
     /// last kept flowing, and since when it has flowed with no slot paused for bandwidth.
@@ -1375,7 +1378,9 @@ impl Sfu {
                 });
                 if let Some(slot) = slot {
                     self.ask_keyframe(session, slot, now);
-                    if let Some(w) = self.watchers.get_mut(&session) {
+                    // A paused slot has nothing in flight to come back: the word would be a
+                    // resume's first keyframe running late, and the pause was the link's answer.
+                    if let Some(w) = self.watchers.get_mut(&session).filter(|w| w.egress.paused(slot).is_none()) {
                         w.link_back = true;
                     }
                 }
@@ -2860,19 +2865,17 @@ fn allocate(
     }
     let told = std::mem::take(&mut w.link_back)
         && w.restored.is_none_or(|r| now.saturating_duration_since(r.at) >= RESTORE_EVERY);
-    let undone = w.restored.filter(|r| {
-        !r.held && now.saturating_duration_since(r.at) < RESTORE_HOLD && w.egress.estimate() < r.target / 2
-    });
     let mut restored = false;
-    if let Some(r) = undone {
-        restart_estimator(w, r.target, now, &caps, &lanes);
-        w.restored = Some(Restored { held: true, ..r });
-        restored = true;
-    } else if told {
-        let target = w.egress.needed(&caps, &lanes).map_or(w.peak.0, |needed| needed.min(w.peak.0));
+    if told {
+        let target = w
+            .egress
+            .needed(&caps, &lanes)
+            .map_or(w.peak.0, |needed| needed.min(w.peak.0))
+            .min(w.ceiling)
+            .min((w.egress.estimate() as f64 * RESTORE_REACH) as u64);
         if target > w.egress.estimate() {
             restart_estimator(w, target, now, &caps, &lanes);
-            w.restored = Some(Restored { at: now, target, held: false });
+            w.restored = Some(Restored { at: now });
             restored = true;
         }
     }
@@ -4546,6 +4549,8 @@ pub(crate) mod tests {
     #[test]
     fn a_viewer_whose_link_is_back_gets_its_estimate_back_once() {
         let mut pair = Pair::new();
+        // Room in the server budget: a restore keeps to it (`a_restored_estimate_stays_within_the_servers_budget`).
+        pair.w.ceiling = u64::MAX;
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
         set_estimate(&mut pair.w, 40_000_000, pair.now);
@@ -4565,6 +4570,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_restored_estimate_stays_within_the_servers_budget() {
+        // Early review S2: starts and retries keep to `ceiling`; the restore did not.
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        set_estimate(&mut pair.w, 40_000_000, pair.now);
+        pair.now += Duration::from_secs(2);
+        set_estimate(&mut pair.w, 1_000_000, pair.now);
+        pair.w.ceiling = 2_000_000;
+        pair.w.link_back = true;
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        let back = pair.w.egress.estimate();
+        assert!(back > 1_000_000 && back <= 2_000_000, "restored to {back}");
+    }
+
+    #[test]
     fn the_word_of_a_link_back_never_lowers_an_estimate_or_raises_a_stale_one() {
         let mut pair = Pair::new();
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
@@ -4578,8 +4599,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_restored_estimate_survives_the_backlogs_own_feedback_once() {
+    fn a_restore_reaches_half_again_above_the_estimate_and_a_fall_after_it_stands() {
         let mut pair = Pair::new();
+        // Room in the server budget: a restore keeps to it (`a_restored_estimate_stays_within_the_servers_budget`).
+        pair.w.ceiling = u64::MAX;
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
         set_estimate(&mut pair.w, 40_000_000, pair.now);
@@ -4587,11 +4610,7 @@ pub(crate) mod tests {
         set_estimate(&mut pair.w, 3_000_000, pair.now);
         pair.w.link_back = true;
         allocate(&mut pair.w, pair.now, &HashMap::new(), false);
-        let back = pair.w.egress.estimate();
-        pair.now += Duration::from_millis(600);
-        set_estimate(&mut pair.w, 3_000_000, pair.now);
-        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
-        assert_eq!(pair.w.egress.estimate(), back, "the first feedback of the burst says nothing either");
+        assert_eq!(pair.w.egress.estimate(), 4_500_000);
         pair.now += Duration::from_millis(600);
         set_estimate(&mut pair.w, 3_000_000, pair.now);
         allocate(&mut pair.w, pair.now, &HashMap::new(), false);
@@ -5441,6 +5460,20 @@ pub(crate) mod tests {
             }
             assert!(sent.iter().all(|requests| !requests.is_empty()), "seed {seed}: every static source is requested");
         }
+    }
+
+    #[tokio::test]
+    async fn a_paused_slot_says_nothing_about_its_link_coming_back() {
+        // Early review S1: a resume's first keyframe runs late from its size alone, and the
+        // viewer's filter took it for a backlog. The pause was the link's answer: no restore.
+        let (mut sfu, _, _, _) = recovery_fixture(&[1]).await;
+        let share = sfu.watchers[&1].slots[0].grant.as_ref().unwrap().share.clone();
+        apply(sfu.watchers.get_mut(&1).unwrap(), 0, Change::Pause(ScreenPauseReason::Bandwidth));
+        sfu.command(ScreenCmd::Stalled { session: 1, share: share.clone() });
+        assert!(!sfu.watchers[&1].link_back);
+        apply(sfu.watchers.get_mut(&1).unwrap(), 0, Change::Resume);
+        sfu.command(ScreenCmd::Stalled { session: 1, share });
+        assert!(sfu.watchers[&1].link_back);
     }
 
     #[tokio::test]

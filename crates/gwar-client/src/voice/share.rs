@@ -38,8 +38,16 @@ const RING_CAPACITY: usize = (RATE / 5) as usize; // 200 ms
 
 const MIN_DELAY: Duration = Duration::from_millis(40);
 const MAX_DELAY: Duration = Duration::from_millis(160);
-/// Packets queued per stream: at most 640 ms at the normal 20 ms packet.
-const MAX_QUEUED: usize = 32;
+/// Packets queued per stream: at most 960 ms at the normal 20 ms packet. A full hold, the
+/// longest delay and the backlog margin take 640 ms; the rest takes a lump that arrives at once
+/// (`JUMP_HEADROOM`), so the trim, not the newest packets, decides what goes.
+const MAX_QUEUED: usize = 48;
+/// A lump of sound handed over at once beyond the backlog margin.
+const JUMP_HEADROOM: Duration = Duration::from_millis(300);
+const _: () = assert!(
+    MAX_HOLD.as_millis() + MAX_DELAY.as_millis() + BACKLOG_MARGIN.as_millis() + JUMP_HEADROOM.as_millis()
+        <= FRAME_MS as u128 * MAX_QUEUED as u128
+);
 /// Queued frames beyond the delay that are played slightly faster to absorb clock drift.
 const DRIFT_MARGIN: Duration = Duration::from_millis(10);
 /// 0.2 % stays inaudible and covers any sound card's clock error.
@@ -50,7 +58,8 @@ const HOLD_RATE: f64 = 0.01;
 /// How quickly the reading speed follows, per sample: changes of speed take 100 ms, so an uneven
 /// queue cannot be heard as a wobble.
 const RATE_SMOOTHING: f64 = 1.0 / 4800.0;
-/// The most sound holds back for the picture. `MAX_QUEUED` has to stay above this and `MAX_DELAY`.
+/// The most sound holds back for the picture. `MAX_QUEUED` has to stay above this, `MAX_DELAY`,
+/// `BACKLOG_MARGIN` and `JUMP_HEADROOM`.
 const MAX_HOLD: Duration = Duration::from_millis(400);
 /// Anything further ahead is a stall's backlog: dropped, never replayed.
 const BACKLOG_MARGIN: Duration = Duration::from_millis(80);

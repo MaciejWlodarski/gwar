@@ -604,6 +604,14 @@ export class DecodeWatchdog {
     this.reported = now;
     return true;
   }
+
+  /**
+   * This viewer's late-frame filter dropped frames the SFU forwarded whole, so the decoder waits
+   * for the keyframe that `screen.stalled` asked for, and the server, which saw nothing dropped,
+   * would take a report of that wait as a decoder that cannot decode. The stall starts again at
+   * the next sample, as after a decode.
+   */
+  lost(): void { this.frames = null; }
 }
 
 /** The main and RTX SSRCs of a publish offer's single video section (its `ssrc-group:FID`). */
@@ -1677,7 +1685,11 @@ export class ScreenWatchTransport {
   private shedLateFrames(receiver: RTCRtpReceiver, slot: number, kind: MediaKind): void {
     if (typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return;
     try {
-      this.lateFrames ??= createLateFramesWorker(slot => { if (!this.closed) this.params.frameLost?.(slot); });
+      this.lateFrames ??= createLateFramesWorker(slot => {
+        if (this.closed) return;
+        this.watchdogs.get(slot)?.watchdog.lost();
+        this.params.frameLost?.(slot);
+      });
       receiver.transform = new RTCRtpScriptTransform(this.lateFrames, { slot, kind });
     } catch { /* it plays as it would have */ }
   }

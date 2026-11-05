@@ -1,7 +1,6 @@
 /** Runs `LateFrames` on a watch slot's received frames, where the receiver has not seen them yet. */
-import { LateFrames, type MediaKind } from "./late-frames";
+import { filterFrames, type EncodedFrame, type MediaKind } from "./late-frames";
 
-interface EncodedFrame { type?: string; timestamp?: number; getMetadata?(): { rtpTimestamp?: number } }
 interface Transformer { readonly readable: ReadableStream<EncodedFrame>; readonly writable: WritableStream<EncodedFrame>; readonly options: { slot: number; kind: MediaKind } }
 export interface LinkBack { slot: number }
 
@@ -12,19 +11,8 @@ interface WorkerScope {
 }
 const self = globalThis as unknown as WorkerScope;
 
-async function run(transformer: Transformer): Promise<void> {
-  const { slot, kind } = transformer.options;
-  const late = new LateFrames(kind);
-  const reader = transformer.readable.getReader();
-  const writer = transformer.writable.getWriter();
-  for (;;) {
-    const { value: frame, done } = await reader.read();
-    if (done) return;
-    const rtp = frame.getMetadata?.().rtpTimestamp ?? frame.timestamp;
-    const verdict = rtp === undefined ? { keep: true, back: false } : late.see(rtp, performance.now(), frame.type === "key");
-    if (verdict.keep) await writer.write(frame);
-    if (verdict.back && kind === "video") self.postMessage({ slot });
-  }
-}
-
-self.onrtctransform = event => void run(event.transformer).catch(() => {});
+self.onrtctransform = event => {
+  const { readable, writable, options: { slot, kind } } = event.transformer;
+  // Only the picture's link-back asks for a keyframe and the estimate back.
+  void filterFrames(readable, writable, kind, () => { if (kind === "video") self.postMessage({ slot }); });
+};

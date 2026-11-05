@@ -47,6 +47,13 @@ const BREAK_LOOKS = 4;
 const BREAK_MOVE_MS = 45;
 /** The picture's wait, which a Bluetooth speaker can reach. The receiver's own limit is 4 s. */
 export const MAX_WAIT_MS = 1_000;
+/**
+ * Looks in a row with no line between the clocks (the server does not know it, or does not
+ * answer) or no sound to place: a wait set before is then a guess. Past this many, the slot gives
+ * its waits back and starts over, as a slot without sync plays, rather than keep the picture up to
+ * `MAX_WAIT_MS` late on a measure nobody can renew. One lost question is asked again.
+ */
+export const BLIND_LOOKS = 5;
 
 /**
  * Where sync puts the sound: the middle of the range nobody notices, 45 ms ahead to 125 ms behind.
@@ -119,7 +126,7 @@ export interface PictureSyncLink {
   now(): number;
 }
 
-interface SlotState { share: string; waits: Waits; looks: number; breakLooks?: number }
+interface SlotState { share: string; waits: Waits; looks: number; breakLooks?: number; blind?: number }
 const NO_WAIT: Waits = { picture: 0, sound: 0 };
 const same = (a: Waits, b: Waits) => a.picture === b.picture && a.sound === b.sound;
 
@@ -173,10 +180,14 @@ export class PictureSync {
       if (e instanceof RequestError && e.code === "bad_request") this.unsupported = true;
       return null;
     });
-    if (!association?.known) return;
+    if (!association?.known) { this.blind(slot, releases); return; }
     const sound = await this.link.sound(slot).catch(() => null);
+    if (!sound) { this.blind(slot, releases); return; }
     const picture = this.link.picture(slot);
-    if (!sound || !picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS || this.releases !== releases) return;
+    // A still picture shows nothing new to measure; its wait still holds what was measured.
+    if (!picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS || this.releases !== releases) return;
+    const found = this.states.get(slot);
+    if (found?.blind) this.states.set(slot, { ...found, blind: 0 });
     const seen = this.states.get(slot) ?? start;
     if (seen.looks < SETTLING_LOOKS) { this.states.set(slot, { ...seen, looks: seen.looks + 1 }); return; }
     if (seen.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...seen, breakLooks: BREAK_LOOKS - 1 }); return; }
@@ -189,6 +200,15 @@ export class PictureSync {
     const breakLooks = state.breakLooks ?? 0;
     const whole = state.looks === SETTLING_LOOKS || (breakLooks > 0 && Math.abs(lag) > BREAK_MOVE_MS);
     this.set(slot, state, { ...state, waits: nextWaits(state.waits, lag, whole, shown, this.link.soundWaits), looks: state.looks + 1, breakLooks: whole ? 0 : Math.max(0, breakLooks - 1) });
+  }
+
+  /** A look found nothing to measure by; after `BLIND_LOOKS` of them, the waits go. */
+  private blind(slot: number, releases: number): void {
+    const state = this.states.get(slot);
+    if (!state || this.releases !== releases) return;
+    const blind = (state.blind ?? 0) + 1;
+    if (blind < BLIND_LOOKS) this.states.set(slot, { ...state, blind });
+    else this.set(slot, state, { ...state, waits: NO_WAIT, looks: 0, blind: 0 });
   }
 
   private set(slot: number, before: SlotState, after: SlotState): void {

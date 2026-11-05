@@ -929,13 +929,13 @@ export class ScreenController {
     }
   }
 
-  /** A warm receiver can need a keyframe for its newly initialized media player. */
   /** The link is back after a stall: the server restores this viewer's estimate as well. */
   private frameLost(share: string, run: number, id: number): void {
     const conn = this.link();
     if (conn) void conn.request("screen.stalled", { share }).catch(() => this.requestFrame(share, run, id));
   }
 
+  /** A warm receiver can need a keyframe for its newly initialized media player. */
   requestFrame(share: string, run: number, id: number): void {
     const screen = useScreen.getState();
     if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;

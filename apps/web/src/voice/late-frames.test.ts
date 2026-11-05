@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LateFrames } from "./late-frames";
+import { filterFrames, LateFrames, type EncodedFrame } from "./late-frames";
 
 /** Frames 33 ms apart on the media clock, arriving on time from `start`. */
 function feed(late: LateFrames, from: number, count: number, start: number, step = 33) {
@@ -72,5 +72,49 @@ describe("LateFrames", () => {
     for (let n = 0; n < 300; n++) late.see(n * 960, n * 20, false);
     expect(late.see(300 * 960, 300 * 20 + 150, false).keep).toBe(true);
     expect(late.see(301 * 960, 301 * 20 + 400, false).keep).toBe(false);
+  });
+
+  it("takes a resumed slot's late first keyframe and the frames behind it as new, not as a link back", () => {
+    const late = new LateFrames("video");
+    feed(late, 0, 100, 0);
+    // Paused for 3 s: nothing arrives. The resume keyframe is 700 ms late from its size alone,
+    // and the deltas behind it queue after it.
+    const resumed = [late.see(190 * 2970, 190 * 33 + 700, true)];
+    for (let n = 191; n < 200; n++) resumed.push(late.see(n * 2970, 190 * 33 + 700 + (n - 190) * 5, false));
+    expect(resumed.every(v => v.keep && !v.back)).toBe(true);
+  });
+});
+
+/** A transform's two ends, fed from `frames`, recording what reached the receiver. */
+function ends(frames: EncodedFrame[]) {
+  const written: EncodedFrame[] = [];
+  const readable = new ReadableStream<EncodedFrame>({ start(c) { for (const f of frames) c.enqueue(f); c.close(); } });
+  const writable = new WritableStream<EncodedFrame>({ write(f) { written.push(f); } });
+  return { readable, writable, written };
+}
+
+describe("filterFrames", () => {
+  it("passes every frame on when the filter fails, rather than freezing the slot", async () => {
+    const frames: EncodedFrame[] = [
+      { type: "key", timestamp: 0 },
+      { getMetadata() { throw new Error("detached"); } },
+      { type: "delta", timestamp: 2970 },
+      { type: "delta", timestamp: 5940 },
+    ];
+    const { readable, writable, written } = ends(frames);
+    await filterFrames(readable, writable, "video", () => {});
+    expect(written).toEqual(frames);
+  });
+
+  it("passes frames on when the link-back word fails", async () => {
+    const frames: EncodedFrame[] = [];
+    for (let n = 0; n < 100; n++) frames.push({ type: "delta", timestamp: n * 2970 });
+    for (let n = 100; n < 160; n++) frames.push({ type: "delta", timestamp: n * 2970 });
+    const times = [...frames.slice(0, 100).map((_, n) => n * 33), ...frames.slice(100).map((_, n) => 5_300 + n)];
+    let i = 0;
+    const { readable, writable, written } = ends(frames);
+    await filterFrames(readable, writable, "video", () => { throw new Error("closed"); }, () => times[i++]!);
+    expect(written.length).toBeGreaterThan(100);
+    expect(written.at(-1)).toBe(frames.at(-1));
   });
 });

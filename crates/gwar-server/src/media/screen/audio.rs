@@ -90,7 +90,10 @@ impl SoundTime {
                 self.shift = self.shift.wrapping_add(missing);
                 // A report on a line other than the one before the stop already has the new one.
                 let old = line.filter(|l| before.is_none_or(|b| !moved(*l, b)));
-                self.stale = old.map(|l| (missing, l, arrival));
+                // A second stop before the publisher reports again leaves its line two silences
+                // behind: they add up.
+                let earlier = |l: Line| self.stale.filter(|(_, s, _)| !moved(l, *s)).map_or(0, |(m, ..)| m);
+                self.stale = old.map(|l| (earlier(l).wrapping_add(missing), l, arrival));
             }
         }
         self.resumes = resumes;
@@ -375,6 +378,33 @@ mod tests {
                     "{frames_from}/{new_line_at}: {ms} ms placed {placed:.3} s off its clock"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn two_stops_before_the_next_report_place_sound_by_both_silences() {
+        // Early review S5: sound 0–1 s, 2–3 s and from 4 s, stopped twice within one report
+        // period, and the publisher's reports still on the line from before the first stop. The
+        // stale correction kept only the second silence and placed sound a second early.
+        let start = Instant::now();
+        let path = Duration::from_millis(30);
+        let (mut time, mut clock) = (SoundTime::default(), super::super::clock::Clock::default());
+        let line = report(Duration::ZERO, 7_000);
+        let (mut rtp, mut seen) = (7_000u32, Vec::new());
+        for ms in (0..8_000u64).step_by(20) {
+            if (1_000..2_000).contains(&ms) || (3_000..4_000).contains(&ms) {
+                continue;
+            }
+            let arrival = start + Duration::from_millis(ms) + path;
+            let resumes = u64::from(ms >= 2_000) + u64::from(ms >= 4_000);
+            let (_, placed) = time.place(rtp, arrival, Some(&line), resumes);
+            seen.push((ms, clock.map(placed, arrival, Some(line), 48_000)));
+            rtp = rtp.wrapping_add(960);
+        }
+        let (first, wall) = seen[0];
+        for &(ms, w) in &seen {
+            let off = (w - wall).as_secs_f64() - Duration::from_millis(ms - first).as_secs_f64();
+            assert!(off.abs() < 0.001, "{ms} ms placed {off:.3} s off its clock");
         }
     }
 

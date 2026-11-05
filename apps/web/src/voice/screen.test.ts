@@ -3008,6 +3008,41 @@ describe("AV1", () => {
     expect(decodeFailed).not.toHaveBeenCalled();
     transport.close();
   });
+
+  it("starts a decode stall again when its own late-frame filter dropped frames", async () => {
+    // Early review (#213 on #230): the filter drops a stall's backlog that the SFU forwarded
+    // whole, so the decoder waits for the keyframe `screen.stalled` asked for while packets keep
+    // arriving, and the server, which saw the slot intact, took a report of that wait for a
+    // decoder that cannot decode. Here the decoder stops at 1 s and the filter drops frames at
+    // 3.5 s: no report before 4 s after that.
+    const workers: { onmessage: ((event: MessageEvent<{ slot: number }>) => void) | null }[] = [];
+    vi.stubGlobal("Worker", class { onmessage = null; constructor() { workers.push(this); } terminate() {} });
+    vi.stubGlobal("RTCRtpScriptTransform", class {});
+    const decodeFailed = vi.fn();
+    const frameLost = vi.fn();
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed, frameLost });
+    await transport.start();
+    const pc = Peer.all[0]!;
+    (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
+    pc.stats = new Map([["codec", { type: "codec", mimeType: "video/H264" }]]);
+    transport.keyframe(0, "A", 1);
+    const reported: number[] = [];
+    decodeFailed.mockImplementation(() => reported.push(Date.now() - start));
+    const start = Date.now();
+    // Polls every second from 1 s, packets always arriving; one frame decoded, then none.
+    for (let at = 500; at <= 12_000; at += 500) {
+      if (at === 3500) workers[0]!.onmessage?.({ data: { slot: 0 } } as MessageEvent<{ slot: number }>);
+      pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded: 1 });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(Date.now() - start).toBe(at);
+    }
+    expect(frameLost).toHaveBeenCalledWith(0);
+    expect(reported.length).toBeGreaterThan(0);
+    // The first sample after the drop, 4 s on: 8 s, where the stall from the first sample gave 5 s.
+    expect(reported[0]).toBe(8000);
+    transport.close();
+    vi.unstubAllGlobals();
+  });
 });
 
 

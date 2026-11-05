@@ -59,6 +59,10 @@ export class LateFrames {
     const stopped = this.arrived !== null && now - this.arrived >= STALL_GAP_MS;
     this.arrived = now;
     if (transit - Math.min(this.quickest, this.before) > this.lateMs && (stopped || this.shedSince !== null)) {
+      // A keyframe after a pause is a resumed slot's first picture, held up only by its own size,
+      // not a backlog: it says nothing about the link, and the frames behind it are new. (A stall
+      // whose backlog happens to start with a keyframe plays through, as without the filter.)
+      if (this.shedSince === null && key) return KEEP;
       const back = this.shedSince === null;
       this.shedSince ??= now;
       if (now - this.shedSince < MAX_SHED_MS) return { keep: key, back };
@@ -82,5 +86,52 @@ export class LateFrames {
   private restart(): void {
     this.quickest = this.before = Infinity;
     this.windowEnds = 0;
+  }
+}
+
+/** An encoded frame as a script transform hands it over. */
+export interface EncodedFrame { type?: string; timestamp?: number; getMetadata?(): { rtpTimestamp?: number } }
+
+/**
+ * Passes a slot's received frames on, less the late ones, and calls `back` when the link is back.
+ * Nothing here may stop the frames: if the filter fails, every frame from then on passes as it
+ * would without it, and if the stream itself fails, whatever still flows is piped through
+ * unfiltered. A slot whose transform stopped would freeze its picture or sound for good, silently.
+ */
+export async function filterFrames(
+  readable: ReadableStream<EncodedFrame>,
+  writable: WritableStream<EncodedFrame>,
+  kind: MediaKind,
+  back: () => void,
+  now: () => number = () => performance.now(),
+): Promise<void> {
+  const late = new LateFrames(kind);
+  let broken = false;
+  const reader = readable.getReader();
+  const writer = writable.getWriter();
+  try {
+    for (;;) {
+      const { value: frame, done } = await reader.read();
+      if (done) return;
+      let verdict = KEEP;
+      if (!broken) {
+        try {
+          const rtp = frame.getMetadata?.().rtpTimestamp ?? frame.timestamp;
+          if (rtp !== undefined) verdict = late.see(rtp, now(), frame.type === "key");
+        } catch {
+          broken = true;
+        }
+      }
+      if (verdict.keep) await writer.write(frame);
+      if (verdict.back) {
+        try { back(); } catch { /* the frames matter more than the word */ }
+      }
+    }
+  } catch {
+    try {
+      reader.releaseLock();
+      writer.releaseLock();
+      await readable.pipeTo(writable);
+    } catch { /* nothing flows any more */ }
   }
 }
