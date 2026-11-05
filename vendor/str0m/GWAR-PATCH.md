@@ -254,3 +254,17 @@ sender reports. Track IDs remain distinct; ordinary `accept_offer` uses no group
 and preserves its behavior. Gwar uses this for paired screen receivers so
 libwebrtc negotiates synchronization rather than merely combining tracks in JS.
 The server regression checks both the actual answer and stored media identities.
+
+The TWCC receiver (`build_interims` in `src/rtp/rtcp/twcc.rs`) takes each receive
+delta from the time the report has stated so far, not from the previous packet's
+true arrival. Deltas are truncated to 250 µs steps; taken from the true arrival,
+the truncations added up over a report (packets 1.1 ms apart lost 100 µs each, so
+the 40th was reported 3.9 ms early), skewing the sender's delay gradient and probe
+spans. This ports upstream str0m's fix, commit 634e76bb83 (PR #1071), line for
+line, including `checked_sub` on a negative delta. `deltas_do_not_drift_over_a_report`
+covers ordered arrivals; upstream's `report_deltas_do_not_accumulate_across_reordering`
+and `report_reconstructs_long_reordered_first_report` are ported for the
+negative-delta path. The required Rust CI job now runs the TWCC unit tests. Drop
+this patch once the vendored str0m includes 634e76bb83. That upstream commit also
+raised the lossy `bwe_cellular` test's "Wait for mid" limit to 75 s; that
+test change is not ported here.
