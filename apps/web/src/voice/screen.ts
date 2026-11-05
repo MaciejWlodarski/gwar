@@ -1719,7 +1719,9 @@ export class ScreenWatchTransport {
         this.lateFramesReady = null;
         return;
       }
-      const { slot } = event.data;
+      const { slot, kind } = event.data;
+      // Only the picture's link-back asks for a keyframe and the estimate back.
+      if (kind !== "video") return;
       this.watchdogs.get(slot)?.watchdog.lost();
       this.params.frameLost?.(slot);
     };

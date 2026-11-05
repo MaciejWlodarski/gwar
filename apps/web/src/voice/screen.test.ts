@@ -3030,7 +3030,7 @@ describe("AV1", () => {
     const start = Date.now();
     // Polls every second from 1 s, packets always arriving; one frame decoded, then none.
     for (let at = 500; at <= 12_000; at += 500) {
-      if (at === 3500) workers[0]!.say({ slot: 0 });
+      if (at === 3500) workers[0]!.say({ slot: 0, kind: "video" });
       pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded: 1 });
       await vi.advanceTimersByTimeAsync(500);
       expect(Date.now() - start).toBe(at);
@@ -3060,7 +3060,7 @@ describe("AV1", () => {
     const reported: number[] = [];
     decodeFailed.mockImplementation(() => reported.push(Date.now() - start));
     for (let at = 500; at <= 12_000; at += 500) {
-      if ([3500, 6000, 7500].includes(at)) workers[0]!.say({ slot: 0 });
+      if ([3500, 6000, 7500].includes(at)) workers[0]!.say({ slot: 0, kind: "video" });
       pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: at / 10, framesDecoded: 1 });
       await vi.advanceTimersByTimeAsync(500);
     }
@@ -3088,7 +3088,7 @@ describe("late-frame worker that never runs", () => {
     expect(transforms()).toEqual(transforms().map(() => null));
     expect(workers[0]!.terminated).toBe(true);
     expect(lateFramesFailed).toHaveBeenCalledOnce();
-    workers[0]!.say({ slot: 0 });
+    workers[0]!.say({ slot: 0, kind: "video" });
     expect(frameLost).not.toHaveBeenCalled();
     transport.close();
   });
@@ -3110,12 +3110,18 @@ describe("late-frame worker that never runs", () => {
   it("keeps a worker that loaded, and starts none once one failed", async () => {
     const workers = stubLateFramesWorker();
     const lateFramesFailed = vi.fn();
-    const transport = watch({ lateFramesFailed });
+    const frameLost = vi.fn();
+    const transport = watch({ lateFramesFailed, frameLost });
     await transport.start();
     workers[0]!.say({ ready: true });
     await vi.advanceTimersByTimeAsync(10_000);
     expect(transforms().every(t => t !== null)).toBe(true);
     expect(lateFramesFailed).not.toHaveBeenCalled();
+    // Only the picture's link-back asks for anything; the sound's is a record.
+    workers[0]!.say({ slot: 1, kind: "audio", dropped: 9, at: 0 });
+    expect(frameLost).not.toHaveBeenCalled();
+    workers[0]!.say({ slot: 1, kind: "video", dropped: 9, at: 0 });
+    expect(frameLost).toHaveBeenCalledWith(1);
     transport.close();
     const next = watch({ skipLateFrames: true });
     await next.start();

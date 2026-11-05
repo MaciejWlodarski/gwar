@@ -93,7 +93,8 @@ export class LateFrames {
 export interface EncodedFrame { type?: string; timestamp?: number; getMetadata?(): { rtpTimestamp?: number } }
 
 /**
- * Passes a slot's received frames on, less the late ones, and calls `back` when the link is back.
+ * Passes a slot's received frames on, less the late ones, and calls `back` when the link is back,
+ * with the frames dropped since the last call.
  * Nothing here may stop the frames: if the filter fails, every frame from then on passes as it
  * would without it, and if the stream itself fails, whatever still flows is piped through
  * unfiltered. A slot whose transform stopped would freeze its picture or sound for good, silently.
@@ -102,11 +103,12 @@ export async function filterFrames(
   readable: ReadableStream<EncodedFrame>,
   writable: WritableStream<EncodedFrame>,
   kind: MediaKind,
-  back: () => void,
+  back: (dropped: number) => void,
   now: () => number = () => performance.now(),
 ): Promise<void> {
   const late = new LateFrames(kind);
   let broken = false;
+  let dropped = 0;
   const reader = readable.getReader();
   const writer = writable.getWriter();
   try {
@@ -123,8 +125,10 @@ export async function filterFrames(
         }
       }
       if (verdict.keep) await writer.write(frame);
+      else dropped++;
       if (verdict.back) {
-        try { back(); } catch { /* the frames matter more than the word */ }
+        try { back(dropped); } catch { /* the frames matter more than the word */ }
+        dropped = 0;
       }
     }
   } catch {

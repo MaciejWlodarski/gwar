@@ -2878,6 +2878,7 @@ fn allocate(
             .map_or(w.peak.0, |needed| needed.min(w.peak.0))
             .min(w.ceiling)
             .min((w.egress.estimate() as f64 * RESTORE_REACH) as u64);
+        debug!(session = w.session, from = w.egress.estimate(), target, "screen watch link back");
         if target > w.egress.estimate() {
             restart_estimator(w, target, now, &caps, &lanes);
             w.restored = Some(Restored { at: now });
@@ -3254,6 +3255,7 @@ fn pace(rtc: &mut Rtc, estimate: u64, probe_rate: u64) {
 }
 
 fn restart_estimator(w: &mut Watcher, estimate: u64, now: Instant, caps: &[u64], lanes: &[ShareRate]) {
+    debug!(session = w.session, from = w.egress.estimate(), to = estimate, "screen watch estimator restarted");
     #[cfg(test)]
     if let Some(cap) = &mut w.frozen {
         *cap = estimate;

@@ -15,6 +15,8 @@
  *   SYNC_VIEWERS=browser,desktop                who watches, side by side
  *   SYNC_SECONDS=30                             how long they watch
  *   SYNC_NOHOLD=1 / SYNC_NOFILTER=1             sync on, but without the start's sound hold / the late-frame filter (A/B)
+ *   SYNC_NOWAIT=1                               sync on, but nothing ever waits for the other side (A/B)
+ *   SYNC_SERVER_LOG=path                        the fixture's log there, with RUST_LOG (e.g. gwar_server::media::screen=debug)
  *   SYNC_ENGINE=chromium|webkit                 the viewers' engine (default: chromium)
  *   SYNC_OFF=1                                  main's playback, for a before: no picture wait, no sound
  *                                               hold, no late-frame filter (so no stall report), no held
@@ -26,7 +28,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -182,15 +184,24 @@ function viewerPatch() {
     if (watch?.status === "watching") window.__granted ??= Date.now();
     if (watch?.status === "watching" && !watch.soundHeld) { window.__audible = Date.now(); clearInterval(audible); }
   }, 10);
-  /** When the late-frame filter said the link is back (it then asks for a keyframe). */
+  /** When the late-frame filter said the picture's link is back (it then asks for a keyframe). */
   window.__linkBacks = [];
+  /** Every word of the filter, picture and sound: what it dropped since the last, and when. */
+  window.__sheds = [];
   window.Worker = new Proxy(window.Worker, {
     construct(target, args) {
       const worker = new target(...args);
-      if (args[1]?.name === "gwar-late-frames") worker.addEventListener("message", event => { if (event.data?.slot !== undefined) window.__linkBacks.push(Date.now()); });
+      if (args[1]?.name === "gwar-late-frames") worker.addEventListener("message", event => {
+        if (event.data?.slot === undefined) return;
+        window.__sheds.push(event.data);
+        if (event.data.kind === "video") window.__linkBacks.push(Date.now());
+      });
       return worker;
     },
   });
+  /** Each look's lag as the controller measured it (before its aim), and every wait it asked for. */
+  window.__looks = [];
+  window.__waits = [];
   window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
     construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
   });
@@ -322,6 +333,7 @@ async function device(browser, web, server, name, native = false) {
     } });
   });
   if (process.env.SYNC_NOFILTER) await context.addInitScript(() => { window.__noFilter = true; });
+  if (process.env.SYNC_NOWAIT) await context.addInitScript(() => { window.__noWait = true; });
   await context.addInitScript(viewerPatch);
   if (process.env.SYNC_FAKE_TAB && name === "sync-sharer") await context.addInitScript({ content: fakeTab });
   // The picker's first answer has the tab's picture only, as a share nobody asked sound for.
@@ -383,9 +395,45 @@ const joinDefault = page => page.evaluate(async () => {
   await controller.joinChannel(useSession.getState().server.default_channel);
 });
 
+/**
+ * Records what the lip-sync controller sees at each look, and with `SYNC_NOWAIT` keeps its waits
+ * from reaching either side. Every controller is wrapped at its first look.
+ */
+const followLooks = page => page.evaluate(async () => {
+  const { PictureSync, soundLagMs } = await window.__gwarE2eImport("/src/voice/share-sync.ts");
+  const tick = PictureSync.prototype.tick;
+  PictureSync.prototype.tick = function (slots) {
+    if (!this.__followed) {
+      this.__followed = true;
+      const link = this.link;
+      const last = {};
+      const { association, sound, picture, shown, wait } = link;
+      link.association = async share => (last.association = await association(share));
+      link.sound = async slot => (last.sound = await sound(slot));
+      link.picture = slot => {
+        const clock = picture(slot);
+        if (clock && last.association?.known && last.sound) window.__looks.push({ at: Date.now(), slot, lag: soundLagMs(last.association, last.sound, clock), age: Date.now() - clock.unixMs });
+        return clock;
+      };
+      link.shown = async slot => {
+        const held = await shown(slot);
+        const look = window.__looks.at(-1);
+        if (look?.slot === slot) look.shown = held;
+        return held;
+      };
+      link.wait = (slot, waits) => {
+        window.__waits.push({ at: Date.now(), slot, ...waits });
+        if (!window.__noWait) wait(slot, waits);
+      };
+    }
+    return tick.call(this, slots);
+  };
+});
+
 async function viewer(browser, web, server, sharer, kind) {
   const page = await device(browser, web, server, `${kind}-viewer`, kind === "desktop");
   page.kind = kind;
+  await followLooks(page);
   // The app's own test for share sound in the desktop app (`shareSoundReceivable`) needs it first.
   page.pictureOnly = kind === "desktop" && !await page.evaluate(() => typeof RTCRtpScriptTransform === "function");
   await joinDefault(page);
@@ -423,7 +471,7 @@ async function turnOnSound(sharer, viewers) {
 }
 
 async function viewerRecord(page) {
-  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted, baseline: window.__baseline, linkBacks: window.__linkBacks }));
+  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted, baseline: window.__baseline, linkBacks: window.__linkBacks, sheds: window.__sheds, looks: window.__looks, waits: window.__waits }));
   if (page.native) {
     record.onsets = await page.native.request("speaker_onsets");
     record.mixer = await page.native.request("share_stats");
@@ -443,6 +491,7 @@ async function run() {
 
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("LATENCY_") && !key.startsWith("GWAR_")));
   const fixture = start(fixtureBinary, [web, scratch], { env: { ...env, LATENCY_NET: netSpec } });
+  if (process.env.SYNC_SERVER_LOG) fixture.stderr.pipe(createWriteStream(process.env.SYNC_SERVER_LOG));
   const lines = createInterface({ input: fixture.stdout });
   const ready = await new Promise((resolve, reject) => {
     lines.once("line", line => resolve(JSON.parse(line)));
@@ -492,7 +541,7 @@ async function run() {
       const record = await viewerRecord(page);
       if (process.env.SYNC_OFF) assert.deepEqual(baselineFaults(record.baseline), [], `the ${page.kind} viewer's baseline is not main`);
       const pairs = pairBursts(bursts, record.presented, record.onsets);
-      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, onsets: record.onsets, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted, linkBacks: record.linkBacks };
+      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, onsets: record.onsets, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted, linkBacks: record.linkBacks, sheds: record.sheds, looks: record.looks, waits: record.waits };
       console.log(JSON.stringify({ net: netName, viewer: page.kind, ...offsetSummary(pairs), drawn: bursts.length, mixer: record.mixer }));
       console.log(pairs.map(pair => pair.offsetMs.toFixed(0)).join(" "));
     }
