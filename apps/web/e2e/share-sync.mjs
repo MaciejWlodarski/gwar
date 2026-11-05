@@ -239,7 +239,7 @@ function viewerPatch() {
       row.waits = [row.waits, ...pc.getReceivers().filter(r => r.jitterBufferTarget > 0).map(r => `${r.track.kind} ${r.jitterBufferTarget}`)].filter(Boolean).join();
       for (const stat of (await pc.getStats()).values()) {
         if (stat.type !== "inbound-rtp" || !stat.bytesReceived) continue;
-        row[stat.kind] = { bytes: stat.bytesReceived, frames: stat.framesDecoded, dropped: stat.framesDropped, keys: stat.keyFramesDecoded, nacks: stat.nackCount, plis: stat.pliCount, freezes: stat.freezeCount, delay: stat.jitterBufferDelay, emitted: stat.jitterBufferEmittedCount, target: stat.jitterBufferTargetDelay, minimum: stat.jitterBufferMinimumDelay, lost: stat.packetsLost, concealed: stat.concealedSamples };
+        row[stat.kind] = { bytes: stat.bytesReceived, frames: stat.framesDecoded, dropped: stat.framesDropped, keys: stat.keyFramesDecoded, nacks: stat.nackCount, plis: stat.pliCount, freezes: stat.freezeCount, delay: stat.jitterBufferDelay, emitted: stat.jitterBufferEmittedCount, target: stat.jitterBufferTargetDelay, minimum: stat.jitterBufferMinimumDelay, lost: stat.packetsLost, concealed: stat.concealedSamples, packets: stat.packetsReceived, received: stat.framesReceived, processing: stat.totalProcessingDelay, decode: stat.totalDecodeTime, assembly: stat.totalAssemblyTime, assembled: stat.framesAssembledFromMultiplePackets, samples: stat.totalSamplesReceived };
       }
     }
     window.__health.push(row);
