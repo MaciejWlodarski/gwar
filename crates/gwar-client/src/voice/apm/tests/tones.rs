@@ -667,6 +667,42 @@ fn recorded_speech_is_not_held_after_stereo() {
     }
 }
 
+/// The audit's candidates on the 12 cases of [`recorded_speech_is_not_held_after_stereo`], beside
+/// shipped P7: F1 `[mid, mid]` for every stereo canceller, F5 takeover on recent echo only.
+/// Reports only.
+#[test]
+#[cfg(feature = "deep-filter")]
+#[ignore = "F1/F5 candidates on the 12-case recorded-speech matrix; release, alone, single-threaded"]
+fn audit_candidates_speech_matrix() {
+    let _scope = measurement_scope();
+    for lead in [6, 10] {
+        for echo in [false, true] {
+            for noise in [0, 50, 100] {
+                let cold = historical_arm("human speech", lead, echo, noise, 8);
+                let shipped = arm("human speech", lead, echo, noise, 110);
+                AEC_MID_REFERENCE.store(true, Ordering::Relaxed);
+                let mid = arm("human speech", lead, echo, noise, 110);
+                AEC_MID_REFERENCE.store(false, Ordering::Relaxed);
+                AEC_RECENT_ECHO.store(super::audit_candidates::RECENT_ECHO_FRAMES, Ordering::Relaxed);
+                let recent = arm("human speech", lead, echo, noise, 110);
+                AEC_RECENT_ECHO.store(0, Ordering::Relaxed);
+                eprintln!(
+                    "audit-speech,lead={lead},echo={echo},noise={noise},active={},cold-hold={},cold-kept-frames={},shipped-hold={},shipped-kept-frames={},mid-hold={},mid-kept-frames={},recent-hold={},recent-kept-frames={}",
+                    shipped.speaking_frames,
+                    cold.maximum[3],
+                    cold.kept_frames,
+                    shipped.maximum[3],
+                    shipped.kept_frames,
+                    mid.maximum[3],
+                    mid.kept_frames,
+                    recent.maximum[3],
+                    recent.kept_frames
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "native AEC state and linear/suppressor comparison; release, alone, single-threaded"]
 fn aec_linear_and_suppression_at_takeover() {

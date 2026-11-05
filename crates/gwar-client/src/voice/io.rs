@@ -773,6 +773,47 @@ fn open_input(
 
 type SpeakerRing = Arc<Mutex<Consumer<[f32; 2]>>>;
 
+/// The speakers' 48 kHz stereo at the device's rate, resampled ahead of what a callback plays.
+/// Its memory is all there when the stream is built: the realtime callback never allocates.
+struct ToDevice {
+    left: Resampler,
+    right: Resampler,
+    pending: Vec<f32>,
+    pending_right: Vec<f32>,
+}
+
+impl ToDevice {
+    fn new(device_rate: u32) -> Self {
+        // A quarter of a second at the device's rate: more than any callback asks for at once.
+        // The fill overshoots by at most one input sample's worth of output.
+        let capacity = device_rate as usize / 4 + 8;
+        Self {
+            left: Resampler::new(RATE, device_rate),
+            right: Resampler::new(RATE, device_rate),
+            pending: Vec::with_capacity(capacity),
+            pending_right: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Resamples from `ring` until `frames` are pending or the ring is empty.
+    fn fill(&mut self, ring: &mut Consumer<[f32; 2]>, frames: usize) {
+        while self.pending.len() < frames {
+            let Ok([left, right]) = ring.pop() else { break };
+            self.left.process(&[left], |s| self.pending.push(s));
+            self.right.process(&[right], |s| self.pending_right.push(s));
+        }
+    }
+
+    fn pair(&self, index: usize) -> [f32; 2] {
+        [self.pending[index], self.pending_right[index]]
+    }
+
+    fn played(&mut self, frames: usize) {
+        self.pending.drain(..frames);
+        self.pending_right.drain(..frames);
+    }
+}
+
 fn open_output(
     host: &cpal::Host,
     route: &Route,
@@ -791,10 +832,7 @@ fn open_output(
     let config = device.default_output_config()?;
     let channels = usize::from(config.channels());
     let device_rate = config.sample_rate() as usize;
-    let mut left_to_device = Resampler::new(RATE, config.sample_rate());
-    let mut right_to_device = Resampler::new(RATE, config.sample_rate());
-    let mut pending: Vec<f32> = Vec::new();
-    let mut pending_right: Vec<f32> = Vec::new();
+    let mut to_device = ToDevice::new(config.sample_rate());
     let stream = device.build_output_stream(
         config.config(),
         move |data: &mut [f32], _| {
@@ -805,23 +843,18 @@ fn open_output(
                 return;
             }
             if let Some(mut speaker_rx) = try_lock(&speaker) {
-                while pending.len() < frames {
-                    let Ok([left, right]) = speaker_rx.pop() else { break };
-                    left_to_device.process(&[left], |s| pending.push(s));
-                    right_to_device.process(&[right], |s| pending_right.push(s));
-                }
+                to_device.fill(&mut speaker_rx, frames);
             }
-            let take = pending.len().min(frames);
+            let take = to_device.pending.len().min(frames);
             let silent = silence.iter().any(|s| s.load(Ordering::Relaxed));
             for (i, frame) in data.chunks_mut(channels).enumerate() {
-                let pair = if !silent && i < take { [pending[i], pending_right[i]] } else { [0.0; 2] };
+                let pair = if !silent && i < take { to_device.pair(i) } else { [0.0; 2] };
                 frame.fill(mono(pair));
                 if let [left, right, ..] = frame {
                     [*left, *right] = pair;
                 }
             }
-            pending.drain(..take);
-            pending_right.drain(..take);
+            to_device.played(take);
             timing.report(
                 (frames * RATE as usize).div_ceil(device_rate),
                 ((frames - take) * RATE as usize).div_ceil(device_rate),
@@ -1016,6 +1049,27 @@ impl AudioIo for DeviceIo {
 mod tests {
     use super::{OutputTiming, Resampler};
     use std::sync::atomic::Ordering;
+
+    /// The speakers' callback runs on the OS's realtime audio thread: a trip to the allocator
+    /// there can stall the sound. Built for a 44.1 kHz device, callbacks of every usual size
+    /// resample and play without one.
+    #[test]
+    fn the_speakers_callback_never_allocates() {
+        let mut to_device = super::ToDevice::new(44_100);
+        let (mut tx, mut rx) = rtrb::RingBuffer::<[f32; 2]>::new(48_000);
+        for i in 0..48_000 {
+            let _ = tx.push([i as f32, -(i as f32)]);
+        }
+        let trips = crate::voice::apm::tests::heap::trips(|| {
+            for frames in [512, 4096, 441, 1024, 8192] {
+                to_device.fill(&mut rx, frames);
+                let take = to_device.pending.len().min(frames);
+                std::hint::black_box(to_device.pair(take - 1));
+                to_device.played(take);
+            }
+        });
+        assert_eq!(trips, 0, "the callback went to the allocator");
+    }
 
     /// Like cpal: the guard only queues Stop; the input stream drops later on its thread.
     fn delayed_shutdown()
