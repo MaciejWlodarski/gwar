@@ -528,3 +528,42 @@ async fn migrated_v2_history_is_readable_edits_fail_cleanly_and_moderators_can_d
     author.ok("chat.delete", json!({"message":id})).await;
     assert_eq!(author.ok("chat.history", json!({"channel":channel})).await["messages"], json!([]));
 }
+
+/// Only a used identity is answered with `conflict`, which clients take as "an earlier attempt was
+/// delivered": a failed write leaves the identity free, so the same message can be sent again.
+#[tokio::test]
+async fn a_failed_write_is_not_a_duplicate_and_frees_the_message_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("gwar.sqlite");
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.data_dir = Some(dir.path().to_path_buf());
+    })
+    .await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let channel = alice.default_channel();
+    let side = rusqlite::Connection::open(&database).unwrap();
+    let fail = |trigger: &str, table: &str| {
+        side.execute_batch(&format!(
+            "CREATE TRIGGER {trigger} BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'write failed'); END;"
+        ))
+        .unwrap()
+    };
+    // The identity itself cannot be written.
+    fail("no_identity", "message_identities");
+    let sig = alice.signature(&format!("channel:{channel}"), "first", &[], &[]);
+    assert_eq!(alice.fails("chat.send", send(json!({"channel": channel}), "first", &sig)).await, "internal");
+    let direct = alice.signature("server", "everyone", &[], &[]);
+    assert_eq!(alice.fails("chat.send", send(json!("server"), "everyone", &direct)).await, "internal");
+    side.execute_batch("DROP TRIGGER no_identity").unwrap();
+    // The identity is written, but the message is not: neither is kept.
+    fail("no_message", "messages");
+    let sig = alice.signature(&format!("channel:{channel}"), "second", &[], &[]);
+    assert_eq!(alice.fails("chat.send", send(json!({"channel": channel}), "second", &sig)).await, "internal");
+    side.execute_batch("DROP TRIGGER no_message").unwrap();
+    let sent = alice.ok("chat.send", send(json!({"channel": channel}), "second", &sig)).await;
+    assert_eq!(sent["signature"], json!(sig));
+    assert_eq!(alice.fails("chat.send", send(json!({"channel": channel}), "second", &sig)).await, "conflict");
+    let history = alice.ok("chat.history", json!({"channel": channel})).await;
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+}
