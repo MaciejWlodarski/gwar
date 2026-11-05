@@ -93,6 +93,29 @@ it.each([[true, true], [false, false]])("asks the worker itself whether it gets 
   expect(worker.terminate).toHaveBeenCalled();
 });
 
+it("asks again after a worker that did not answer in time, and keeps a real answer", async () => {
+  vi.stubGlobal("RTCRtpScriptTransform", class {});
+  vi.stubGlobal("Worker", class {});
+  const { shareSoundReceivable } = await import("./share-sound");
+  const silent = { onmessage: null, onerror: null, terminate: vi.fn(), postMessage() {} };
+  await expect(shareSoundReceivable(() => silent as unknown as Worker, 5)).resolves.toBe(false);
+  const answering = { onmessage: null as ((event: { data: { transformEvents: boolean } }) => void) | null, onerror: null, terminate: vi.fn(), postMessage() { this.onmessage!({ data: { transformEvents: true } }); } };
+  await expect(shareSoundReceivable(() => answering as unknown as Worker, 5)).resolves.toBe(true);
+  await expect(shareSoundReceivable(() => { throw new Error("must not be asked again"); }, 5)).resolves.toBe(true);
+});
+
+it("stops asking a worker that never answers after two tries", async () => {
+  vi.stubGlobal("RTCRtpScriptTransform", class {});
+  vi.stubGlobal("Worker", class {});
+  const { shareSoundReceivable } = await import("./share-sound");
+  const silent = () => ({ onmessage: null, onerror: null, terminate: vi.fn(), postMessage() {} }) as unknown as Worker;
+  await expect(shareSoundReceivable(silent, 5)).resolves.toBe(false);
+  await expect(shareSoundReceivable(silent, 5)).resolves.toBe(false);
+  const third = vi.fn(silent);
+  await expect(shareSoundReceivable(third, 5)).resolves.toBe(false);
+  expect(third).not.toHaveBeenCalled();
+});
+
 function audioFakes() {
   const port = { postMessage: vi.fn(), close: vi.fn() };
   const track = { stop: vi.fn(), kind: "audio" };

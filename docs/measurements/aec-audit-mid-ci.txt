@@ -1,0 +1,4 @@
+mid-ci	stereo_bursts_never_leak_once_pinned	FAIL
+mid-ci	wide_sound_after_voice_is_cancelled_from_when_it_is_learned	FAIL
+mid-ci	wide_sound_after_five_minutes_of_voice	FAIL
+mid-ci	wide_sound_from_the_first_moment_after_voice_does_not_leak	FAIL

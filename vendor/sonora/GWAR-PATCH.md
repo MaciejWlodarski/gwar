@@ -46,6 +46,9 @@ owner's current production choice.
 
 Corrected two-reference variants greatly improve right-only echo, but fail the
 joint speech/echo gates. They require a separate follow-up and owner decision.
+Feeding the one reference a mid downmix instead (the post-merge audit's F1, measured with a
+Gwar test-only hook, no change here) also fixes right-only echo but leaks all side content:
+121/549 echo windows above +1 dB and the speaker speech cases fail. Not selected.
 The full options table and evidence are in `docs/share-audio-validation.md`.
 
 ## PR #223 measurement hooks (`gwar-aec-measurements`)

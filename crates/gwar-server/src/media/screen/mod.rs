@@ -72,9 +72,10 @@ use crate::core::{CoreHandle, ScreenSlot};
 pub const DISPATCH_CAPACITY: usize = 2048;
 /// At most one keyframe request per share in this window; later ones are coalesced.
 const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
-/// Keyframe requests one viewer may cause, whatever their source: 10 a minute.
-const VIEWER_KEYFRAMES_BURST: f64 = 10.0;
-const VIEWER_KEYFRAMES_PER_SECOND: f64 = 10.0 / 60.0;
+/// Keyframe requests one viewer may cause, whatever their source: 10 a minute. Public so
+/// tests can hold a startup to this bound rather than to a copy of it.
+pub const VIEWER_KEYFRAMES_BURST: f64 = 10.0;
+pub const VIEWER_KEYFRAMES_PER_SECOND: f64 = 10.0 / 60.0;
 /// A slot waiting for a keyframe asks again this often while the share keeps sending deltas.
 const WAITING_RETRY: Duration = Duration::from_secs(1);
 /// Initial admission must progress even if a response or queue drain never arrives.
