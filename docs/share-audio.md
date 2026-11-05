@@ -373,7 +373,7 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
 - A lost frame is concealed up to 100 ms. Sound that arrives after the queue ran dry still
   plays, which leaves the queue the cushion the next lump needs. An arrival is learnt as the
   network's jitter while it is no later than the queue could ride out (the delay and any hold
-  for the picture) plus the concealment; anything later is a pause in the sound and starts a
+  for the picture, or a hold still being given back) plus the concealment; anything later is a pause in the sound and starts a
   new stretch, so a pause never leaves the sound late. A queue that stayed over
   its limit (the delay plus 80 ms) for half a second is a stall's backlog: the excess is
   dropped rather than played late. So after a stall, sound can trail by up to 640 ms for half

@@ -455,6 +455,8 @@ struct Jitter {
     hold: Duration,
     /// A hold was lowered and the queue is still on its way down.
     releasing: bool,
+    /// The highest hold being given back while `releasing`: the queue still holds its sound.
+    released: Duration,
 }
 
 /// Wrapping RTP order.
@@ -475,6 +477,7 @@ impl Jitter {
             watched: 0,
             hold: Duration::ZERO,
             releasing: false,
+            released: Duration::ZERO,
         }
     }
 
@@ -487,13 +490,18 @@ impl Jitter {
     }
 
     /// How late an arrival can be and still be jitter: what the queue rides out before it runs
-    /// dry, and the concealment after that.
+    /// dry, and the concealment after that. While a lowered hold is still being given back, the
+    /// queue holds the old one's sound and rides out that much more (Opus review r3, S22).
     fn discontinuity(&self) -> Duration {
-        (MAX_DELAY + self.hold + CONCEAL).min(MAX_DISCONTINUITY)
+        let held = if self.releasing { self.hold.max(self.released) } else { self.hold };
+        (MAX_DELAY + held + CONCEAL).min(MAX_DISCONTINUITY)
     }
 
     fn set_hold(&mut self, hold: Duration) {
-        self.releasing |= hold < self.hold;
+        if hold < self.hold {
+            self.released = self.released.max(self.hold);
+            self.releasing = true;
+        }
         self.hold = hold;
     }
 
@@ -504,6 +512,9 @@ impl Jitter {
         }
         let (queued, delay) = (self.queued(), self.delay());
         self.releasing &= queued > delay + DRIFT_MARGIN;
+        if !self.releasing {
+            self.released = Duration::ZERO;
+        }
         if !self.releasing && self.hold.is_zero() {
             return if queued > delay + DRIFT_MARGIN { 1.0 + DRIFT_RATE } else { 1.0 };
         }

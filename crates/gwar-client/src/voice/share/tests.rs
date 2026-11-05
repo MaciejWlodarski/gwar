@@ -206,6 +206,35 @@ fn a_stall_a_held_queue_rides_out_is_learned_as_jitter() {
     assert!(jitter.delay() > before, "a 500 ms stall under a full hold was not learned: {before:?}");
 }
 
+/// A lowered hold is given back slowly: until the queue is down, it still holds the old hold's
+/// sound, so a stall that long is still the network's jitter (Opus review r3, S22).
+#[test]
+fn a_stall_while_a_hold_is_given_back_is_still_jitter() {
+    let start = Instant::now();
+    let steady = |jitter: &mut Jitter| {
+        for n in 0..10u32 {
+            jitter.observe(n * 960, start + Duration::from_millis(20 * u64::from(n)));
+        }
+    };
+    let mut jitter = Jitter::new();
+    jitter.set_hold(Duration::from_millis(300));
+    steady(&mut jitter);
+    jitter.set_hold(Duration::ZERO);
+    assert!(jitter.discontinuity() >= MAX_DELAY + Duration::from_millis(300));
+    jitter.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(jitter.delay(), MAX_DELAY, "a 400 ms stall the old hold rode out was not learned");
+    // Once the queue is down, the hold given back no longer counts.
+    let mut released = Jitter::new();
+    released.set_hold(Duration::from_millis(300));
+    steady(&mut released);
+    released.set_hold(Duration::ZERO);
+    released.started = true;
+    released.speed();
+    assert!(!released.releasing);
+    released.observe(10 * 960, start + Duration::from_millis(200 + 400));
+    assert_eq!(released.delay(), MIN_DELAY, "a pause after the release became jitter");
+}
+
 /// With nothing held, a pause past what the delay and concealment cover is a new start: learnt
 /// as jitter, it put share sound 160 ms late for seconds, and the picture waited for it.
 #[test]
