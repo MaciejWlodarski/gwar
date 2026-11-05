@@ -1065,7 +1065,10 @@ mod tests {
         assert_ne!(link.jitter_value, draw, "a fresh draw after the hold");
     }
 
-    fn jitter_case(seed: u64, cadence: u32, jitter: u32, hold: u32, bitrate: u64, key: usize) -> serde_json::Value {
+    /// A viewer behind a downlink with no rate limit, 20 ms of propagation and `jitter` of
+    /// signed uniform delay, one draw per `hold` (zero: per packet), order kept, as the netem
+    /// `keep_order` profile; the SFU runs every `cadence` ms.
+    fn jittery_sim(seed: u64, cadence: u32, jitter: u32, hold: u32) -> Sim {
         let mut sim = Sim::with_seed(None, seed);
         sim.server_interval = cadence * MS;
         sim.up.delay = Duration::ZERO;
@@ -1074,6 +1077,11 @@ mod tests {
         sim.down.jitter_hold = hold * MS;
         sim.down.keep_order = true;
         sim.down.jitter_seed = seed;
+        sim
+    }
+
+    fn jitter_case(seed: u64, cadence: u32, jitter: u32, hold: u32, bitrate: u64, key: usize) -> serde_json::Value {
+        let mut sim = jittery_sim(seed, cadence, jitter, hold);
         sim.join("jitter", bitrate, 60, key, 8_000_000);
         sim.run(60 * SECOND);
         let mut paused = None;
@@ -1133,7 +1141,8 @@ mod tests {
     /// A steady share already running when the viewer joins, on a 20 ms link with `jitter` of
     /// signed uniform delay (`hold` between draws, order kept), observed for 60 s
     /// (docs/screen-mild-jitter.md). A second is whole when the SFU evicted, refused and failed
-    /// nothing in it and the slot was not paused at its end.
+    /// nothing in it and the slot was not paused at its end. The estimate and plan are sampled
+    /// every 100 ms, so the lowest estimate reported is an upper bound on the true lowest.
     fn steady_jitter_case(
         seed: u64,
         cadence: u32,
@@ -1142,14 +1151,7 @@ mod tests {
         bitrate: u64,
         key: usize,
     ) -> serde_json::Value {
-        let mut sim = Sim::with_seed(None, seed);
-        sim.server_interval = cadence * MS;
-        sim.up.delay = Duration::ZERO;
-        sim.down.delay = 20 * MS;
-        sim.down.jitter = jitter * MS;
-        sim.down.jitter_hold = hold * MS;
-        sim.down.keep_order = true;
-        sim.down.jitter_seed = seed;
+        let mut sim = jittery_sim(seed, cadence, jitter, hold);
         sim.join("steady", bitrate, 60, key, 8_000_000);
         let mut whole = 0;
         let mut min_estimate = u64::MAX;

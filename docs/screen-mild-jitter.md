@@ -52,7 +52,8 @@ Main, 12 runs per row (6 seeds × 2 cadences):
 | ±5 ms, hold 5 ms | 5 Mb/s | 688/720 (96%) | 747 | 0 | 1 | 9.2 s | 5.34 Mb/s |
 
 "Plan below the share" is the time the originals budget, `PLAN` = 0.8 × estimate, was
-below the share's rate. The worst single runs kept 19, 30 and 31 of 60 seconds whole
+below the share's rate. Both it and the lowest estimate are sampled every 100 ms, so the
+true lowest estimate can be lower still. The worst single runs kept 19, 30 and 31 of 60 seconds whole
 (seed 4, 5 Mb/s at a 10 ms cadence; seed 42 and seed 5, 4 Mb/s at 5 ms).
 
 ## Root cause: probes misread as saturated
@@ -83,16 +84,27 @@ without jitter.
 Seed 42 only, all three shares, last result per cluster. Per jittered seed-42 run, 34–67%
 of the probe results were saturated, against none without jitter.
 
+The simulator advances in 1 ms ticks and delivers a datagram at the first tick at or after
+it is due. Each end of a receive span is therefore rounded up by 0–1 ms, so a jittered span
+can be off by up to ±1 ms. That is as large as the 1.1 ms margin below, so the exact share
+of misreads depends on this rounding. Jitter-free runs are not affected: their arrivals
+fall exactly on ticks. These numbers were not re-run with delivery at the exact due time.
+
 The mechanism, step by step:
 
 1. **A probe cluster is a few bursts.** The screen session sets a 10 ms probe duration.
    At a 5 ms SFU cadence a cluster leaves as bursts at 0, 5 and 10 ms; at 10 ms, as
    bursts at 0, 10 and sometimes 20 ms. Packets in one burst share a send time.
-2. **FIFO jitter spreads each burst.** The burst's first packet gets a fresh draw. Order
-   is kept, so each later packet arrives no earlier than the one before it. A burst
-   sent at one instant arrives spread over up to the whole ±5 ms range. The receive span
-   from the cluster's first arrival to its last can grow by up to 2 × 5 ms. A hold
-   correlates the draws within a burst but still moves whole bursts against each other.
+2. **FIFO jitter spreads each burst.** Without a hold, every packet gets its own fresh
+   draw. Order is kept, so each packet arrives no earlier than the one before it. A
+   burst's arrivals are therefore a running maximum of its draws and pile up near
+   +5 ms, while the cluster's first packet can land near −5 ms. The receive span from
+   the cluster's first arrival to its last can thus grow by up to 2 × 5 ms. This is the
+   same model as `latency/netem.rs`: one uniform draw per packet, held for `hold=`, then
+   clamped to keep order. With a hold, one draw covers a whole burst, so the burst
+   arrives together, but whole bursts still move against each other. Real Wi-Fi jitter
+   comes in correlated runs, which is closer to the hold rows. There, 26–36% of clusters
+   are misread, against about 50% without a hold.
 3. **The saturation test leaves about 1 ms of slack.** str0m reads a cluster as
    saturated when its receive rate is below 0.9 × its send rate, as libwebrtc does. Over
    a 10 ms send span that is 1.1 ms of stretch. Here half the clusters stretched more;
@@ -198,7 +210,21 @@ p90 ≤ 10, p99 ≤ 950 and worst ≤ 4,270 ms. Worst voice cases:
   when probes misread, and both hurt voice. Any change in what a saturated probe does
   likely needs another early drop signal first.
 - **Where the TWCC loss on a lossless jittery link comes from** is still open. It is
-  the second, smaller cause above.
+  the second, smaller cause above. A lead from review, not tested: on the receiver,
+  `session.rs` has early returns before `twcc_rx_register.update_seq` (around line
+  719): an unknown SSRC, missing probe or RTX payload parameters, the duplicate check,
+  and a failed decrypt. A packet that leaves through one of them is never registered,
+  so its report marks it lost. To settle it, log the sequence numbers that
+  `apply_report` returns without a receive time, and join them with the kinds in
+  `sim.sent`.
+- **A direction from review, not tried:** let a saturated probe lower the estimate
+  only when there is other evidence of a queue. One option: the one-way delay of the
+  cluster's last burst is at least half the stretch above the recent media baseline (a
+  median over roughly 100–200 ms). Another: loss or the trendline agrees. Otherwise,
+  treat the result as unsaturated. A second step could widen the margin to max(1.1 ms,
+  k × the p95 of inter-arrival jitter). The risk is the drop sweep's aggregation cases:
+  there the baseline comes from the same batched media, so a real drop may look like
+  jitter.
 - **Fewer probes would help voice on average.** v3 showed that. A safe version needs a
   drop signal that does not depend on the periodic probe.
 - **A share with a lower layer** could step down instead of evicting (see the
@@ -206,8 +232,11 @@ p90 ≤ 10, p99 ≤ 950 and worst ≤ 4,270 ms. Worst voice cases:
 
 ## Reproducing the experiments
 
+The patch was made on main `0a2f9054` with this report added: it changes only the
+vendored str0m and `egress.rs`. On a later main, apply it with `git apply --3way`.
+
 ```sh
-git apply docs/data/mild-jitter/experiment.patch
+git apply --3way docs/data/mild-jitter/experiment.patch
 GWAR_BWE_VARIANT=3 CARGO_BUILD_JOBS=2 nice -n 19 cargo test --release -p gwar-server --lib steady_jitter_matrix -- --ignored --nocapture
 GWAR_BWE_VARIANT=3 CARGO_BUILD_JOBS=2 nice -n 19 cargo test --release -p gwar-server --lib drop_sweep -- --ignored --nocapture
 git apply -R docs/data/mild-jitter/experiment.patch
