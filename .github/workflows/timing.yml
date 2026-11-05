@@ -106,19 +106,35 @@ jobs:
         timeout-minutes: 5
         with:
           node-version: 22.23.3
+          package-manager-cache: false
       - name: Timing scripts' own tests
         timeout-minutes: 2
         run: node --test scripts/timing/timing.test.mjs
       # Once, here: every later job checks out this commit, so a push to the ref mid-dispatch
-      # changes nothing that is measured.
-      - name: Resolve the ref to one commit
+      # changes nothing that is measured. Resolved against this repository's own branches and tags
+      # only: GitHub serves a fork's commits under this repository's name too, so a SHA from a fork
+      # pull request would otherwise check out here.
+      - name: Resolve the ref to one commit of this repository
         id: resolve
-        timeout-minutes: 2
-        env:
-          GH_TOKEN: ${{ github.token }}
+        timeout-minutes: 5
         run: |
           node --input-type=module -e 'import { checkRef } from "./scripts/timing/lib.mjs"; checkRef(process.env.TIMING_REF);'
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TIMING_REF" -q .sha)
+          refs="$RUNNER_TEMP/timing-refs"
+          git init --quiet --bare "$refs"
+          git -C "$refs" fetch --quiet --filter=tree:0 "https://github.com/$GITHUB_REPOSITORY.git" \
+            '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+          if ! sha=$(git -C "$refs" rev-parse --verify --quiet --end-of-options "$TIMING_REF^{commit}"); then
+            echo "$TIMING_REF is not a branch, tag or commit of $GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
+          if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
+            echo "$TIMING_REF resolved to '$sha', not a commit SHA" >&2
+            exit 1
+          fi
+          if [ -z "$(git -C "$refs" for-each-ref --contains "$sha" refs/heads refs/tags)" ]; then
+            echo "$sha is on no branch or tag of $GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
           echo "$TIMING_REF is $sha"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       - name: Plan the interleaved runs
@@ -227,7 +243,8 @@ jobs:
         timeout-minutes: 5
         with:
           node-version: 22.23.3
-          cache: pnpm
+          # No pnpm store cache: ci.yml restores the same key, and this job runs the ref's code.
+          package-manager-cache: false
       - name: Exact wasm output keys
         if: steps.ci.outputs.found != 'true'
         id: keys
@@ -354,7 +371,8 @@ jobs:
         timeout-minutes: 5
         with:
           node-version: 22.23.3
-          cache: pnpm
+          # No pnpm store cache: ci.yml restores the same key, and this job runs the ref's code.
+          package-manager-cache: false
       - name: Native runtime libraries
         timeout-minutes: 8
         run: bash scripts/ci/apt-install.sh libopus0 libasound2t64 pulseaudio
@@ -411,6 +429,7 @@ jobs:
         timeout-minutes: 5
         with:
           node-version: 22.23.3
+          package-manager-cache: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         timeout-minutes: 5
         with:

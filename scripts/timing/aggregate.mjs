@@ -65,7 +65,9 @@ for (const { row } of plan.rows) {
         table.push(`| ${viewer} | ${arm} | ${good.length}/${all.length} | picture only | | | | |`);
         continue;
       }
-      const ungranted = good.filter(r => r.viewers[viewer].t0From !== "granted").length;
+      const timedFrom = from => good.filter(r => r.viewers[viewer].t0From === from).length;
+      const ungranted = { firstPicture: timedFrom("first picture"), firstPair: timedFrom("first pair") };
+      const ungrantedNote = [ungranted.firstPicture && `${ungranted.firstPicture} timed from the first picture`, ungranted.firstPair && `${ungranted.firstPair} from the first pair`].filter(Boolean).join(", ");
       const runs = good.map(r => ({ rep: r.rep, w: windows(r.viewers[viewer], r.limits) }));
       const tally = list => [list.filter(p => p.inRange).length, list.length];
       const count = key => runs.reduce((acc, { w }) => { const [h, n] = tally(w[key]); return [acc[0] + h, acc[1] + n]; }, [0, 0]);
@@ -83,7 +85,7 @@ for (const { row } of plan.rows) {
         perRun: { first: share("first"), settled: share("settled") },
       };
       cells.push(cell);
-      table.push(`| ${viewer} | ${arm} | ${good.length}/${all.length}${ungranted ? ` (${ungranted} timed from ${ungranted === 1 ? "its" : "their"} first picture, no grant seen)` : ""} | ` +
+      table.push(`| ${viewer} | ${arm} | ${good.length}/${all.length}${ungrantedNote ? ` (no grant seen: ${ungrantedNote})` : ""} | ` +
         `${firstHit}/${firstAll} (${pct(firstHit, firstAll)}) | ${settledHit}/${settledAll} (${pct(settledHit, settledAll)}) | ` +
         `${ms(cell.settledOffsetMs.median)} (${ms(cell.settledOffsetMs.p5)}…${ms(cell.settledOffsetMs.p95)}) | ${spread(cell.perRun.first)} | ${spread(cell.perRun.settled)} |`);
     }

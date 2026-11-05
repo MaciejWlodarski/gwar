@@ -126,7 +126,7 @@ test("aggregate: cells, per-run columns, picture-only viewers, invalid and missi
   assert.equal(status, 0);
   // Off: the first 20 bursts of every run out of range, so none of the first 12 s and 20 of 28 after.
   assert.match(table, /\| browser \| off \| 9\/10 \| 0\/108 \(0\.0%\) \| 180\/252 \(71\.4%\) \| \+20 \(\+20…\+400\) \| 0 0 0 0 0 0 0 0 0 \| 71 71 71 71 71 71 71 71 71 \|/);
-  assert.match(table, /\| browser \| on \| 9\/9 \(1 timed from its first picture, no grant seen\) \| 108\/108 \(100\.0%\) \|/);
+  assert.match(table, /\| browser \| on \| 9\/9 \(no grant seen: 1 timed from the first picture\) \| 108\/108 \(100\.0%\) \|/);
   assert.match(table, /\| desktop \| off \| 9\/10 \| picture only \|/);
   assert.match(table, /\| j10-r08-off \| 0 \| load 9\.0 above 2 per CPU/);
   assert.match(table, /\| j10-r09-on \| 0 \| no record/);

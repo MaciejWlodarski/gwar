@@ -12,9 +12,12 @@ branch whose lip-sync kit has not merged yet can be measured from `main`'s workf
 **Measure trusted refs only**: this repository's own branches, tags and commits, never a fork's
 pull request or anything not yet read. A dispatch from `main` builds and runs the measured code
 (its `build.rs` files, `pnpm install`, its scripts) with `main`'s cache scope, where this workflow
-saves its Rust and wasm caches; later timing dispatches restore them. ci.yml never reads those
-entries (they have their own prefixes), but a hostile ref could still poison the next dispatch's
-build. `pull/…` refs are refused.
+saves its Rust and wasm caches; later timing dispatches restore them, so a hostile ref could poison
+the next dispatch's build. ci.yml never reads those entries: they have their own prefixes, and no
+job here caches the pnpm store (setup-node's `cache: pnpm` would share ci.yml's key). Guards:
+`pull/…` refs are refused, and `ref` is resolved against this repository's branches and tags only,
+so a commit that is on none of them is refused, even as a full SHA (GitHub serves a fork's commits
+under this repository's name too).
 
 ## Running it
 
@@ -30,7 +33,7 @@ The table is the run's job summary (the `aggregate` job). Each shard's artifact
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `ref` | (required) | Branch, tag or SHA measured (letters, digits, `._/-`; no `..`; no `pull/`). It must contain `apps/web/e2e/share-sync.mjs`. |
+| `ref` | (required) | Branch, tag or SHA measured (letters, digits, `._/-`; no `..`; no `pull/`), on a branch or tag of this repository. It must contain `apps/web/e2e/share-sync.mjs`. |
 | `rows` | `j10` | Comma list of rows, below. |
 | `arms` | `off,on` | Comma list of arms, below. The first is the baseline every other arm is compared with. |
 | `runs` | `8` | Runs per arm per row. |
@@ -63,7 +66,7 @@ Arms: `off` (`SYNC_OFF=1`, main's playback), `on`, `nofilter` (`SYNC_NOFILTER=1`
 
 ## What it does
 
-1. `plan` resolves `ref` to its commit, checks the inputs and writes the plan: for every row and repetition one block that holds
+1. `plan` resolves `ref` to its commit among this repository's branches and tags, checks the inputs and writes the plan: for every row and repetition one block that holds
    each arm once, in a seeded random order; the next repetition runs the reverse order, so every arm
    runs as often first as last. With two viewers their order flips every two repetitions. Blocks are
    dealt whole to the shards, so the arms of a block share one runner and its load at that time.

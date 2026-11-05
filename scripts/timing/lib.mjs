@@ -152,7 +152,6 @@ export const percentile = (values, share) => {
   return sorted[Math.min(sorted.length - 1, Math.floor(share * sorted.length))];
 };
 
-/** Pooled share in range of runs given as [inRange, total], each run weighted by its bursts. */
 /**
  * Arm B against the baseline, paired by block: each block ran both arms once, back to back on one
  * runner, so its difference (B's share in range minus the baseline's, each run's own share) leaves
