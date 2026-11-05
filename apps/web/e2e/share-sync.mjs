@@ -6,7 +6,9 @@
  * positive means the sound lags the picture. With Chromium viewers nothing reaches the Mac's
  * speakers: on macOS it runs with `--disable-audio-output`, and the desktop viewer's speaker is
  * `native_bridge`'s virtual device. WebKit viewers opened the speakers even as desktop viewers, so
- * those run on CI only.
+ * those run on CI only. Linux WebKit has no `RTCRtpScriptTransform`, so its desktop viewer cannot keep
+ * the sound from the webview's decoder and, as the app does there, plays the picture only: the run
+ * checks that it shows the picture and offers no sound, and measures nothing for it.
  *
  * Build once: cargo build --release -p gwar-client --no-default-features --example web_latency --example native_bridge
  *   SYNC_NET=normal|jitter|<LATENCY_NET spec>   the link in front of every viewer (default: normal)
@@ -185,7 +187,7 @@ function viewerPatch() {
   window.Worker = new Proxy(window.Worker, {
     construct(target, args) {
       const worker = new target(...args);
-      if (args[1]?.name === "gwar-late-frames") worker.addEventListener("message", () => window.__linkBacks.push(Date.now()));
+      if (args[1]?.name === "gwar-late-frames") worker.addEventListener("message", event => { if (event.data?.slot !== undefined) window.__linkBacks.push(Date.now()); });
       return worker;
     },
   });
@@ -384,15 +386,25 @@ const joinDefault = page => page.evaluate(async () => {
 async function viewer(browser, web, server, sharer, kind) {
   const page = await device(browser, web, server, `${kind}-viewer`, kind === "desktop");
   page.kind = kind;
+  // The app's own test for share sound in the desktop app (`shareSoundReceivable`) needs it first.
+  page.pictureOnly = kind === "desktop" && !await page.evaluate(() => typeof RTCRtpScriptTransform === "function");
   await joinDefault(page);
   await page.getByRole("button", { name: `${sharer} is sharing their screen. Click to watch.` }).click();
-  if (!process.env.SYNC_ADD) await followSound(page);
+  if (!process.env.SYNC_ADD && !page.pictureOnly) await followSound(page);
   else await page.locator("video").first().waitFor({ state: "attached", timeout: 20_000 });
   await page.evaluate(() => { window.__followPicture(); window.__followHealth(); });
   return page;
 }
 
+/** A picture-only viewer must still show the share, and must never offer its sound. */
+async function checkPictureOnly(page) {
+  assert.ok((await page.evaluate(() => window.__presented.length)) > 0, `the ${page.kind} viewer showed no picture`);
+  assert.equal(await page.getByTestId("share-audio-controls").count(), 0, `the ${page.kind} viewer offers sound it cannot play`);
+  assert.equal(await page.locator("audio[data-share-audio]").count(), 0, `the ${page.kind} viewer's webview plays the share's sound`);
+}
+
 async function followSound(page) {
+  if (page.pictureOnly) return;
   if (page.kind === "browser") {
     await page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 20_000 });
     await page.evaluate(quiet => window.__followSound(document.querySelector("audio[data-share-audio]"), quiet), ONSET_QUIET_MS * 48);
@@ -471,6 +483,12 @@ async function run() {
     const bursts = await source.evaluate(() => window.__bursts);
     const report = { net: netName, spec: netSpec, bursts, soundBack, viewers: {} };
     for (const page of watching) {
+      if (page.pictureOnly) {
+        await checkPictureOnly(page);
+        report.viewers[page.kind] = { pictureOnly: true };
+        console.log(JSON.stringify({ net: netName, viewer: page.kind, pictureOnly: true }));
+        continue;
+      }
       const record = await viewerRecord(page);
       if (process.env.SYNC_OFF) assert.deepEqual(baselineFaults(record.baseline), [], `the ${page.kind} viewer's baseline is not main`);
       const pairs = pairBursts(bursts, record.presented, record.onsets);

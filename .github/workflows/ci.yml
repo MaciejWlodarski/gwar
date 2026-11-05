@@ -875,7 +875,8 @@ jobs:
 
   # Lip-sync on WebKit, which cannot be silenced on a developer's Mac. A software encoder on a
   # 4-vCPU runner is not the path the targets speak of, so this records and does not gate
-  # (docs/share-audio-validation.md, "Lip-sync").
+  # (docs/share-audio-validation.md, "Lip-sync"). Linux WebKit has no RTCRtpScriptTransform, so its
+  # desktop viewer plays the picture only, as the app does there: the run checks that, not lip-sync.
   browser-share-sync:
     needs: [changes, mls-wasm, denoise-wasm, native-build]
     if: needs.changes.outputs.app == 'true'

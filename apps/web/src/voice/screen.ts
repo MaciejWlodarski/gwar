@@ -9,7 +9,7 @@
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
 import type { MediaKind } from "./late-frames";
-import type { LinkBack } from "./late-frames-worker";
+import type { LateFramesReady, LinkBack } from "./late-frames-worker";
 import type { PictureClock, SoundClock } from "./share-sync";
 import { RtcUplinkObserver, type UplinkStatus } from "./uplink-congestion";
 import type { Av1Capability } from "../proto/Av1Capability";
@@ -572,6 +572,8 @@ export class DecodeWatchdog {
   private last: number | null = null;
   private next: number | null = null;
   private reported: number | null = null;
+  /** `lost` restarted this stall: only a frame decoded since lets it do so again. */
+  private forgiven = false;
   /**
    * Reports a decoder that receives packets and decodes nothing for `DECODE_STALL_MS`, then
    * every `DECODE_REPORT_EVERY_MS` for as long as that lasts: until it decodes, packets stop, or
@@ -590,6 +592,7 @@ export class DecodeWatchdog {
    * server ignores costs it a constant-time check.
    */
   observe(now: number, packets: number, frames: number): boolean {
+    if (this.frames !== null && frames > this.frames) this.forgiven = false;
     const decoded = this.frames === null || frames > this.frames;
     const paused = this.packets !== null && packets <= this.packets;
     if (decoded || paused || (this.last !== null && now - this.last > DECODE_POLL_GAP_MS)) {
@@ -609,9 +612,15 @@ export class DecodeWatchdog {
    * This viewer's late-frame filter dropped frames the SFU forwarded whole, so the decoder waits
    * for the keyframe that `screen.stalled` asked for, and the server, which saw nothing dropped,
    * would take a report of that wait as a decoder that cannot decode. The stall starts again at
-   * the next sample, as after a decode.
+   * the next sample, as after a decode, but once per stall: a filter that keeps dropping (a link
+   * that keeps coming back) cannot hold off a report of a decoder that decodes nothing at all:
+   * it comes as it would have with that first drop the last.
    */
-  lost(): void { this.frames = null; }
+  lost(): void {
+    if (this.forgiven) return;
+    this.forgiven = true;
+    this.frames = null;
+  }
 }
 
 /** The main and RTX SSRCs of a publish offer's single video section (its `ssrc-group:FID`). */
@@ -1597,6 +1606,10 @@ export interface WatchParams {
   decodeFailed?(slot: number, share: string, generation: number): void;
   /** Late frames were dropped: the decoder has nothing to go on until the next keyframe. */
   frameLost?(slot: number): void;
+  /** No late-frame filter: an earlier transport's worker never ran (`lateFramesFailed`). */
+  skipLateFrames?: boolean;
+  /** The late-frame worker failed to load or crashed: the transport plays on without it. */
+  lateFramesFailed?(): void;
   state(state: TransportState): void;
   /** A slot's video track arrived (once per slot and transport). */
   track(slot: number, stream: MediaStream): void;
@@ -1604,11 +1617,8 @@ export interface WatchParams {
 
 export interface SlotStats { width: number; height: number; fps: number; framesDecoded: number }
 
-function createLateFramesWorker(lost: (slot: number) => void): Worker {
-  const worker = new Worker(new URL("./late-frames-worker.ts", import.meta.url), { type: "module", name: "gwar-late-frames" });
-  worker.onmessage = (event: MessageEvent<LinkBack>) => lost(event.data.slot);
-  return worker;
-}
+/** How long the late-frame worker has to load before its transforms are taken off. */
+export const LATE_FRAMES_READY_MS = 2_000;
 
 /**
  * The session's watch transport: `SCREEN_SLOTS` receive-only video m-lines (one on the guest
@@ -1626,6 +1636,10 @@ export class ScreenWatchTransport {
   private audioTransceivers: RTCRtpTransceiver[] = [];
   private heldBefore = new WeakMap<RTCRtpReceiver, { delay: number; emitted: number }>();
   private lateFrames: Worker | null = null;
+  private lateFramesReady: ReturnType<typeof setTimeout> | null = null;
+  private lateFramesDropped = false;
+  /** The receivers whose frames the late-frame worker reads. */
+  private filtered: RTCRtpReceiver[] = [];
   private streams: MediaStream[] = [];
   private stopWatching: () => void = () => {};
   private closed = false;
@@ -1683,15 +1697,47 @@ export class ScreenWatchTransport {
 
   /** Late frames go before the receiver sees them, where the engine lets anything sit there. */
   private shedLateFrames(receiver: RTCRtpReceiver, slot: number, kind: MediaKind): void {
-    if (typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return;
+    if (this.params.skipLateFrames || this.lateFramesDropped || typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return;
     try {
-      this.lateFrames ??= createLateFramesWorker(slot => {
-        if (this.closed) return;
-        this.watchdogs.get(slot)?.watchdog.lost();
-        this.params.frameLost?.(slot);
-      });
+      this.lateFrames ??= this.startLateFrames();
       receiver.transform = new RTCRtpScriptTransform(this.lateFrames, { slot, kind });
+      this.filtered.push(receiver);
     } catch { /* it plays as it would have */ }
+  }
+
+  /**
+   * A worker that never loads (a missing chunk, a policy, a module error) or crashes leaves every
+   * transform it was given unread, picture and sound alike, with nothing said. So it must say it
+   * loaded within `LATE_FRAMES_READY_MS`, and an error at any time takes the filter off.
+   */
+  private startLateFrames(): Worker {
+    const worker = new Worker(new URL("./late-frames-worker.ts", import.meta.url), { type: "module", name: "gwar-late-frames" });
+    worker.onmessage = (event: MessageEvent<LinkBack | LateFramesReady>) => {
+      if (this.closed || this.lateFrames !== worker) return;
+      if ("ready" in event.data) {
+        if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
+        this.lateFramesReady = null;
+        return;
+      }
+      const { slot } = event.data;
+      this.watchdogs.get(slot)?.watchdog.lost();
+      this.params.frameLost?.(slot);
+    };
+    worker.onerror = () => { if (this.lateFrames === worker) this.dropLateFrames(); };
+    this.lateFramesReady = setTimeout(() => this.dropLateFrames(), LATE_FRAMES_READY_MS);
+    return worker;
+  }
+
+  /** Every receiver the filter held plays as without it, and later transports start without it. */
+  private dropLateFrames(): void {
+    if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
+    this.lateFramesReady = null;
+    this.lateFramesDropped = true;
+    for (const receiver of this.filtered) { try { receiver.transform = null; } catch { /* closed with its transport */ } }
+    this.filtered = [];
+    this.lateFrames?.terminate();
+    this.lateFrames = null;
+    if (!this.closed) this.params.lateFramesFailed?.();
   }
 
   keyframe(slot: number, share: string, generation: number): void {
@@ -1780,6 +1826,9 @@ export class ScreenWatchTransport {
     this.pc = null;
     this.transceivers = [];
     if (pc) { pc.ontrack = null; pc.onconnectionstatechange = null; pc.close(); }
+    if (this.lateFramesReady) clearTimeout(this.lateFramesReady);
+    this.lateFramesReady = null;
+    this.filtered = [];
     this.lateFrames?.terminate();
     this.lateFrames = null;
   }

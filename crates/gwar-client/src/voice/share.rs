@@ -55,9 +55,14 @@ const DRIFT_RATE: f64 = 0.002;
 /// While sound moves to hold back for the picture or to give that back: 1 % is 10 ms a second,
 /// and no music is that far out of tune for the few seconds it takes.
 const HOLD_RATE: f64 = 0.01;
-/// How quickly the reading speed follows, per sample: changes of speed take 100 ms, so an uneven
-/// queue cannot be heard as a wobble.
-const RATE_SMOOTHING: f64 = 1.0 / 4800.0;
+/// How far a hold's queue is from its aim when the speed reaches `HOLD_RATE`: under it the
+/// speed is in proportion. The queue is counted in whole packets and jitter moves it by one at
+/// any time, so a speed that went all or nothing either side of a narrow aim would wander by the
+/// whole 1 %, 17 cents on music.
+const HOLD_FULL: Duration = Duration::from_millis(FRAME_MS as u64 + DRIFT_MARGIN.as_millis() as u64);
+/// How quickly the reading speed follows, per sample: changes of speed take 500 ms, so an uneven
+/// queue, counted in whole packets that jitter moves, cannot be heard as a wobble.
+const RATE_SMOOTHING: f64 = 1.0 / 24000.0;
 /// The most sound holds back for the picture. `MAX_QUEUED` has to stay above this, `MAX_DELAY`,
 /// `BACKLOG_MARGIN` and `JUMP_HEADROOM`.
 const MAX_HOLD: Duration = Duration::from_millis(400);
@@ -196,13 +201,14 @@ impl ShareBus {
     pub fn mix(&self, speakers: &mut [[f32; 2]], deafened: bool) -> bool {
         let Ok(mut ring) = self.ring.try_lock() else { return false };
         let mut missing = 0u64;
+        let mut taken = 0u64;
         let mut played = false;
         for pair in speakers {
             let Ok([left, right]) = ring.pop() else {
                 missing += 1;
                 continue;
             };
-            self.taken.fetch_add(1, Ordering::Relaxed);
+            taken += 1;
             if deafened {
                 continue;
             }
@@ -213,6 +219,8 @@ impl ShareBus {
             let side = (0.5 * (left - right)).clamp(-room, room);
             *pair = [(mid + side).clamp(-1.0, 1.0), (mid - side).clamp(-1.0, 1.0)];
         }
+        // Once per call: `note_output` reads it before the next one, on this same thread.
+        self.taken.fetch_add(taken, Ordering::Relaxed);
         if missing > 0 && self.active() {
             self.counters.ring_underruns.fetch_add(missing, Ordering::Relaxed);
         }
@@ -465,13 +473,8 @@ impl Jitter {
         if !self.releasing && self.hold.is_zero() {
             return if queued > delay + DRIFT_MARGIN { 1.0 + DRIFT_RATE } else { 1.0 };
         }
-        if queued > delay + DRIFT_MARGIN {
-            1.0 + HOLD_RATE
-        } else if queued + DRIFT_MARGIN < delay {
-            1.0 - HOLD_RATE
-        } else {
-            1.0
-        }
+        let off = (queued.as_secs_f64() - delay.as_secs_f64()) / HOLD_FULL.as_secs_f64();
+        1.0 + (off * HOLD_RATE).clamp(-HOLD_RATE, HOLD_RATE)
     }
 
     fn observe(&mut self, rtp_time: u32, now: Instant) {

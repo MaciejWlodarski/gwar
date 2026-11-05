@@ -399,9 +399,11 @@ other and a lag alone would never show that a wait is no longer needed.
 
 **Sound waits only in the desktop app**, for a picture that is late with nothing left to give, for
 a lead over 25 ms, in steps. Sound leaves the webview there, so its own sync has none to work with.
-The mixer plays it 1 % slower, 10 ms a second and at most 400 ms in all, with the speed changing
-over 100 ms; when the wait falls it plays 1 % faster until the queue is back. With no wait the
-mixer reads exactly as before. While sound is not ahead it keeps giving a wait back. In a browser
+The mixer plays it up to 1 % slower, 10 ms a second and at most 400 ms in all; when the wait
+falls it plays up to 1 % faster until the queue is back. Within 30 ms of its aim the speed is in
+proportion, and it changes over 500 ms: the queue counts whole 20 ms packets that jitter moves, so
+an all-or-nothing speed wandered by the whole 1 %, 17 cents on music (0.9959 to 1.0092 under
+±10 ms; now 0.9986 to 1.0019). With no wait the mixer picks its speed as before, smoothed the same. While sound is not ahead it keeps giving a wait back. In a browser
 the engine's own sync moves sound; a second controller on the same pair only drove both up.
 
 A watch settles for ten looks before anything moves, per slot: its keyframes and buffers are still
@@ -449,7 +451,10 @@ picture, held up by its own size, not a backlog. Nothing is shed for more than a
 link that stays that slow is the link now, and it sets the new measure. Without script transforms a
 viewer plays the backlog, as before. The filter never stops a frame on its own failure: if it
 throws, every later frame passes, and if the stream fails, what still flows is piped through
-unfiltered, so a slot can never freeze on it.
+unfiltered, so a slot can never freeze on it. A worker that never runs would leave every transform
+unread, picture and sound alike: it has to say it loaded within 2 s, and if it does not, or fails
+at any time, every receiver's transform comes off and the session's later transports go without
+the filter.
 
 The first frame of a backlog proves the link is back, so that is when the viewer sends
 `screen.stalled`, and again at the first frame in time, because frames were dropped since any
@@ -460,9 +465,12 @@ word, and not for a paused slot. The estimator then proves or lowers it as usual
 restore is the link's answer. The viewer's word says a backlog arrived, not what the link carries
 now, so the reach is bounded for a link that came back slower. In the simulator, a 2 s stall that
 left the link at a quarter cost voice 1.37 s more of 50 ms queue with an unbounded restore and a
-second one within a second, and 0.12 s more at 1.5 times. Dropping frames the SFU forwarded whole
-also restarts the slot's decode watchdog, so the keyframe wait is never reported as a decoder that
-cannot decode.
+second one within a second, and 0.12 s more at 1.5 times; told with the backlog's first frame,
+before feedback lowered the estimate, the SFU restores nothing and voice pays nothing more. A
+restore does not stop a new viewer following its ramping share up: the catch-up goes on, held
+against the restored estimate. Dropping frames the SFU forwarded whole also restarts the slot's
+decode watchdog, once until it decodes again, so the keyframe wait is never reported as a decoder
+that cannot decode, and a filter that keeps dropping cannot hold a real failure's report off.
 
 The picture has just jumped, so one more move goes unseen: after the backlog lands, the first look
 that finds the two sides over 45 ms apart moves the picture the whole way, once, while sound is

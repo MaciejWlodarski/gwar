@@ -658,3 +658,52 @@ fn a_hold_is_bounded_and_a_new_run_starts_without_one() {
     assert!(!playout.set_hold(0, 7, 100), "an older run has no say");
     assert_eq!(playout.hold[0].load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn a_reached_hold_keeps_the_sound_in_tune_under_jitter() {
+    // Opus review r1 (S17): the queue is counted in 20 ms packets, and a dead zone of 10 ms each
+    // side let jitter flip the speed between the full 1 % and none: 17 cents of slow wander on
+    // music. Packets arrive up to 10 ms early or late; once the hold is reached, the speed
+    // stays close to what drift asks for.
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut jitter = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % 21) as i64 - 10
+    };
+    let start = Instant::now();
+    let arrivals: Vec<i64> = (0..30 * 50).map(|n| 40 + 20 * n + jitter()).collect();
+    let mut next = 0usize;
+    let mut speeds = Vec::new();
+    for tick in 0..30 * 100i64 {
+        if tick == 200 {
+            assert!(playout.set_hold(0, 7, 60));
+        }
+        while next < arrivals.len() && arrivals[..=next].iter().max().copied().unwrap() <= 10 * tick {
+            feed(
+                &mut worker,
+                &mut encoder,
+                (0, 7),
+                next as u64,
+                1,
+                (440.0, 440.0),
+                start + Duration::from_millis(10 * tick as u64),
+            );
+            next += 1;
+        }
+        drain(&mut worker, &bus, 1);
+        if tick >= 15 * 100 {
+            speeds.push(worker.streams[0].as_ref().unwrap().speed);
+        }
+    }
+    let (low, high) = speeds.iter().fold((f64::MAX, f64::MIN), |(l, h), s| (l.min(*s), h.max(*s)));
+    // The old all-or-nothing speed spanned 0.9959 to 1.0092 here.
+    assert!(high - low <= HOLD_RATE / 2.0, "speed {low:.4} to {high:.4}");
+    let stats = playout.stats();
+    assert_eq!((stats.late_drops, stats.backlog_drops), (0, 0));
+}

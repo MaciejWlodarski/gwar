@@ -2884,11 +2884,14 @@ fn allocate(
             restored = true;
         }
     }
-    // A restore puts back what the link carried before a stall: it is not a share's ramp to
-    // follow, and the next start measures its own link again. Restore first, then end the
-    // catch-up, so the two never raise the estimate in the same tick.
+    // A restore puts back what the link carried before a stall, and a young share may still
+    // ramp: the catch-up goes on, its link held against the restored estimate from now
+    // (`CATCH_UP_HELD`). The two never raise the estimate in the same tick.
     if restored {
-        w.catch_up = None;
+        let estimate = w.egress.estimate();
+        if let Some(c) = w.catch_up.as_mut() {
+            c.estimate = estimate;
+        }
     } else {
         catch_up(w, rates, now);
     }
@@ -4620,6 +4623,37 @@ pub(crate) mod tests {
         set_estimate(&mut pair.w, 3_000_000, pair.now);
         allocate(&mut pair.w, pair.now, &HashMap::new(), false);
         assert_eq!(pair.w.egress.estimate(), 3_000_000, "falling again is the link's answer");
+    }
+
+    #[test]
+    fn a_restore_leaves_a_new_viewer_following_its_ramping_share() {
+        // Opus review r1 (S14): a restore ended #230's catch-up, so a new viewer whose filter
+        // said its link was back early stopped following its young share's ramp.
+        let mut pair = Pair::new();
+        pair.w.ceiling = u64::MAX;
+        let rate = |average: f64| ShareRate {
+            average,
+            last_keyframe: 60_000,
+            largest_keyframe: 60_000,
+            largest_delta: 10_000,
+        };
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 40_000_000);
+        origin.measured(rate(4_000_000.0), true, true);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        assert!(pair.w.catch_up.is_some(), "a ramping share is followed");
+        let started = pair.w.egress.estimate();
+        set_estimate(&mut pair.w, started, pair.now);
+        pair.now += Duration::from_secs(1);
+        set_estimate(&mut pair.w, started / 2, pair.now);
+        pair.w.link_back = true;
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        let restored = pair.w.egress.estimate();
+        assert!(restored > started / 2, "restored to {restored}");
+        assert_eq!(pair.w.catch_up.map(|c| c.estimate), Some(restored), "held against the restored estimate");
+        origin.measured(rate(8_000_000.0), true, true);
+        pair.now += Duration::from_millis(500);
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        assert_eq!(pair.w.egress.estimate(), origin.start_estimate(), "the share's ramp is still followed");
     }
 
     #[test]

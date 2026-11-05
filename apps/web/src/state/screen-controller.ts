@@ -127,6 +127,8 @@ export class ScreenController {
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
   private watchAudio = false;
+  /** The late-frame worker failed once: this session's transports go without the filter. */
+  private lateFramesFailed = false;
   /** The desktop app's lip-sync, for as long as sound reaches the native mixer. */
   private pictureSync: PictureSync | null = null;
   /** Desktop app: this share's computer sound, from the sharer's confirmation until it ends. */
@@ -1121,6 +1123,8 @@ export class ScreenController {
           this.frameLost(watch.share, run, watch.id);
         }
       },
+      skipLateFrames: this.lateFramesFailed,
+      lateFramesFailed: () => { this.lateFramesFailed = true; },
       decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
     });

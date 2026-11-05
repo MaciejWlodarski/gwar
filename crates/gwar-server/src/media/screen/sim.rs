@@ -891,9 +891,20 @@ mod tests {
         assert!(hurt <= 700 * MS, "{hurt:?}: {}", summary(&sim));
     }
 
+    /// When the viewer's word that its link is back reaches the server, in `stall_then_slower`.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum LinkBackAt {
+        Never,
+        /// With the backlog's first frame, as the viewer's filter sends it, before any feedback.
+        Backlog,
+        /// Once the burst's feedback has brought the estimate down, the case a restore is for.
+        Fallen,
+    }
+
     /// A 2 s stall that leaves the link 4x slower: the viewer's filter drops the backlog and
     /// says the link is back, so the server restores its estimate on a link that cannot carry it.
-    fn stall_then_slower(restore: bool, seed: u64) -> (Duration, Duration, u64) {
+    /// Returns the voice hurt and its worst, the estimate when told, and the most it then reached.
+    fn stall_then_slower(at: LinkBackAt, seed: u64) -> (Duration, Duration, u64, u64) {
         let mut sim = Sim::with_seed(Some(20_000_000), seed);
         sim.voice = true;
         sim.server_interval = 5 * MS;
@@ -908,39 +919,43 @@ mod tests {
         sim.run(DELAY);
         sim.down.rate = Some(5_000_000);
         let back = sim.now;
-        // The viewer's word reaches the server once the burst's feedback has brought the
-        // estimate down, the case a restore is for.
-        while sim.w.egress.estimate() > 8_000_000 && sim.now - back < 5 * SECOND {
-            sim.run(20 * MS);
+        if at == LinkBackAt::Fallen {
+            while sim.w.egress.estimate() > 8_000_000 && sim.now - back < 5 * SECOND {
+                sim.run(20 * MS);
+            }
         }
         let told = (sim.now - back, sim.w.egress.estimate());
-        if restore {
-            sim.w.link_back = true;
-        }
-        let mut restored = 0;
+        sim.w.link_back = at != LinkBackAt::Never;
+        let mut reached = 0;
         for _ in 0..50 {
             sim.run(20 * MS);
-            restored = restored.max(sim.w.egress.estimate());
+            reached = reached.max(sim.w.egress.estimate());
         }
         sim.run(7 * SECOND);
         let (hurt, worst) = voice_hurt(&sim, back, sim.now);
-        println!("  restore {restore}: told at {:?} with {}, then up to {restored}", told.0, told.1);
-        (hurt, worst, restored)
+        println!("  link back {at:?}: told at {:?} with {}, then up to {reached}", told.0, told.1);
+        (hurt, worst, told.1, reached)
     }
 
     #[test]
     fn a_restore_after_a_stall_on_a_slower_link_keeps_voice_as_without_it() {
         // Early review S3: no simulation set `link_back`, so the drop sweep never measured the
-        // restore. Voice may not pay for it beyond what the stall alone costs.
+        // restore. Voice may not pay for it beyond what the stall alone costs, whether the word
+        // comes with the backlog's first frame (as the filter sends it) or once the estimate fell
+        // (Opus review r1, S16: measured +120 ms at most, so the gate is +150 ms).
         for seed in 1..=4 {
-            let (plain, plain_worst, told_at) = stall_then_slower(false, seed);
-            let told_estimate = |_| told_at;
-            let (hurt, worst, restored) = stall_then_slower(true, seed);
-            println!(
-                "seed {seed}: voice hurt {plain:?} (worst {plain_worst:?}) without the restore, {hurt:?} (worst {worst:?}) with it, restored to {restored}"
-            );
-            assert!(restored > told_estimate(seed), "seed {seed}: the case did not restore");
-            assert!(hurt <= plain + 300 * MS, "seed {seed}: {hurt:?} against {plain:?}");
+            let (plain, plain_worst, ..) = stall_then_slower(LinkBackAt::Never, seed);
+            println!("seed {seed}: voice hurt {plain:?} (worst {plain_worst:?}) without a link-back");
+            for at in [LinkBackAt::Backlog, LinkBackAt::Fallen] {
+                let (hurt, worst, told, reached) = stall_then_slower(at, seed);
+                println!(
+                    "seed {seed}: {at:?}: voice hurt {hurt:?} (worst {worst:?}), told at {told}, reached {reached}"
+                );
+                if at == LinkBackAt::Fallen {
+                    assert!(reached > told, "seed {seed}: the case did not restore");
+                }
+                assert!(hurt <= plain + 150 * MS, "seed {seed}, {at:?}: {hurt:?} against {plain:?}");
+            }
         }
     }
 
