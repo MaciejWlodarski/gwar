@@ -9,6 +9,12 @@ use gwar_proto::{
 
 use super::{Core, EPHEMERAL_MESSAGE_BASE, MAX_MESSAGE, Reply, err, now_ms, storage_error};
 
+/// A signed message's identity was already stored: clients take this as "an earlier attempt was
+/// delivered", so nothing else may answer it.
+pub(super) fn message_id_used() -> gwar_proto::ErrorBody {
+    err(ErrorCode::Conflict, "message_id already used")
+}
+
 /// At most this many users can be mentioned in one message.
 const MAX_MENTIONS: usize = 20;
 
@@ -118,10 +124,13 @@ impl Core {
     }
 
     pub(super) fn reserve_message_identity(&self, msg: &ChatMessage) -> Result<(), gwar_proto::ErrorBody> {
-        if let Some(s) = &msg.signature {
-            self.store
+        if let Some(s) = &msg.signature
+            && !self
+                .store
                 .reserve_message_identity(&s.server_key, &s.author_uid, &s.message_id)
-                .map_err(|_| err(ErrorCode::Conflict, "message_id already used"))?;
+                .map_err(storage_error)?
+        {
+            return Err(message_id_used());
         }
         Ok(())
     }

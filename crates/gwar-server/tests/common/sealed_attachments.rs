@@ -114,6 +114,13 @@ async fn sealed_file_ties_refuse_wrong_mode_owner_pending_reuse_duplicates_and_o
     for case in cases {
         assert_eq!(a.fails("chat.sealed.send", with_files(&conversation, &group, 1, &case)).await, "bad_request");
     }
+    // The web client tells uploads that are gone from other refusals by this exact text (state/sealed.ts).
+    let refused =
+        a.request("chat.sealed.send", with_files(&conversation, &group, 1, &[own.id.as_str(), "missing"])).await;
+    assert_eq!(
+        refused.unwrap_err().message,
+        "files must be distinct, finished, unattached sealed uploads of this author (at most 10)"
+    );
     let channel = a.default_channel();
     let sig = a.signature(&format!("channel:{channel}"), "file", &[], std::slice::from_ref(&own));
     assert_eq!(

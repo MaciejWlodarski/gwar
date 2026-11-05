@@ -2709,12 +2709,11 @@ impl Core {
                 }
                 message.attachments = files;
                 self.verify_message(session, &message, false)?;
-                self.reserve_message_identity(&message)?;
-                message.id = self
-                    .store
-                    .add_message(channel, &message.author_uid, &message.author_name, &message.text, message.sent_at)
-                    .map_err(storage_error)?;
-                self.store.save_message_body(&message).map_err(storage_error)?;
+                // The identity, the message and its body are written together: a failed write is
+                // never answered later as a duplicate.
+                if self.store.add_signed_message(channel, &mut message).map_err(storage_error)?.is_none() {
+                    return Err(messages::message_id_used());
+                }
                 // Everyone who can read the channel, in voice there or not (for unread counts).
                 let readers: BTreeSet<_> =
                     self.sessions.values().filter(|s| self.can_read(s, channel)).map(|s| s.id).collect();

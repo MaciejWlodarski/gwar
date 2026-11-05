@@ -27,6 +27,19 @@ const SCANS = 4;
 /** Rows a mention scan reads at most: the server keeps this many per conversation. */
 const SCAN_ROWS = 1000;
 
+/** The server holds this message ID, but no copy of it can be found: an earlier attempt may have been
+ * delivered and later removed, or be older than the rows scanned. Sending it again can never succeed. */
+export class DeliveryUnknownError extends Error {
+  constructor(options?: ErrorOptions) { super("message_id already used, no delivered copy found", options); }
+}
+/** The server's refusal of uploads that are not (or no longer) this send's to attach: `InvalidFiles` in
+ * crates/gwar-server/src/store.rs, whose text a server test pins. Other refusals share its code. */
+export const INVALID_FILES = "files must be distinct, finished, unattached sealed uploads of this author (at most 10)";
+/** The server no longer takes this send's uploads (expired, or tied to an earlier attempt that is gone). */
+export class AttachmentsGoneError extends Error {
+  constructor(options?: ErrorOptions) { super(tNow("chat.missingAttachments"), options); }
+}
+
 /** One session's sealed chat work, for direct messages and public encrypted chat.
  * Every asynchronous boundary checks its session fence. */
 export class SealedConversations {
@@ -427,10 +440,20 @@ export class SealedConversations {
           checkSession();
           // Upload ownership is checked before duplicate message IDs: an attached upload can
           // turn a lost acknowledgement into bad_request rather than conflict.
-          if (!original && error instanceof RequestError && (error.code === "conflict" || (error.code === "bad_request" && attachments.length > 0))
-            && await this.recoverDelivery(thread, retry.message_id, checkSession)) return;
+          if (!original && error instanceof RequestError && (error.code === "conflict" || (error.code === "bad_request" && attachments.length > 0 && error.message === INVALID_FILES))) {
+            if (await this.recoverDelivery(thread, retry.message_id, checkSession)) return;
+            // Neither answer changes on another try with the same message and files.
+            throw error.code === "conflict" ? new DeliveryUnknownError({ cause: error }) : new AttachmentsGoneError({ cause: error });
+          }
           if (!(error instanceof RequestError) || !["stale", "pending"].includes(error.code) || attempt === 2) throw error;
-          await this.runtime.sync(); check();
+          try { await this.runtime.sync(); }
+          catch (syncError) {
+            // A pass reports the first DM that failed in it, which may be another conversation's: a
+            // failure of this one (or of the whole pass) leaves it securing, so only then is it ours.
+            check();
+            if (this.runtime.status(conversation) !== "ready") throw syncError;
+          }
+          check();
           if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"), { cause: error });
         }
       }

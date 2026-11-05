@@ -1906,15 +1906,42 @@ impl Store {
         Ok(Some(message))
     }
 
-    pub fn reserve_message_identity(&self, server_key: &str, author_uid: &str, message_id: &str) -> Result<()> {
-        self.db
-            .execute("INSERT INTO message_identities VALUES(?1,?2,?3)", params![server_key, author_uid, message_id])?;
-        Ok(())
+    /// Records a signed message's identity: false when it was already used. Only that answer means
+    /// "used"; any other failure (a full disk, a busy or read-only database) is an error.
+    pub fn reserve_message_identity(&self, server_key: &str, author_uid: &str, message_id: &str) -> Result<bool> {
+        match self
+            .db
+            .execute("INSERT INTO message_identities VALUES(?1,?2,?3)", params![server_key, author_uid, message_id])
+        {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+                    || e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Stores a new channel message with its identity, body and attachments: all of it, or none, so a
+    /// failed write leaves the identity free for a retry. None when the identity was already used.
+    pub fn add_signed_message(&self, channel: ChannelId, msg: &mut ChatMessage) -> Result<Option<MessageId>> {
+        let tx = self.begin()?;
+        if let Some(s) = &msg.signature
+            && !self.reserve_message_identity(&s.server_key, &s.author_uid, &s.message_id)?
+        {
+            return Ok(None);
+        }
+        msg.id = self.add_message(channel, &msg.author_uid, &msg.author_name, &msg.text, msg.sent_at)?;
+        self.save_message_body(msg)?;
+        tx.commit()?;
+        Ok(Some(msg.id))
     }
 
     /// The body, signature and attachment order change together.
-    pub fn save_message_body(&mut self, msg: &ChatMessage) -> Result<()> {
-        let tx = self.db.transaction()?;
+    pub fn save_message_body(&self, msg: &ChatMessage) -> Result<()> {
+        let tx = self.begin()?;
         let signature = msg.signature.as_ref().map(serde_json::to_string).transpose()?;
         tx.execute(
             "UPDATE messages SET text=?2,sent_at=?3,edited_at=?4,signature=?5 WHERE id=?1",
