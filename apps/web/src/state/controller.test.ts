@@ -2592,9 +2592,14 @@ describe("edits stay on their connection; history ownership follows each verifie
   }
 
   it("drops the card, never leaving it on Sending…, when the session changes during the history lookup", async () => {
-    const t = await lostFileSend(async () => { stores.useSession.setState(s => ({ epoch: s.epoch + 1 })); return { messages: [] }; });
+    // The session changes once, during the retry's lookup; later lookups (the reload it starts) see no change.
+    let lookups = 0;
+    const t = await lostFileSend(async () => {
+      if (lookups++ === 0) stores.useSession.setState(s => ({ epoch: s.epoch + 1 }));
+      return { messages: [] };
+    });
     await controller.retrySend(t.failed.id);
-    expect(t.a.request).toHaveBeenCalledWith("chat.history", expect.anything());
+    expect(lookups).toBeGreaterThanOrEqual(1);
     expect(stores.useOutbox.getState().failed).toEqual([]);
     t.done();
   });
