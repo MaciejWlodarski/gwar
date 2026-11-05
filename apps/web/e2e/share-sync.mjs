@@ -508,10 +508,13 @@ async function workerFailed(pages, mode) {
     if (crash) for (const worker of window.__lateFrameWorkers) { worker.terminate(); worker.dispatchEvent(new ErrorEvent("error", { message: "e2e: the worker died" })); }
     return { workers: window.__lateFrameWorkers.length, run };
   }, mode === "crash")));
+  // A desktop viewer's sound leaves the webview: the native mixer counts the frames it gets.
+  const mixed = () => Promise.all(pages.map(async page => (page.native ? (await page.native.request("share_stats")).frames : 0)));
   const before = await Promise.all(pages.map(page => page.evaluate(() => window.__played())));
-  // Long enough for the transport to be taken for stuck and rebuilt, if it is.
+  const mixedBefore = await mixed();
   await sleep(9_000);
   const after = await Promise.all(pages.map(page => page.evaluate(() => window.__played())));
+  const mixedAfter = await mixed();
   // What each connection's receivers say, for a run that fails.
   const receivers = await Promise.all(pages.map(page => page.evaluate(async () => Promise.all(window.__pcs.map(async pc => ({
     state: pc.connectionState,
@@ -520,11 +523,14 @@ async function workerFailed(pages, mode) {
 }))))));
   return pages.map((page, i) => {
     const gained = kind => Object.entries(after[i].pcs).reduce((sum, [pc, now]) => sum + now[kind] - (before[i].pcs[pc]?.[kind] ?? 0), 0);
-    const result = { viewer: page.kind, mode, workers: failed[i].workers, rebuilt: after[i].run !== failed[i].run, video: gained("video"), audio: gained("audio"), receivers: receivers[i] };
+    const result = { viewer: page.kind, mode, workers: failed[i].workers, rebuilt: after[i].run !== failed[i].run, video: gained("video"), audio: gained("audio"), mixed: mixedAfter[i] - mixedBefore[i], receivers: receivers[i] };
     console.log(JSON.stringify({ workerFail: result }));
     assert.ok(result.video >= 60, `the ${page.kind} viewer's picture stopped after the worker failed (${mode}): ${JSON.stringify(result)}`);
-    // Two seconds' worth in nine; a desktop viewer's sound leaves the webview.
+    // Two seconds' worth in nine: the browser's decoded samples, the desktop's 20 ms frames.
     if (page.kind === "browser") assert.ok(result.audio >= 2 * 48_000, `the browser viewer's sound stopped after the worker failed (${mode}): ${JSON.stringify(result)}`);
+    if (page.native && !page.pictureOnly) assert.ok(result.mixed >= 100, `the desktop viewer's sound stopped reaching its mixer after the worker failed (${mode}): ${JSON.stringify(result)}`);
+    // A worker that dies with pictures flowing leaves receivers no engine plays again: the transport is new.
+    if (mode === "crash" && result.workers > 0) assert.ok(result.rebuilt, `the ${page.kind} viewer kept the transport its dead filter held: ${JSON.stringify(result)}`);
     return result;
   });
 }
