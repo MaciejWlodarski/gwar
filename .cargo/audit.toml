@@ -19,4 +19,4 @@
 # use one ECDH and a few ECDSA operations per connection, so a remote server
 # gets few, network-jittered timing samples; accepted until a fix is reachable.
 # Drop this when those crates move to elliptic-curve 0.14.
-ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331", "RUSTSEC-2026-0381", "RUSTSEC-2026-0387"]
+ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331", "RUSTSEC-2026-0387"]
